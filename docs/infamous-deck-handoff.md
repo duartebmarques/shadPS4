@@ -254,3 +254,10 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - `infamous-fps` shortened at the user's request: 1 warm-up + 3 windows of 300 frames (about 90 s plus load).
 - Feedback-loop usage off (DCC hypothesis): 17.53, rejected. CPU profile of GpuComm (53%, flat) and GpuSche (66%, mostly memcpy): emulator CPU side is not the limit.
 - **Work is now organized in `agent/` (local, git-excluded): STATUS.md, ideas/BACKLOG.md, experiments/NNN-*.md, results.csv, TOOLS.md.** Read `agent/STATUS.md` first when resuming.
+
+### Critical path and GPU counters (2026-10-10 ~23:40; details in local `agent/experiments/007–010`)
+- Frame trace: decode→vkQueueSubmit <1 ms; submit→GPU done ~18–20 ms average. GPU queue backlog is the chain's limit.
+- HW counters (VK_KHR_performance_query): GPU active ~72%, VALU busy ~22%, DRAM read 11.7 GB/s (peak 89). GPU stalls, not work.
+- Microbenchmark: snooped GTT, WC GTT and VRAM carve-out read identically on the Deck APU (89 GB/s streaming, 8 GB/s scattered). In-place guest memory is not the cost.
+- ACO stats: no spills, median 40 VGPRs; occupancy not the issue.
+- Next: front-end/fixed-function stalls — barrier model, render-pass breaks, per-draw state. Diagnostics patch: `claude/diagnostics-2.patch`.
