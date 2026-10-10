@@ -261,3 +261,9 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - Microbenchmark: snooped GTT, WC GTT and VRAM carve-out read identically on the Deck APU (89 GB/s streaming, 8 GB/s scattered). In-place guest memory is not the cost.
 - ACO stats: no spills, median 40 VGPRs; occupancy not the issue.
 - Next: front-end/fixed-function stalls — barrier model, render-pass breaks, per-draw state. Diagnostics patch: `claude/diagnostics-2.patch`.
+
+### Latency-bound GPU (2026-10-11 ~00:15; local details in `agent/experiments/011–013`)
+- Front-end timestamp trace + barrier reduction A/B: barriers are where the GPU waits, not what costs. Cutting ~35% of image barriers gave no fps.
+- gpu_metrics: GFX 2.2 W "busy" vs CPU 6–7 W of a 12 W socket; 1600 MHz triggers PPT throttling. GPU work is latency-bound (DRAM traffic in the scattered-access regime).
+- No GS emulation (only 13 tess pairs). Next: instruction-level profiling (RGP/SQTT) to find which work is latency-bound.
+- Known visual issues parked: window-frame "refocus" flicker; particle/debris ghosting.
