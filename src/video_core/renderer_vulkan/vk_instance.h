@@ -281,6 +281,11 @@ public:
     }
 
     /// Returns the vendor ID of the physical device
+    /// Whether guest direct memory can be allocated as exported dma-buf memory.
+    bool IsGuestMemoryExportSupported() const {
+        return supports_guest_memory_export;
+    }
+
     u32 GetVendorID() const {
         return properties.vendorID;
     }
@@ -552,6 +557,7 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool supports_memory_budget{};
+    bool supports_guest_memory_export{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

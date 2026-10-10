@@ -14,6 +14,9 @@
 
 namespace VideoCore {
 
+bool sparse_external_memory = false;
+
+
 std::string_view BufferTypeName(MemoryType type) {
     switch (type) {
     case MemoryType::HostUncached:
@@ -107,7 +110,15 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
     } else {
         buffer_ci.flags |=
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+        // Guest memory in place: arena blocks are bound to exported (dma-buf) guest memory.
+        const vk::ExternalMemoryBufferCreateInfo external = {
+            .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+        };
+        if (sparse_external_memory) {
+            buffer_ci.pNext = &external;
+        }
         buffer = Vulkan::Check(device.createBuffer(buffer_ci));
+        buffer_ci.pNext = nullptr;
     }
 
     if (with_bda) {

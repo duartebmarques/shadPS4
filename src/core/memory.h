@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -309,6 +310,30 @@ public:
     static void EndBackingPush();
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
+
+
+    /// Writes a GPU fence label (4 or 8 bytes) from any thread, after the GPU finished the work
+
+    /// before it. Returns false, writing nothing, when the guest no longer maps the address.
+
+    bool TryWriteLabel(VAddr address, u64 value, u32 num_bytes);
+
+
+    /// The direct memory offset backing [address, address + size) when one Direct or Pooled
+
+    /// mapping holds the whole range contiguously; used to bind guest memory in place.
+
+    std::optional<PAddr> DirectPhysOf(VAddr address, u64 size);
+
+    /// Installs guest memory chunks into the address space under the exclusive lock, keeping
+    /// direct memory that is already mapped in the memfd.
+    void InstallGuestMemoryChunks(AddressSpace::ChunkAllocator alloc,
+                                  AddressSpace::ChunkRelease release, void* user);
+
+    /// Backing offsets below this hold direct memory (flexible memory starts here).
+    u64 GetDirectBackingLimit() const {
+        return direct_backing_limit;
+    }
     struct BackingWriteStats {
         u64 calls;
         u64 hits;
@@ -412,6 +437,8 @@ private:
 
 private:
     AddressSpace impl;
+    // Backing offsets below this hold direct memory; flexible memory starts here.
+    u64 direct_backing_limit{};
     PhysMap dmem_map;
     PhysMap fmem_map;
     VMAMap vma_map;

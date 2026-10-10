@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "common/alignment.h"
@@ -44,6 +45,7 @@ MemoryManager::MemoryManager() {
         total_size += extra_fmem * 1_MB;
     }
     total_direct_size = total_size;
+    direct_backing_limit = total_size;
     dmem_map.clear();
     dmem_map.emplace(0, PhysicalMemoryArea{0, total_direct_size});
 
@@ -301,6 +303,71 @@ inline void CopyToBacking(void* dst, const void* src, u64 size) {
     }
 }
 } // Anonymous namespace
+
+std::optional<PAddr> MemoryManager::DirectPhysOf(VAddr address, u64 size) {
+    // Called from the GPU thread, which a writer may be waiting on (rasterizer unmap paths):
+    // never block for long. Without the answer the caller keeps the copying path.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!tls_in_guest_copy_scope &&
+        !lk.try_lock_until(std::chrono::steady_clock::now() + std::chrono::milliseconds{1})) {
+        return std::nullopt;
+    }
+    if (!IsValidMapping(address, size)) {
+        return std::nullopt;
+    }
+    const auto vma_handle = FindVMA(address);
+    if (vma_handle == vma_map.end()) {
+        return std::nullopt;
+    }
+    const auto& vma = vma_handle->second;
+    if ((vma.type != VMAType::Direct && vma.type != VMAType::Pooled) ||
+        !vma.Contains(address, size) || vma.phys_areas.empty()) {
+        return std::nullopt;
+    }
+    const u64 offset_in_vma = address - vma.base;
+    const auto phys_handle = std::prev(vma.phys_areas.upper_bound(offset_in_vma));
+    const u64 offset_in_area = offset_in_vma - phys_handle->first;
+    if (offset_in_area + size > phys_handle->second.size) {
+        return std::nullopt;
+    }
+    return phys_handle->second.base + offset_in_area;
+}
+
+void MemoryManager::InstallGuestMemoryChunks(AddressSpace::ChunkAllocator alloc,
+                                             AddressSpace::ChunkRelease release, void* user) {
+    std::scoped_lock lk{mutex};
+    std::vector<std::pair<PAddr, u64>> in_use;
+    for (const auto& [base, vma] : vma_map) {
+        if (vma.type != VMAType::Direct && vma.type != VMAType::Pooled) {
+            continue;
+        }
+        for (const auto& [offset, area] : vma.phys_areas) {
+            in_use.emplace_back(area.base, area.size);
+        }
+    }
+    impl.InstallChunks(direct_backing_limit, alloc, release, user, in_use);
+}
+
+bool MemoryManager::TryWriteLabel(VAddr address, u64 value, u32 num_bytes) {
+    void* const ptr = reinterpret_cast<void*>(address);
+    // The mutex is recursive-shared: TryWriteBacking may take it again below. Labels are
+    // written by the scheduler's completion thread, which must not stall behind a writer that
+    // waits on the GPU: past a short wait, store through the guest address as the CP did.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!lk.try_lock_until(std::chrono::steady_clock::now() + std::chrono::milliseconds{2})) {
+        CopyToBacking(ptr, &value, num_bytes);
+        return true;
+    }
+    if (!IsValidMapping(address, num_bytes)) {
+        return false;
+    }
+    if (TryWriteBacking(ptr, &value, num_bytes)) {
+        return true;
+    }
+    // No physical backing: store through the guest address, as one store.
+    CopyToBacking(ptr, &value, num_bytes);
+    return true;
+}
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);

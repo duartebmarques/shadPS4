@@ -26,6 +26,10 @@ struct VmaAllocationInfo;
 
 namespace VideoCore {
 
+/// Sparse buffers (the arena) accept dma-buf memory: guest memory in place.
+extern bool sparse_external_memory;
+
+
 /// Hints and requirements for the backing memory type of a commit
 enum class MemoryType : u8 {
     DeviceLocal,  ///< Requests device local buffer.

@@ -981,6 +981,14 @@ u64 Rasterizer::Flush() {
     return current_tick;
 }
 
+u64 Rasterizer::CurrentTick() const {
+    return scheduler.CurrentTick();
+}
+
+void Rasterizer::DeferAfterTick(u64 tick, Common::UniqueFunction<void>&& func) {
+    scheduler.DeferPriorityOperationAt(tick, std::move(func));
+}
+
 void Rasterizer::Finish() {
     DropCopyHold(hold_drops_wait_);
     scheduler.Finish();
@@ -3108,6 +3116,7 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     buffer_cache.InvalidateMemory(addr, size);
+    buffer_cache.UnmapInPlace(addr, size);
     texture_cache.UnmapMemory(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};

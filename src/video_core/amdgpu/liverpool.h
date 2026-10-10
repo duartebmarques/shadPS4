@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <optional>
+
+#include <deque>
+
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -17,6 +21,7 @@
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
+#include "core/platform.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/gfx_state_stamp.h"
 #include "video_core/amdgpu/regs.h"
@@ -30,6 +35,8 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+struct PM4CmdWaitRegMem;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -290,6 +297,35 @@ private:
     // Frozen counter = every query pair differences to zero samples passed:
     // the title's own visibility logic then culls those draws before issue.
     bool occlude_all_{};
+    // inplace_guest_memory >= 1: fence labels, their interrupts and the GPU idle interrupt wait
+    // for the GPU to finish the work recorded before them.
+    bool honest_fences_{};
+
+public:
+    /// A fence label captured when its packet is decoded, written after the GPU finished the
+    /// work recorded before it.
+    struct FenceWrite {
+        VAddr address;
+        u64 value;
+        u32 num_bytes;
+    };
+
+private:
+    /// Queues a label write and/or interrupt to run once the GPU finished all work recorded so
+    /// far, without submitting: FlushHonestSignals submits at guest submission ends and waits.
+    void QueueHonestSignal(const std::optional<FenceWrite>& write,
+                           std::optional<Platform::InterruptId> irq);
+    /// Submits the recorded work when it holds queued honest signals.
+    void FlushHonestSignals();
+    /// Whether a queued, not yet written label will make the wait pass (the GPU runs the queues
+    /// in recording order, so the wait is met by stream order).
+    bool PendingLabelSatisfies(const PM4CmdWaitRegMem* wait);
+
+    // Labels queued and not yet written, oldest first; their writes pop them in order.
+    std::mutex pending_labels_mutex_;
+    std::deque<FenceWrite> pending_labels_;
+    // Tick of the newest queued honest signal (GPU thread only).
+    u64 honest_signal_tick_{};
     bool reg_run_{};
 
     struct ConstantEngine {

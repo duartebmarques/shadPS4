@@ -87,6 +87,11 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     u64 Flush();
+    /// Tick of the batch being recorded: it completes after all work recorded so far.
+    u64 CurrentTick() const;
+    /// Runs `func` on the scheduler's completion thread once the GPU reached `tick`. The tick
+    /// must get submitted eventually (honest fences flush at guest submission ends and waits).
+    void DeferAfterTick(u64 tick, Common::UniqueFunction<void>&& func);
     void Finish();
     void OnSubmit();
     void OnFence();

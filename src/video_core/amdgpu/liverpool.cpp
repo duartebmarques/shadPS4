@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
+#include <optional>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -108,6 +109,61 @@ static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
     if (rasterizer) {
         rasterizer->OnFence();
     }
+}
+
+namespace {
+void WriteFenceLabel(const std::optional<Liverpool::FenceWrite>& write) {
+    if (write && !Core::Memory::Instance()->TryWriteLabel(write->address, write->value,
+                                                          write->num_bytes)) {
+        LOG_WARNING(Render, "Fence label {:#x} was unmapped before the GPU finished",
+                    write->address);
+    }
+}
+} // Anonymous namespace
+
+void Liverpool::QueueHonestSignal(const std::optional<FenceWrite>& write,
+                                  std::optional<Platform::InterruptId> irq) {
+    const u64 tick = rasterizer->CurrentTick();
+    if (write) {
+        std::scoped_lock lk{pending_labels_mutex_};
+        pending_labels_.push_back(*write);
+    }
+    honest_signal_tick_ = tick;
+    rasterizer->DeferAfterTick(tick, [this, write, irq] {
+        WriteFenceLabel(write);
+        if (write) {
+            // Completion callbacks run in queue order, so this label is the oldest one.
+            std::scoped_lock lk{pending_labels_mutex_};
+            pending_labels_.pop_front();
+        }
+        if (irq) {
+            Platform::IrqC::Instance()->Signal(*irq);
+        }
+    });
+}
+
+void Liverpool::FlushHonestSignals() {
+    if (honest_fences_ && rasterizer && honest_signal_tick_ >= rasterizer->CurrentTick()) {
+        rasterizer->Flush();
+    }
+}
+
+bool Liverpool::PendingLabelSatisfies(const PM4CmdWaitRegMem* wait) {
+    if (wait->mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
+        return false;
+    }
+    const VAddr address = reinterpret_cast<VAddr>(wait->Address<u32*>());
+    std::scoped_lock lk{pending_labels_mutex_};
+    // The newest queued write to the polled dword decides the value the wait will see.
+    for (auto it = pending_labels_.rbegin(); it != pending_labels_.rend(); ++it) {
+        if (it->address == address) {
+            return wait->Compare(static_cast<u32>(it->value));
+        }
+        if (it->num_bytes == sizeof(u64) && it->address + sizeof(u32) == address) {
+            return wait->Compare(static_cast<u32>(it->value >> 32));
+        }
+    }
+    return false;
 }
 
 // user_data words stay outside the graphics state stamp by contract: engines
@@ -291,6 +347,7 @@ Liverpool::Liverpool() {
     gfx_stamp.rt_mask = rt_reg_mask_.data();
     gfx_stamp.classify_rt = gfx_stamp.active && EmulatorSettings.IsRtStateStamp();
     occlude_all_ = EmulatorSettings.IsOccludeAll();
+    honest_fences_ = EmulatorSettings.GetInplaceGuestMemory() >= 1;
     reg_run_ = EmulatorSettings.IsParserRegRun();
     Common::SetCoreReservationEnabled(EmulatorSettings.IsGpuThreadCoreReserve());
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
@@ -364,6 +421,8 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
+                // A guest submission ended: its queued honest signals may now be waited on.
+                FlushHonestSignals();
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
@@ -388,7 +447,12 @@ void Liverpool::Process(std::stop_token stoken) {
             submit_done = false;
         }
 
-        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        if (honest_fences_ && rasterizer) {
+            QueueHonestSignal(std::nullopt, Platform::InterruptId::GpuIdle);
+            FlushHonestSignals();
+        } else {
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        }
     }
 }
 
@@ -1017,6 +1081,19 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         case PM4ItOpcode::EventWriteEos: {
             const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
             FenceDrainAndDownload(rasterizer);
+            if (honest_fences_ && rasterizer &&
+                event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
+                std::optional<FenceWrite> write;
+                event_eos->SignalFence([&write](void* address, u64 data, u32 num_bytes) {
+                    write = FenceWrite{reinterpret_cast<VAddr>(address), data, num_bytes};
+                });
+                QueueHonestSignal(write, std::nullopt);
+                break;
+            }
+            if (honest_fences_ && rasterizer) {
+                // GdsStore reads the GDS after a full GPU wait anyway; label after that wait too.
+                rasterizer->Finish();
+            }
             event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                 auto* memory = Core::Memory::Instance();
                 ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
@@ -1034,6 +1111,18 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         case PM4ItOpcode::EventWriteEop: {
             const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
             FenceDrainAndDownload(rasterizer);
+            if (honest_fences_ && rasterizer) {
+                std::optional<FenceWrite> write;
+                bool irq = false;
+                event_eop->SignalFence(
+                    [&write](void* address, u64 data, u32 num_bytes) {
+                        write = FenceWrite{reinterpret_cast<VAddr>(address), data, num_bytes};
+                    },
+                    [&irq] { irq = true; });
+                QueueHonestSignal(write, irq ? std::optional{Platform::InterruptId::GfxEop}
+                                             : std::nullopt);
+                break;
+            }
             event_eop->SignalFence(
                 [](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
@@ -1218,10 +1307,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u64* wait_addr = wait_reg_mem->Address<u64*>();
             if (vo_port->IsVoLabel(wait_addr) &&
                 num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                FlushHonestSignals();
                 vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                 break;
             }
+            if (honest_fences_ && !wait_reg_mem->Test(regs.reg_array) &&
+                PendingLabelSatisfies(wait_reg_mem)) {
+                // Met in stream order by a label the GPU writes after earlier work.
+                break;
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                FlushHonestSignals();
                 YIELD_GFX();
             }
             break;
@@ -1490,7 +1586,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (honest_fences_ && !wait_reg_mem->Test(regs.reg_array) &&
+                PendingLabelSatisfies(wait_reg_mem)) {
+                break;
+            }
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                FlushHonestSignals();
                 YIELD_ASC(vqid);
             }
             break;
@@ -1500,6 +1601,46 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             // The compute queue has no packet-run guard, so its dispatch
             // marks reach a drain here, at its waits and at every submit.
             FenceDrainAndDownload(rasterizer);
+            if (honest_fences_ && rasterizer) {
+                std::optional<FenceWrite> write;
+                const VAddr address = release_mem->Address<VAddr>();
+                switch (release_mem->data_sel.Value()) {
+                case DataSelect::Data32Low:
+                    write = FenceWrite{address, release_mem->DataDWord(), sizeof(u32)};
+                    break;
+                case DataSelect::Data64:
+                    write = FenceWrite{address, release_mem->DataQWord(), sizeof(u64)};
+                    break;
+                case DataSelect::GpuClock64:
+                    write = FenceWrite{address, GetGpuClock64(), sizeof(u64)};
+                    break;
+                case DataSelect::PerfCounter:
+                    write = FenceWrite{address, GetGpuPerfCounter(), sizeof(u64)};
+                    break;
+                case DataSelect::GdsMemStore:
+                    // Recorded on the GPU in stream order; only the interrupt waits below.
+                    rasterizer->CopyBuffer(address, release_mem->gds_index,
+                                           release_mem->num_dw * sizeof(u32), false, true);
+                    break;
+                default:
+                    UNREACHABLE();
+                }
+                bool irq = false;
+                switch (release_mem->int_sel.Value()) {
+                case InterruptSelect::None:
+                    break;
+                case InterruptSelect::IrqUndocumented:
+                case InterruptSelect::IrqWhenWriteConfirm:
+                    irq = true;
+                    break;
+                default:
+                    UNREACHABLE();
+                }
+                QueueHonestSignal(
+                    write, irq ? std::optional{static_cast<Platform::InterruptId>(queue.pipe_id)}
+                               : std::nullopt);
+                break;
+            }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));

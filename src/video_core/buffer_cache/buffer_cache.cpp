@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -63,7 +64,14 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
+    // Guest memory in place: the arena must accept exported (dma-buf) memory.
+    const bool want_in_place =
+        EmulatorSettings.GetInplaceGuestMemory() >= 2 && instance.IsGuestMemoryExportSupported();
+    const vk::ExternalMemoryBufferCreateInfo external_ci = {
+        .handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
+    };
     const vk::BufferCreateInfo probe_ci = {
+        .pNext = want_in_place ? &external_ci : nullptr,
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
         .size = ARENA_PAGE_SIZE,
@@ -109,6 +117,27 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     }
     clean_sync_peek = EmulatorSettings.IsCleanSyncPeek();
     readback_offload = EmulatorSettings.IsReadbackOffload();
+
+    if (want_in_place) {
+        // A sparse arena page with external memory must be creatable before chunks go live.
+        const auto [probe_result, probe_buffer] = device.createBuffer(probe_ci);
+        if (probe_result == vk::Result::eSuccess) {
+            device.destroyBuffer(probe_buffer);
+            sparse_external_memory = true;
+            if (Vulkan::GuestMemory::Install(instance, reqs.memoryTypeBits)) {
+                in_place = true;
+                in_place_bits.resize((u64{blocks_per_arena_page} * NUM_ARENA_PAGES + 63) / 64);
+                in_place_write_ticks =
+                    std::make_unique<std::atomic<u64>[]>(u64{1} << (40 - WriteTickShift));
+            } else {
+                sparse_external_memory = false;
+            }
+        } else {
+            LOG_WARNING(Render_Vulkan,
+                        "Guest memory in place: sparse buffers cannot take external memory ({})",
+                        vk::to_string(probe_result));
+        }
+    }
 }
 
 BufferCache::~BufferCache() = default;
@@ -330,7 +359,9 @@ void BufferCache::MergeReadbackReturns() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
-    // For read-only buffers use device local stream buffer to reduce renderpass breaks.
+    // For read-only buffers use device local stream buffer to reduce renderpass breaks. With
+    // guest memory in place this also keeps small reads a snapshot of guest memory at record
+    // time, as command processor writes executed on the CPU expect.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         if (const auto lane_offset = StreamViaLane(device_addr, size)) {
             return {&stream_buffer, *lane_offset};
@@ -344,9 +375,24 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
+    if (in_place && AllInPlace(first_block, last_block)) {
+        // The arena is the guest's memory here: nothing to upload, track or read back.
+        if (is_written) {
+            NoteInPlaceWrite(device_addr, size);
+        } else if (is_texel_buffer) {
+            SynchronizeMemoryFromImage(arena, device_addr, size);
+        }
+        return {arena, arena->Offset(device_addr)};
+    }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
-        gpu_modified_ranges.Add(device_addr, size);
+        if (in_place) {
+            NoteInPlaceWrite(device_addr, size);
+            ForEachNotInPlace(device_addr, size,
+                              [&](VAddr addr, u64 part) { gpu_modified_ranges.Add(addr, part); });
+        } else {
+            gpu_modified_ranges.Add(device_addr, size);
+        }
     }
     return {arena, arena->Offset(device_addr)};
 }
@@ -403,7 +449,8 @@ bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
-    return memory_tracker->IsRegionGpuModified(addr, size);
+    return memory_tracker->IsRegionGpuModified(addr, size) ||
+           (in_place && IsInPlaceWritePending(addr, size));
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
@@ -489,7 +536,149 @@ bool BufferCache::AllResident(u64 first_block, u64 last_block) const {
     return true;
 }
 
+void BufferCache::ForEachNotInPlace(VAddr device_addr, u64 size, auto&& func) const {
+    const VAddr end_addr = device_addr + size;
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (end_addr - 1) >> block_shift;
+    const auto is_in_place = [&](u64 block) {
+        return block < in_place_bits.size() * 64 &&
+               ((in_place_bits[block >> 6] >> (block & 63)) & 1) != 0;
+    };
+    u64 block = first_block;
+    while (block <= last_block) {
+        if (is_in_place(block)) {
+            ++block;
+            continue;
+        }
+        u64 run_end = block + 1;
+        while (run_end <= last_block && !is_in_place(run_end)) {
+            ++run_end;
+        }
+        const VAddr part_start = std::max<VAddr>(device_addr, block << block_shift);
+        const VAddr part_end = std::min<VAddr>(end_addr, run_end << block_shift);
+        func(part_start, part_end - part_start);
+        block = run_end;
+    }
+}
+
+bool BufferCache::AllInPlace(u64 first_block, u64 last_block) const {
+    if (last_block >= in_place_bits.size() * 64) {
+        return false;
+    }
+    for (u64 word = first_block >> 6; word <= last_block >> 6; ++word) {
+        u64 mask = ~u64{0};
+        if (word == first_block >> 6) {
+            mask &= ~u64{0} << (first_block & 63);
+        }
+        if (word == last_block >> 6) {
+            mask &= ~u64{0} >> (63 - (last_block & 63));
+        }
+        if ((in_place_bits[word] & mask) != mask) {
+            return false;
+        }
+    }
+    return true;
+}
+
+u64 BufferCache::InPlaceRun(u64 block, u64 end, vk::DeviceMemory* out_memory,
+                            u64* out_memory_block) const {
+    const auto phys = memory->DirectPhysOf(block << block_shift, block_size);
+    if (!phys || (*phys & (block_size - 1)) != 0) {
+        return 0;
+    }
+    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    if (!chunk || *phys + block_size > chunk->phys + chunk->size) {
+        return 0;
+    }
+    u64 count = 1;
+    while (block + count < end) {
+        const auto next = memory->DirectPhysOf((block + count) << block_shift, block_size);
+        if (!next || *next != *phys + (count << block_shift) ||
+            *next + block_size > chunk->phys + chunk->size) {
+            break;
+        }
+        ++count;
+    }
+    *out_memory = chunk->memory;
+    *out_memory_block = (*phys - chunk->phys) >> block_shift;
+    return count;
+}
+
+void BufferCache::UnmapInPlace(VAddr device_addr, u64 size) {
+    if (!in_place || size == 0) {
+        return;
+    }
+    std::scoped_lock lk{pending_unmaps_mutex};
+    pending_unmaps.emplace_back(device_addr, size);
+    has_pending_unmaps.store(true, std::memory_order_release);
+}
+
+void BufferCache::ProcessPendingUnmaps() {
+    std::vector<std::pair<VAddr, u64>> ranges;
+    {
+        std::scoped_lock lk{pending_unmaps_mutex};
+        ranges.swap(pending_unmaps);
+        has_pending_unmaps.store(false, std::memory_order_release);
+    }
+    bool released = false;
+    const u64 max_block = in_place_bits.size() * 64;
+    for (const auto& [addr, size] : ranges) {
+        const u64 first_block = addr >> block_shift;
+        const u64 last_block = std::min<u64>((addr + size - 1) >> block_shift, max_block - 1);
+        u64 block = first_block;
+        while (block <= last_block) {
+            if (((in_place_bits[block >> 6] >> (block & 63)) & 1) == 0) {
+                ++block;
+                continue;
+            }
+            u64 run_end = block;
+            while (run_end <= last_block &&
+                   ((in_place_bits[run_end >> 6] >> (run_end & 63)) & 1) != 0) {
+                in_place_bits[run_end >> 6] &= ~(u64{1} << (run_end & 63));
+                if (!resident_bits.empty()) {
+                    resident_bits[run_end >> 6] &= ~(u64{1} << (run_end & 63));
+                }
+                ++run_end;
+            }
+            // The blocks get rebound to whatever is mapped there at their next use.
+            resident_ranges.Subtract(block, run_end);
+            released = true;
+            block = run_end;
+        }
+    }
+    if (released) {
+        // Rebinding must not overtake work already submitted against the old binding.
+        bind_wait_tick = std::max(bind_wait_tick, scheduler.CurrentTick() - 1);
+    }
+}
+
+void BufferCache::NoteInPlaceWrite(VAddr device_addr, u64 size) {
+    const u64 tick = scheduler.CurrentTick();
+    const u64 first = device_addr >> WriteTickShift;
+    const u64 last = (device_addr + std::max<u64>(size, 1) - 1) >> WriteTickShift;
+    const u64 limit = u64{1} << (40 - WriteTickShift);
+    for (u64 page = first; page <= last && page < limit; ++page) {
+        in_place_write_ticks[page].store(tick, std::memory_order_relaxed);
+    }
+}
+
+bool BufferCache::IsInPlaceWritePending(VAddr device_addr, u64 size) const {
+    const u64 first = device_addr >> WriteTickShift;
+    const u64 last = (device_addr + std::max<u64>(size, 1) - 1) >> WriteTickShift;
+    const u64 limit = u64{1} << (40 - WriteTickShift);
+    for (u64 page = first; page <= last && page < limit; ++page) {
+        const u64 tick = in_place_write_ticks[page].load(std::memory_order_relaxed);
+        if (tick != 0 && !scheduler.IsFree(tick)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    if (in_place && has_pending_unmaps.load(std::memory_order_acquire)) {
+        ProcessPendingUnmaps();
+    }
     if (!resident_bits.empty()) {
         ++fast_stats.resident_checks;
         if (AllResident(first_block, last_block)) {
@@ -497,61 +686,107 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             return;
         }
     }
-    u32 resident_blocks{};
     IntervalList bind_ranges;
-    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
-        resident_blocks += end - start;
-        bind_ranges.Add({start, end});
-    });
+    resident_ranges.ForEachGap(first_block, last_block + 1,
+                               [&](u64 start, u64 end) { bind_ranges.Add({start, end}); });
 
     if (bind_ranges.Empty()) {
         return;
     }
 
-    const vk::MemoryAllocateFlagsInfo alloc_flags = {
-        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+    // Each gap splits into runs bound in place (to the chunk holding the guest memory) and runs
+    // that get new device memory and the copying path.
+    struct Run {
+        u64 start;
+        u64 end;
+        vk::DeviceMemory memory;
+        u64 memory_block;
+        bool in_place;
     };
-    const vk::MemoryAllocateInfo alloc_info = {
-        .pNext = &alloc_flags,
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    boost::container::small_vector<Run, 8> runs;
+    u64 device_blocks{};
+    u64 total_blocks{};
+    for (const auto& range : bind_ranges) {
+        u64 block = range.start;
+        while (block < range.end) {
+            vk::DeviceMemory chunk_memory{};
+            u64 chunk_block{};
+            const u64 in_place_count =
+                in_place ? InPlaceRun(block, range.end, &chunk_memory, &chunk_block) : 0;
+            if (in_place_count != 0) {
+                runs.push_back({block, block + in_place_count, chunk_memory, chunk_block, true});
+                block += in_place_count;
+                continue;
+            }
+            u64 run_end = block + 1;
+            if (!in_place) {
+                run_end = range.end;
+            } else {
+                while (run_end < range.end &&
+                       InPlaceRun(run_end, run_end + 1, &chunk_memory, &chunk_block) == 0) {
+                    ++run_end;
+                }
+            }
+            runs.push_back({block, run_end, {}, device_blocks, false});
+            device_blocks += run_end - block;
+            block = run_end;
+        }
+    }
+    for (const auto& run : runs) {
+        total_blocks += run.end - run.start;
+    }
+
+    vk::DeviceMemory device_memory{};
+    if (device_blocks != 0) {
+        const vk::MemoryAllocateFlagsInfo alloc_flags = {
+            .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+        };
+        const vk::MemoryAllocateInfo alloc_info = {
+            .pNext = &alloc_flags,
+            .allocationSize = device_blocks << block_shift,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    }
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
-        staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
+        staging_pool.Request(total_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    u64 memory_offset{};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
-    for (const auto& range : bind_ranges) {
+    for (const auto& run : runs) {
         Backing backing;
-        backing.start = range.start;
-        backing.end = range.end;
-        backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
+        backing.start = run.start;
+        backing.end = run.end;
+        backing.memory = run.in_place ? run.memory : device_memory;
+        backing.offset = run.memory_block;
         resident_ranges.Add(backing);
-        for (u64 block = range.start; block < range.end && !resident_bits.empty(); ++block) {
-            resident_bits[block >> 6] |= u64{1} << (block & 63);
+        for (u64 block = run.start; block < run.end; ++block) {
+            if (!resident_bits.empty()) {
+                resident_bits[block >> 6] |= u64{1} << (block & 63);
+            }
+            if (run.in_place) {
+                in_place_bits[block >> 6] |= u64{1} << (block & 63);
+            }
         }
 
-        LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
+        LOG_INFO(Render, "Making range start={}, end={} resident{}", backing.start, backing.end,
+                 run.in_place ? " in place" : "");
 
         const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
-            .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
-            .size = (range.end - range.start) << block_shift,
-            .memory = device_memory,
-            .memoryOffset = memory_offset,
+            .resourceOffset = (run.start << block_shift) - arena->cpu_addr,
+            .size = (run.end - run.start) << block_shift,
+            .memory = backing.memory,
+            .memoryOffset = run.memory_block << block_shift,
         });
-        memory_offset += bind.size;
 
-        for (u32 block = 0; block < bind.size; block += block_size) {
+        for (u64 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
         }
-        const u64 copy_size = (backing.end - backing.start) * sizeof(vk::DeviceAddress);
-        copies.emplace_back(offset, backing.start * sizeof(vk::DeviceAddress), copy_size);
+        const u64 copy_size = (run.end - run.start) * sizeof(vk::DeviceAddress);
+        copies.emplace_back(offset, run.start * sizeof(vk::DeviceAddress), copy_size);
         offset += copy_size;
     }
 
@@ -572,8 +807,17 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     }
     if (!clean) {
         memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
-            copies.emplace_back(total_size_bytes, addr, size);
-            total_size_bytes += size;
+            if (!in_place) {
+                copies.emplace_back(total_size_bytes, addr, size);
+                total_size_bytes += size;
+                return;
+            }
+            // An upload into a block bound in place would write an older snapshot of guest
+            // memory over newer guest writes.
+            ForEachNotInPlace(addr, size, [&](VAddr part_addr, u64 part_size) {
+                copies.emplace_back(total_size_bytes, part_addr, part_size);
+                total_size_bytes += part_size;
+            });
         });
     }
     if (!copies.empty()) {
@@ -661,13 +905,20 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     const u64 signal_tick = memory_semaphore.NextTick();
     const auto signal_sema = memory_semaphore.Handle();
 
+    // After in-place unmaps, rebinding waits for the work submitted against the old binding.
+    const u64 wait_tick = std::exchange(bind_wait_tick, 0);
+    const auto wait_sema = scheduler.GetWorkSemaphore()->Handle();
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = wait_tick != 0 ? 1u : 0u,
+        .pWaitSemaphoreValues = wait_tick != 0 ? &wait_tick : nullptr,
         .signalSemaphoreValueCount = 1u,
         .pSignalSemaphoreValues = &signal_tick,
     };
 
     const vk::BindSparseInfo sparse_info = {
         .pNext = &timeline_si,
+        .waitSemaphoreCount = wait_tick != 0 ? 1u : 0u,
+        .pWaitSemaphores = wait_tick != 0 ? &wait_sema : nullptr,
         .bufferBindCount = static_cast<u32>(buffer_binds.size()),
         .pBufferBinds = buffer_binds.data(),
         .signalSemaphoreCount = 1u,

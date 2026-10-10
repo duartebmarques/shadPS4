@@ -229,7 +229,8 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    // RADV already enables about 30; the guest memory extensions need room on top.
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -349,6 +350,14 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+#ifdef __linux__
+    // Guest memory in place (inplace_guest_memory 2): direct memory exported as dma-buf.
+    if (EmulatorSettings.GetInplaceGuestMemory() >= 2) {
+        const bool fd = add_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+        const bool dma_buf = fd && add_extension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        supports_guest_memory_export = fd && dma_buf;
+    }
+#endif
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();

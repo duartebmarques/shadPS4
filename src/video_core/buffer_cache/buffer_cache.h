@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <boost/container/small_vector.hpp>
 
@@ -107,6 +109,16 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// Guest memory in place (inplace_guest_memory 2): whether arena blocks may be bound to the
+    /// guest's own GPU-visible direct memory.
+    [[nodiscard]] bool IsGuestMemoryInPlace() const noexcept {
+        return in_place;
+    }
+
+    /// Queues an unmapped guest range: blocks bound in place are released and rebound to
+    /// whatever is mapped there at their next use. Any thread.
+    void UnmapInPlace(VAddr device_addr, u64 size);
+
     /// residency_bitmap and clean_sync_peek telemetry, reset on read.
     struct FastPathStats {
         u64 resident_checks;
@@ -170,6 +182,20 @@ private:
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
+    /// Blocks [first, last] are all bound to guest memory in place.
+    bool AllInPlace(u64 first_block, u64 last_block) const;
+    /// Calls func(addr, size) for each part of the range not bound in place.
+    void ForEachNotInPlace(VAddr device_addr, u64 size, auto&& func) const;
+    /// The run of blocks from `block` (before `end`) that can be bound in place: one contiguous
+    /// piece of one chunk. Returns the run length, 0 when `block` cannot.
+    u64 InPlaceRun(u64 block, u64 end, vk::DeviceMemory* memory, u64* memory_block) const;
+    /// Releases the in-place blocks of queued unmapped ranges (GPU thread).
+    void ProcessPendingUnmaps();
+    /// Records a GPU write to in-place memory at the tick being recorded.
+    void NoteInPlaceWrite(VAddr device_addr, u64 size);
+    /// Whether an in-place GPU write to the range may still be pending on the GPU.
+    bool IsInPlaceWritePending(VAddr device_addr, u64 size) const;
+
     /// Streams a read-only range through the copy lane. Returns the stream buffer offset, or
     /// nullopt when the range must be copied inline.
     std::optional<u64> StreamViaLane(VAddr device_addr, u32 size);
@@ -218,6 +244,19 @@ private:
     /// One bit per sparse block that has backing (residency_bitmap). Residency only grows, so
     /// EnsureResident sets bits and nothing clears them.
     std::vector<u64> resident_bits;
+
+    // Guest memory in place (inplace_guest_memory 2).
+    bool in_place{};
+    /// One bit per sparse block bound to guest memory in place.
+    std::vector<u64> in_place_bits;
+    std::mutex pending_unmaps_mutex;
+    std::vector<std::pair<VAddr, u64>> pending_unmaps;
+    std::atomic<bool> has_pending_unmaps{};
+    /// Sparse binds made after an unmap wait for the work submitted before it.
+    u64 bind_wait_tick{};
+    /// Newest tick of a GPU write to in-place memory, per 1 MiB of guest address space.
+    static constexpr u32 WriteTickShift = 20;
+    std::unique_ptr<std::atomic<u64>[]> in_place_write_ticks;
     bool clean_sync_peek{};
     FastPathStats fast_stats{};
 
