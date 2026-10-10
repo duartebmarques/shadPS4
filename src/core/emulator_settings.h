@@ -495,6 +495,8 @@ struct GPUSettings {
     // idle interrupt are signalled after the GPU really finished the work recorded before them,
     // instead of when the packet is decoded. 2: also keep guest direct memory in GPU-visible
     // system memory (dma-buf) used by the GPU in place, without arena copies (Linux, AMD).
+    // 3: also read small read-only buffers in place instead of copying them to the stream
+    // buffer, except memory the command processor writes on the CPU (constant dumps).
     Setting<u32> inplace_guest_memory{0};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).

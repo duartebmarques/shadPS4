@@ -1346,9 +1346,11 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
     const u64 stream_skips = runtime.DrainUntrackedSkips();
     if (barrier_adds || fs.resident_checks || stream_skips || fs.sync_peeks) {
         LOG_INFO(Render_Skipcache,
-                 "[SkipCache] FASTPATH barrier={}/{} resident={}/{} stream={} sync={}/{} per300f",
+                 "[SkipCache] FASTPATH barrier={}/{} resident={}/{} stream={} sync={}/{} "
+                 "small_inplace={} small_cp={} small_other={} per300f",
                  barrier_skips, barrier_adds, fs.resident_hits, fs.resident_checks, stream_skips,
-                 fs.sync_clean, fs.sync_peeks);
+                 fs.sync_clean, fs.sync_peeks, fs.small_in_place, fs.small_cp_marked,
+                 fs.small_other);
     }
     if (auto& lane = VideoCore::StreamCopyLane::Instance(); lane.Enabled()) {
         const auto ls = lane.DrainStats();
@@ -2964,6 +2966,7 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes) &&
             !buffer_cache.IsAnyInPlace(address, num_bytes)) {
             VideoCore::StreamCopyLane::Instance().DrainProducer();
+            buffer_cache.NoteCpWrite(address, num_bytes);
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -2986,6 +2989,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory, once
             // the lane has read what earlier draws queued, as CpWriteOrCopy does.
             VideoCore::StreamCopyLane::Instance().DrainProducer();
+            buffer_cache.NoteCpWrite(dst, num_bytes);
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             return;
         }
@@ -3042,7 +3046,12 @@ bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
     return true;
 }
 
-bool Rasterizer::TryCpWriteBacking(VAddr, const void*, u64) {
+bool Rasterizer::TryCpWriteBacking(VAddr address, const void*, u64 size) {
+    // inplace_guest_memory 3: memory the CP writes on the CPU is read through snapshots from now
+    // on. The first time that covers memory already read in place, queued reads finish first.
+    if (buffer_cache.NoteCpWrite(address, size)) {
+        Finish();
+    }
     // The sparse buffer manager cannot keep a CPU write's watcher armed, so
     // CP writes take the plain store and its fault.
     return false;

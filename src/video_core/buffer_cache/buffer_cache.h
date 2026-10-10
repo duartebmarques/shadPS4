@@ -119,6 +119,11 @@ public:
     /// whatever is mapped there at their next use. Any thread.
     void UnmapInPlace(VAddr device_addr, u64 size);
 
+    /// The command processor writes this memory on the CPU (in parse order, not GPU order).
+    /// Returns true when a block already read in place is marked for the first time: work
+    /// queued against it must finish before the write lands.
+    bool NoteCpWrite(VAddr device_addr, u64 size);
+
     /// Whether every block of the range is bound in place (the GPU reads the guest's bytes).
     [[nodiscard]] bool IsAllInPlace(VAddr device_addr, u64 size) const {
         return in_place && size != 0 &&
@@ -134,6 +139,9 @@ public:
         u64 resident_hits;
         u64 sync_peeks;
         u64 sync_clean;
+        u64 small_in_place;  ///< Small reads bound in place (no copy).
+        u64 small_cp_marked; ///< Small reads copied: the CP wrote that memory at parse time.
+        u64 small_other;     ///< Small reads copied: memory not bound in place.
     };
     FastPathStats DrainFastPathStats() {
         return std::exchange(fast_stats, {});
@@ -208,6 +216,9 @@ private:
     /// Streams a read-only range through the copy lane. Returns the stream buffer offset, or
     /// nullopt when the range must be copied inline.
     std::optional<u64> StreamViaLane(VAddr device_addr, u32 size);
+    /// A small read-only range bound in place, or nullopt (the caller copies it).
+    std::optional<std::pair<const Buffer*, u64>> TryInPlaceRead(VAddr device_addr, u32 size);
+    bool IsCpWritten(u64 first_block, u64 last_block) const;
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -266,6 +277,13 @@ private:
     /// Newest tick of a GPU write to in-place memory, per 1 MiB of guest address space.
     static constexpr u32 WriteTickShift = 20;
     std::unique_ptr<std::atomic<u64>[]> in_place_write_ticks;
+    /// inplace_guest_memory 3: small read-only buffers are read in place too, unless the command
+    /// processor writes their memory while parsing (CE constant dumps, CPU-side WRITE_DATA/DMA):
+    /// queued draws must keep the snapshot those writes would otherwise overtake.
+    bool in_place_small_reads{};
+    /// One bit per sparse block the command processor wrote on the CPU. Sticky.
+    std::unique_ptr<std::atomic<u64>[]> cp_written_bits;
+    u64 cp_written_words{};
     bool clean_sync_peek{};
     FastPathStats fast_stats{};
 

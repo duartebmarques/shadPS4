@@ -129,6 +129,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                 in_place_bits.resize((u64{blocks_per_arena_page} * NUM_ARENA_PAGES + 63) / 64);
                 in_place_write_ticks =
                     std::make_unique<std::atomic<u64>[]>(u64{1} << (40 - WriteTickShift));
+                in_place_small_reads = EmulatorSettings.GetInplaceGuestMemory() >= 3;
+                cp_written_words = in_place_bits.size();
+                cp_written_bits = std::make_unique<std::atomic<u64>[]>(cp_written_words);
+                LOG_INFO(Render_Vulkan, "Guest memory in place: small reads in place: {}",
+                         in_place_small_reads);
             } else {
                 sparse_external_memory = false;
             }
@@ -363,6 +368,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     // guest memory in place this also keeps small reads a snapshot of guest memory at record
     // time, as command processor writes executed on the CPU expect.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+        if (in_place_small_reads) {
+            if (const auto bound = TryInPlaceRead(device_addr, size)) {
+                return *bound;
+            }
+        }
         if (const auto lane_offset = StreamViaLane(device_addr, size)) {
             return {&stream_buffer, *lane_offset};
         }
@@ -578,6 +588,67 @@ bool BufferCache::AllInPlace(u64 first_block, u64 last_block) const {
         }
     }
     return true;
+}
+
+bool BufferCache::IsCpWritten(u64 first_block, u64 last_block) const {
+    for (u64 block = first_block; block <= last_block; ++block) {
+        if ((block >> 6) >= cp_written_words) {
+            return true;
+        }
+        if ((cp_written_bits[block >> 6].load(std::memory_order_relaxed) >> (block & 63)) & 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool BufferCache::NoteCpWrite(VAddr device_addr, u64 size) {
+    if (!in_place_small_reads || size == 0) {
+        return false;
+    }
+    bool newly_in_place = false;
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    for (u64 block = first_block; block <= last_block && (block >> 6) < cp_written_words;
+         ++block) {
+        const u64 bit = u64{1} << (block & 63);
+        auto& word = cp_written_bits[block >> 6];
+        if (!(word.load(std::memory_order_relaxed) & bit)) {
+            word.fetch_or(bit, std::memory_order_relaxed);
+            newly_in_place |= ((in_place_bits[block >> 6] >> (block & 63)) & 1) != 0;
+        }
+    }
+    return newly_in_place;
+}
+
+std::optional<std::pair<const Buffer*, u64>> BufferCache::TryInPlaceRead(VAddr device_addr,
+                                                                          u32 size) {
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    if (IsCpWritten(first_block, last_block)) {
+        ++fast_stats.small_cp_marked;
+        return std::nullopt;
+    }
+    if (!AllInPlace(first_block, last_block)) {
+        // Bind it in place only when all of it can be: device memory for a small read would
+        // cost an upload that the stream copy avoids.
+        vk::DeviceMemory memory{};
+        u64 memory_block{};
+        if (AllResident(first_block, last_block) ||
+            InPlaceRun(first_block, last_block + 1, &memory, &memory_block) !=
+                last_block - first_block + 1) {
+            ++fast_stats.small_other;
+            return std::nullopt;
+        }
+        EnsureResident(GetArena(first_block, last_block), first_block, last_block);
+        if (!AllInPlace(first_block, last_block)) {
+            ++fast_stats.small_other;
+            return std::nullopt;
+        }
+    }
+    ++fast_stats.small_in_place;
+    const auto* arena = GetArena(first_block, last_block);
+    return std::pair{arena, arena->Offset(device_addr)};
 }
 
 bool BufferCache::IsAnyInPlace(VAddr device_addr, u64 size) const {
