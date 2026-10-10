@@ -275,3 +275,4 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - Barriers 0.86% of frame. Wavefront occupancy: ~40% of the frame near-empty — a chain of tiny dispatches (1–183 workgroups, ~7 µs each) interleaved with depth passes.
 - Dispatch census: **93% of dispatches are from the PS4 async compute queue** (~740/frame), executed serialized in the single Vulkan graphics queue. On PS4 they overlap graphics.
 - Next: real async compute queue (design draft in local `agent/review/ASYNC_COMPUTE.md`).
+- Async compute prototype (branch `async-compute`, setting `async_compute_queue`, off): works and renders correctly, no fps gain. RGP shows the first half of the frame is the GPU **starved by the command processor** (gaps between small command buffers while the CP records ~2700 shadow draws + ~740 dispatches at ~5 µs CPU each). Next: faster command recording (bbport's two-stage pipeline).
