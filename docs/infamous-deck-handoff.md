@@ -269,3 +269,9 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - Known visual issues parked: window-frame "refocus" flicker; particle/debris ghosting.
 - 2026-10-11: play build is now local eddff94 with `guest_sync_barriers` on (17.75 fps verified). Decode-time fences with in-place memory → device lost (rejected).
 - Image↔buffer transfers (bbport's Deck bottleneck): ~10 async downloads/frame (27 MB), ~1% of GPU time, zero CP waits. Not our bottleneck. Patch: `claude/copy-stats.patch`.
+
+### RGP capture: root cause of the latency-bound GPU (2026-10-11)
+- Radeon GPU Profiler 2.7.1 (`~/Applications/RadeonDeveloperToolSuite/`), capture `MESA_VK_TRACE=rgp` + trigger file.
+- Barriers 0.86% of frame. Wavefront occupancy: ~40% of the frame near-empty — a chain of tiny dispatches (1–183 workgroups, ~7 µs each) interleaved with depth passes.
+- Dispatch census: **93% of dispatches are from the PS4 async compute queue** (~740/frame), executed serialized in the single Vulkan graphics queue. On PS4 they overlap graphics.
+- Next: real async compute queue (design draft in local `agent/review/ASYNC_COMPUTE.md`).
