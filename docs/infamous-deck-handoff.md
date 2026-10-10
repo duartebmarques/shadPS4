@@ -268,3 +268,4 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - No GS emulation (only 13 tess pairs). Next: instruction-level profiling (RGP/SQTT) to find which work is latency-bound.
 - Known visual issues parked: window-frame "refocus" flicker; particle/debris ghosting.
 - 2026-10-11: play build is now local eddff94 with `guest_sync_barriers` on (17.75 fps verified). Decode-time fences with in-place memory → device lost (rejected).
+- Image↔buffer transfers (bbport's Deck bottleneck): ~10 async downloads/frame (27 MB), ~1% of GPU time, zero CP waits. Not our bottleneck. Patch: `claude/copy-stats.patch`.
