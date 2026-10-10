@@ -230,3 +230,17 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - **Revert:** `$W $P/pp_od_clk_voltage r; $W $P/pp_od_clk_voltage c; $W $P/power_dpm_force_performance_level auto` (a reboot also resets it).
 - Status: waiting for the user to run the lock; then rerun `infamous-fps` off/on with `build/shadps4` and check `freq1_input`.
 - Wrapper written: `~/.local/bin/deck-gpu-clock lock <200-1600> | auto | status` (only touches the GPU clock, via steamos-priv-write). Claude cannot chmod it or allow it for itself (auto mode blocks self-granted permissions); the user has to run `chmod +x` and add a Bash allow rule for it.
+- `deck-gpu-clock` is approved and works autonomously (user ran chmod and allowed it). Always `deck-gpu-clock auto` after a test.
+
+### Result: GPU clock barely matters (1600 vs 1040 MHz, 2026-10-10 ~22:30)
+`infamous-fps`, Release build `build/` (9103c21), same scene. Sampler log: `profiles/clock-1600.txt`.
+
+| GPU clock | guest_sync_barriers off | on |
+|---|---|---|
+| auto (sits at 1040) | 17.14 | 17.80 |
+| locked 1600 | 17.93 (+4.6%) | 17.80 (+0%) |
+
+- The clock really held 1600 MHz under load (avg sclk 1600), with total power about 14.8 W, right at the 15 W cap. GPU busy was still about 99–100%.
+- A 54% higher shader clock gives at most about 4.6% FPS, and nothing on top of guest_sync_barriers. So the GPU is "busy" but not shader-bound: it is stalled on memory/fabric (mclk is already at its 800 MHz max on shared LPDDR5) or on serialization (drains, tiny draws, idle waits that count as busy).
+- The earlier note "1600 = same FPS" holds. Raising the clock is not the lever; cutting memory traffic and GPU-side serialization is.
+- Next candidates: memory traffic per frame (shadow map 2048² D32 + color, guest memory in GTT versus VRAM, tiling/compression of render targets), and whether the always-3.5 GHz spinning CPU threads steal power and fabric bandwidth from the GPU (try a yielding spin or a lower CPU clock cap and measure).
