@@ -162,6 +162,26 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
                  vk::AccessFlagBits2::eTransferWrite);
 }
 
+void Runtime::UpdateBuffer(const VideoCore::Buffer* dst, u64 offset, std::span<const u8> data) {
+    if (data.empty()) {
+        return;
+    }
+    scheduler.EndRendering();
+    if (IsBufferAccessed(dst, offset, data.size(), true)) {
+        FlushBarriers();
+    }
+    const auto cmdbuf = scheduler.CommandBuffer();
+    // vkCmdUpdateBuffer takes at most 64 KiB; the data is copied into the command buffer.
+    constexpr std::size_t Piece = 32_KB;
+    for (std::size_t at = 0; at < data.size(); at += Piece) {
+        const std::size_t piece = std::min(Piece, data.size() - at);
+        cmdbuf.updateBuffer(dst->Handle(), offset + at, piece, data.data() + at);
+    }
+    // Synchronization2 places vkCmdUpdateBuffer in the clear stage.
+    AccessBuffer(dst, offset, data.size(), vk::PipelineStageFlagBits2::eAllTransfer,
+                 vk::AccessFlagBits2::eTransferWrite);
+}
+
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {

@@ -113,7 +113,7 @@ static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
 
 namespace {
 void WriteFenceLabel(const std::optional<Liverpool::FenceWrite>& write) {
-    if (write && !Core::Memory::Instance()->TryWriteLabel(write->address, write->value,
+    if (write && write->cpu_write && !Core::Memory::Instance()->TryWriteLabel(write->address, write->value,
                                                           write->num_bytes)) {
         LOG_WARNING(Render, "Fence label {:#x} was unmapped before the GPU finished",
                     write->address);
@@ -320,6 +320,21 @@ SHAD_FORCE_INLINE static void CpWriteOrCopy(Vulkan::Rasterizer* rasterizer, void
     if (!rasterizer || !rasterizer->TryCpWriteBacking(std::bit_cast<VAddr>(dst), src, size)) {
         std::memcpy(dst, src, size);
     }
+}
+
+void Liverpool::WriteData(const PM4CmdWriteData* write_data, u32 data_size) {
+    const VAddr address = write_data->Address<VAddr>();
+    if (honest_fences_ && rasterizer &&
+        rasterizer->WriteDataOnGpu(address, write_data->data, data_size)) {
+        if (data_size <= sizeof(u64)) {
+            // The CP may poll it next: met in stream order, like a queued label.
+            u64 value = 0;
+            std::memcpy(&value, write_data->data, data_size);
+            QueueHonestSignal(FenceWrite{address, value, data_size, false}, std::nullopt);
+        }
+        return;
+    }
+    CpWriteOrCopy(rasterizer, write_data->Address<void*>(), write_data->data, data_size);
 }
 
 Liverpool::Liverpool() {
@@ -1165,6 +1180,10 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
                                 u32(dma_data->dst_sel));
             }
+            if (honest_fences_) {
+                // In place, the DMA may run on the GPU: a later wait on its result flushes.
+                honest_signal_tick_ = rasterizer->CurrentTick();
+            }
             break;
         }
         case PM4ItOpcode::WriteData: {
@@ -1173,8 +1192,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
                 FenceDrainAndDownload(rasterizer);
-                CpWriteOrCopy(rasterizer, write_data->Address<void*>(), write_data->data,
-                              data_size);
+                WriteData(write_data, data_size);
             } else {
                 UNREACHABLE();
             }
@@ -1471,6 +1489,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
                                 u32(dma_data->dst_sel));
             }
+            if (honest_fences_) {
+                // In place, the DMA may run on the GPU: a later wait on its result flushes.
+                honest_signal_tick_ = rasterizer->CurrentTick();
+            }
             break;
         }
         case PM4ItOpcode::AcquireMem: {
@@ -1564,8 +1586,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
                 FenceDrainAndDownload(rasterizer);
-                CpWriteOrCopy(rasterizer, write_data->Address<void*>(), write_data->data,
-                              data_size);
+                WriteData(write_data, data_size);
             } else {
                 UNREACHABLE();
             }

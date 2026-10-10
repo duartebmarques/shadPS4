@@ -37,6 +37,7 @@ struct VideoOutPort;
 namespace AmdGpu {
 
 struct PM4CmdWaitRegMem;
+struct PM4CmdWriteData;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -308,6 +309,7 @@ public:
         VAddr address;
         u64 value;
         u32 num_bytes;
+        bool cpu_write = true; ///< False: the GPU writes it; only WAIT_REG_MEM resolution needs it.
     };
 
 private:
@@ -317,6 +319,8 @@ private:
                            std::optional<Platform::InterruptId> irq);
     /// Submits the recorded work when it holds queued honest signals.
     void FlushHonestSignals();
+    /// WRITE_DATA: on the GPU in stream order where it targets memory bound in place.
+    void WriteData(const PM4CmdWriteData* write_data, u32 data_size);
     /// Whether a queued, not yet written label will make the wait pass (the GPU runs the queues
     /// in recording order, so the wait is met by stream order).
     bool PendingLabelSatisfies(const PM4CmdWaitRegMem* wait);

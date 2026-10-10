@@ -580,6 +580,21 @@ bool BufferCache::AllInPlace(u64 first_block, u64 last_block) const {
     return true;
 }
 
+bool BufferCache::IsAnyInPlace(VAddr device_addr, u64 size) const {
+    if (!in_place || size == 0) {
+        return false;
+    }
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block =
+        std::min<u64>((device_addr + size - 1) >> block_shift, in_place_bits.size() * 64 - 1);
+    for (u64 block = first_block; block <= last_block; ++block) {
+        if ((in_place_bits[block >> 6] >> (block & 63)) & 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 u64 BufferCache::InPlaceRun(u64 block, u64 end, vk::DeviceMemory* out_memory,
                             u64* out_memory_block) const {
     const auto phys = memory->DirectPhysOf(block << block_shift, block_size);

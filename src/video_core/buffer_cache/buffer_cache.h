@@ -119,6 +119,15 @@ public:
     /// whatever is mapped there at their next use. Any thread.
     void UnmapInPlace(VAddr device_addr, u64 size);
 
+    /// Whether every block of the range is bound in place (the GPU reads the guest's bytes).
+    [[nodiscard]] bool IsAllInPlace(VAddr device_addr, u64 size) const {
+        return in_place && size != 0 &&
+               AllInPlace(device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
+    }
+
+    /// Whether any block of the range is bound in place.
+    [[nodiscard]] bool IsAnyInPlace(VAddr device_addr, u64 size) const;
+
     /// residency_bitmap and clean_sync_peek telemetry, reset on read.
     struct FastPathStats {
         u64 resident_checks;

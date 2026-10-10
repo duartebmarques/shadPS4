@@ -2959,7 +2959,10 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
                "FillBuffer address and size must be a multiple of 4 bytes");
     if (!is_gds) {
         texture_cache.ClearMeta(address);
-        if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+        // Memory the GPU reads in place is filled by the GPU in stream order: a fill on the CPU
+        // now would land before earlier queued draws read the old data.
+        if (!buffer_cache.IsRegionGpuModified(address, num_bytes) &&
+            !buffer_cache.IsAnyInPlace(address, num_bytes)) {
             VideoCore::StreamCopyLane::Instance().DrainProducer();
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
@@ -2976,7 +2979,8 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes) &&
+        !buffer_cache.IsAnyInPlace(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory, once
@@ -3023,6 +3027,18 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     Skipcache::Framework::Instance().BumpMemGen();
+    return true;
+}
+
+bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
+    // A CP write into memory the GPU reads in place is recorded in stream order: a CPU store at
+    // parse time would land before queued draws have read the old value.
+    if (size == 0 || ((address | size) & 3) != 0 || !buffer_cache.IsAllInPlace(address, size)) {
+        return false;
+    }
+    texture_cache.InvalidateMemoryFromGPU(address, size);
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, size, true);
+    runtime.UpdateBuffer(buffer, offset, {static_cast<const u8*>(data), size});
     return true;
 }
 

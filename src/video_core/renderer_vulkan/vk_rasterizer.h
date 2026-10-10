@@ -80,6 +80,8 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
+    /// WRITE_DATA into memory bound in place, recorded on the GPU. False: write on the CPU.
+    bool WriteDataOnGpu(VAddr address, const void* data, u32 size);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
