@@ -466,6 +466,8 @@ public:
 
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
+    /// Usage and the driver's current budget over the same heaps, from one query.
+    void GetDeviceMemoryUsageAndBudget(u64& usage, u64& budget) const;
 
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {

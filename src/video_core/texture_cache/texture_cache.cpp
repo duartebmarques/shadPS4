@@ -1867,7 +1867,23 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+        u64 budget = 0;
+        if (instance.IsIntegrated()) {
+            instance.GetDeviceMemoryUsageAndBudget(total_used_memory, budget);
+        } else {
+            total_used_memory = instance.GetDeviceMemoryUsage();
+        }
+        // On integrated GPUs (Steam Deck) the usage covers the system-memory heaps, which hold
+        // far more than images (the buffers backing guest memory), while the startup budget
+        // keeps only what is left after an 8 GB system reserve (its 2 GB floor on the Deck).
+        // Usage then sat above the critical mark for good, and every submission evicted images
+        // used a few frames ago and uploaded them again. Compare with the driver's current
+        // budget instead. Ported from bbport (deadinside28/bloodborne_pc).
+        if (budget != 0) {
+            trigger_gc_memory = budget / 10 * 7;
+            pressure_gc_memory = budget / 100 * 85;
+            critical_gc_memory = budget / 100 * 95;
+        }
     }
     if (total_used_memory < trigger_gc_memory) {
         return;

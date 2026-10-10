@@ -281,6 +281,27 @@ u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan
     return num_spans;
 }
 
+namespace {
+// A memcpy of a runtime 4 or 8 bytes is two overlapping stores in glibc. GPU labels (EOP/EOS
+// fences) go through TryWriteBacking; a thread preempted between the two stores could write
+// the label again after the game had already moved on and freed its block. Write such small
+// aligned values with one store. Ported from bbport (deadinside28/bloodborne_pc).
+inline void CopyToBacking(void* dst, const void* src, u64 size) {
+    const auto addr = reinterpret_cast<uintptr_t>(dst);
+    if (size == 8 && (addr & 7) == 0) {
+        u64 v;
+        std::memcpy(&v, src, 8);
+        __atomic_store_n(static_cast<u64*>(dst), v, __ATOMIC_RELEASE);
+    } else if (size == 4 && (addr & 3) == 0) {
+        u32 v;
+        std::memcpy(&v, src, 4);
+        __atomic_store_n(static_cast<u32*>(dst), v, __ATOMIC_RELEASE);
+    } else {
+        std::memcpy(dst, src, size);
+    }
+}
+} // Anonymous namespace
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     // Shared lock unless a GuestCopyScope already holds it (see GuestCopyScope).
@@ -303,7 +324,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 virtual_addr + size <= e.end) {
                 ++memo.hits;
                 memo.hit_bytes += size;
-                std::memcpy(e.backing + (virtual_addr - e.base), data, size);
+                CopyToBacking(e.backing + (virtual_addr - e.base), data, size);
                 return true;
             }
         }
@@ -347,7 +368,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                     ++memo.multi;
                 }
             }
-            memcpy(backing, data, copy_size);
+            CopyToBacking(backing, data, copy_size);
             data = static_cast<const u8*>(data) + copy_size;
             size -= copy_size;
         }
