@@ -126,6 +126,13 @@ void GameController::PollState() {
     PushStateLocked();
 }
 
+void GameController::SetShake(bool active) {
+    std::lock_guard lock{m_state_mutex};
+    m_shake_active = active;
+    m_shake_start = Libraries::Kernel::sceKernelGetProcessTime();
+    PushStateLocked();
+}
+
 void GameController::ResetOrientation() {
     std::lock_guard lock{m_state_mutex};
     m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -211,7 +218,20 @@ void GameController::PushStateLocked(u64 timestamp) {
     }
     m_state.UpdateAxisSmoothing(timestamp);
     m_state.OnGyro(gyro_buf);
-    m_state.OnAccel(accel_buf);
+    if (m_shake_active) {
+        // Emulate shaking a spray can: a strong ~7 Hz oscillation on every axis on top of the
+        // real reading, so the shake registers whatever axis or orientation the game checks.
+        constexpr float amplitude = 2.5f * 9.81f; // m/s^2, about 2.5 G
+        constexpr float frequency = 7.0f;         // Hz
+        const float t = static_cast<float>(timestamp - m_shake_start) / 1'000'000.f;
+        const float wave = std::sin(2.0f * 3.14159265f * frequency * t) >= 0.0f ? 1.0f : -1.0f;
+        const float shaken[3] = {accel_buf[0] + amplitude * wave,
+                                 accel_buf[1] + amplitude * wave,
+                                 accel_buf[2] + amplitude * wave};
+        m_state.OnAccel(shaken);
+    } else {
+        m_state.OnAccel(accel_buf);
+    }
     UpdateOrientationLocked(timestamp);
     m_state.time = timestamp;
     m_state.touch_time_since_held_down =

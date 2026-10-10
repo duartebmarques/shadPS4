@@ -99,6 +99,7 @@ public:
     void UpdateAcceleration(const float acceleration[3]);
     void PollState();
     void ResetOrientation();
+    void SetShake(bool active);
     void SetLightBarRGB(u8 const r, u8 const g, u8 const b);
     void SetLightBarRGB(Colour const c);
     Colour GetLightBarRGB();
@@ -118,6 +119,8 @@ private:
     u8 m_next_touch_id{1};
     u64 m_touch_down_timestamp{};
     u64 m_last_orientation_update{};
+    bool m_shake_active{};
+    u64 m_shake_start{};
     Colour colour;
     std::optional<Colour> override_colour{};
 
