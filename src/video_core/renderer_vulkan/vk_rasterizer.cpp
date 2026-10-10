@@ -1044,6 +1044,10 @@ void Rasterizer::OnSubmit() {
     runtime.TickFrame();
 }
 
+void Rasterizer::NoteGuestSync() {
+    runtime.NoteGuestSync();
+}
+
 void Rasterizer::OnFence() {
     // The downloads wait on the GPU, so the guest-copy hold goes first.
     if (texture_cache.HasPendingDownloads()) {
@@ -1344,6 +1348,10 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
     const auto fs = buffer_cache.DrainFastPathStats();
     const auto [barrier_adds, barrier_skips] = runtime.DrainBarrierAddStats();
     const u64 stream_skips = runtime.DrainUntrackedSkips();
+    if (const auto [syncs, relaxed] = runtime.DrainGuestSyncStats(); syncs || relaxed) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] GUESTSYNC syncs={} relaxed_writes={} per300f",
+                 syncs, relaxed);
+    }
     if (barrier_adds || fs.resident_checks || stream_skips || fs.sync_peeks) {
         LOG_INFO(Render_Skipcache,
                  "[SkipCache] FASTPATH barrier={}/{} resident={}/{} stream={} sync={}/{} "
@@ -1835,7 +1843,7 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (const auto [buffer, offset, size, src_access] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
-        runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access);
+        runtime.AccessBuffer(buffer, offset, size, dst_stage, src_access, true);
     }
     bound_images.clear();
     bound_buffers.clear();
@@ -2037,8 +2045,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{gds_buf->Handle(), 0, gds_buf->SizeBytes()};
-                needs_barrier |=
-                    runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
+                needs_barrier |= runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(),
+                                                          desc.is_written, true);
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), src_access);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
@@ -2110,7 +2118,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                needs_barrier |=
+                    runtime.IsBufferAccessed(buffer, offset, size, desc.is_written, true);
             }
         }
 

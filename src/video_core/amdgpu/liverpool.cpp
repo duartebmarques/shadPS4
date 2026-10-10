@@ -107,7 +107,15 @@ SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateS
 static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
     VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (rasterizer) {
+        rasterizer->NoteGuestSync();
         rasterizer->OnFence();
+    }
+}
+
+// Packets that order the guest GPU's later work after its earlier work.
+static void NoteGuestSync(Vulkan::Rasterizer* rasterizer) {
+    if (rasterizer) {
+        rasterizer->NoteGuestSync();
     }
 }
 
@@ -1069,6 +1077,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             break;
         }
         case PM4ItOpcode::EventWrite: {
+            NoteGuestSync(rasterizer);
             const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
             LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                       magic_enum::enum_name(event->event_type.Value()),
@@ -1219,7 +1228,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         case PM4ItOpcode::IndirectBuffer:
             return dcb;
         case PM4ItOpcode::AcquireMem: {
-            // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
+            NoteGuestSync(rasterizer);
             break;
         }
         case PM4ItOpcode::IncrementDeCounter: {
@@ -1294,6 +1303,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         switch (header->type3.opcode) {
         case PM4ItOpcode::MemSemaphore: {
+            NoteGuestSync(rasterizer);
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
@@ -1316,6 +1326,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             break;
         }
         case PM4ItOpcode::WaitRegMem: {
+            NoteGuestSync(rasterizer);
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             // Optimization: VO label waits are special because the emulator
@@ -1496,6 +1507,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::AcquireMem: {
+            NoteGuestSync(rasterizer);
             break;
         }
         case PM4ItOpcode::Rewind: {
@@ -1593,6 +1605,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::MemSemaphore: {
+            NoteGuestSync(rasterizer);
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
@@ -1605,6 +1618,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::WaitRegMem: {
+            NoteGuestSync(rasterizer);
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             if (honest_fences_ && !wait_reg_mem->Test(regs.reg_array) &&
@@ -1672,7 +1686,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::EventWrite: {
-            // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            NoteGuestSync(rasterizer);
             break;
         }
         default:

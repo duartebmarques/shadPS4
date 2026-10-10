@@ -96,6 +96,8 @@ public:
     void DeferAfterTick(u64 tick, Common::UniqueFunction<void>&& func);
     void Finish();
     void OnSubmit();
+    /// A synchronizing guest packet; see the guest_sync_barriers setting.
+    void NoteGuestSync();
     void OnFence();
 
     // Scopes a guest-copy hold to one packet run: the caller yields to guest

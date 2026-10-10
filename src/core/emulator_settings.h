@@ -498,6 +498,12 @@ struct GPUSettings {
     // 3: also read small read-only buffers in place instead of copying them to the stream
     // buffer, except memory the command processor writes on the CPU (constant dumps).
     Setting<u32> inplace_guest_memory{0};
+    // Order guest shader buffer writes the way the guest GPU does: a write overlapping only
+    // accesses that guest draws and dispatches made since the last synchronizing packet (partial
+    // flushes, cache flushes, ACQUIRE_MEM, waits and end-of-pipe/shader signals) gets no barrier,
+    // as such work may overlap on the guest GPU too. Reads after writes and every access made by
+    // emulator transfers keep their barriers.
+    Setting<bool> guest_sync_barriers{false};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
     // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
@@ -761,6 +767,7 @@ struct GPUSettings {
             GPU_OVERRIDE(clean_sync_peek),
             GPU_OVERRIDE(readback_offload),
             GPU_OVERRIDE(inplace_guest_memory),
+            GPU_OVERRIDE(guest_sync_barriers),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(pending_pop_throttle),
             GPU_OVERRIDE(stream_copy_workers),
@@ -852,7 +859,7 @@ struct GPUSettings {
     runtime_info_stamp_gate, userfaultfd, gpu_thread_core_reserve, one_thread_per_core, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
-    clean_sync_peek, readback_offload, inplace_guest_memory
+    clean_sync_peek, readback_offload, inplace_guest_memory, guest_sync_barriers
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1179,6 +1186,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, CleanSyncPeek, clean_sync_peek)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
     SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
+    SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)
