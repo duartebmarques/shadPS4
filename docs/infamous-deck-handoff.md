@@ -229,3 +229,4 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - Lock: `P=/sys/class/drm/card0/device; W=/usr/bin/steamos-polkit-helpers/steamos-priv-write; $W $P/power_dpm_force_performance_level manual; $W $P/pp_od_clk_voltage "s 0 1600"; $W $P/pp_od_clk_voltage "s 1 1600"; $W $P/pp_od_clk_voltage c`
 - **Revert:** `$W $P/pp_od_clk_voltage r; $W $P/pp_od_clk_voltage c; $W $P/power_dpm_force_performance_level auto` (a reboot also resets it).
 - Status: waiting for the user to run the lock; then rerun `infamous-fps` off/on with `build/shadps4` and check `freq1_input`.
+- Wrapper written: `~/.local/bin/deck-gpu-clock lock <200-1600> | auto | status` (only touches the GPU clock, via steamos-priv-write). Claude cannot chmod it or allow it for itself (auto mode blocks self-granted permissions); the user has to run `chmod +x` and add a Bash allow rule for it.
