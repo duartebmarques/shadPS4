@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -1885,7 +1886,23 @@ void TextureCache::GarbageCollectImages() {
             critical_gc_memory = budget / 100 * 95;
         }
     }
-    if (total_used_memory < trigger_gc_memory) {
+    // Integrated GPUs (Steam Deck): images left unused for IdleSeconds go even below the trigger,
+    // so the textures of areas left behind do not pile up in the shared system memory until the
+    // budget marks are reached. Ported from bbport (deadinside28/bloodborne_pc).
+    constexpr u64 IdleSeconds = 20;
+    u64 idle_tick = 0;
+    if (instance.IsIntegrated()) {
+        const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+        if (second != gc_second) {
+            gc_second = second;
+            gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+        }
+        idle_tick = gc_tick_at_second[(second - IdleSeconds) % gc_tick_at_second.size()];
+    }
+    const bool below_trigger = total_used_memory < trigger_gc_memory;
+    if (below_trigger && idle_tick == 0) {
         return;
     }
     lru_lazy_gc_runs_ += lru_lazy_touch;
@@ -1898,6 +1915,30 @@ void TextureCache::GarbageCollectImages() {
         FlushMemoRangeBatch();
         memo_range_batching_ = false;
     };
+    if (below_trigger) {
+        // Idle pass: only images the CPU side can drop without a write-back (GPU-written ones
+        // stay), at most a few per collection and a bounded walk.
+        size_t idle_deletions = 10;
+        u32 visited = 0;
+        image_lru_cache.ForEachItemBelow(idle_tick, [&](Image& image) {
+            if (idle_deletions == 0 || ++visited > 256) {
+                return true;
+            }
+            if (image.gc_tick_accessed_last >= idle_tick) {
+                // Lazy touch mode: the list tick is only a lower bound; relink at gc_tick.
+                image_lru_cache.Touch(image, gc_tick);
+                return false;
+            }
+            if (image.SafeToDownload()) {
+                return false;
+            }
+            --idle_deletions;
+            FreeImage(slot_images.GetSlotId(image));
+            return false;
+        });
+        return;
+    }
+
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;

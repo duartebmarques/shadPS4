@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -763,6 +765,10 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    // gc_tick at the first collection of each of the last 64 seconds, to age images in seconds
+    // (integrated GPUs evict images unused for a while even below the trigger).
+    std::array<u64, 64> gc_tick_at_second{};
+    u64 gc_second = 0;
     Common::LRUCache<Image> image_lru_cache;
     // Lazy-touch GC-walk accounting; only written with lru_lazy_touch latched on.
     u64 lru_lazy_gc_runs_{};

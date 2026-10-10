@@ -651,8 +651,13 @@ void Instance::CreateAllocator() {
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
     };
+    // 64 MiB blocks instead of VMA's 256 MiB: a block only goes back to the driver once all of it
+    // is free, so a few surviving images held large blocks in place. On integrated GPUs (Steam
+    // Deck) that memory is system RAM. Ported from bbport (deadinside28/bloodborne_pc).
+    VmaAllocatorCreateInfo allocator_info_sized = allocator_info;
+    allocator_info_sized.preferredLargeHeapBlockSize = 64ULL << 20;
 
-    const VkResult result = vmaCreateAllocator(&allocator_info, &allocator);
+    const VkResult result = vmaCreateAllocator(&allocator_info_sized, &allocator);
     if (result != VK_SUCCESS) {
         UNREACHABLE_MSG("Failed to initialize VMA with error {}",
                         vk::to_string(vk::Result{result}));
