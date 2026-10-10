@@ -223,3 +223,9 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 ### Working tree state at 2026-10-10 ~22:05
 - Uncommitted: the shadow-draw probe in `vk_scheduler.*` and `vk_rasterizer.cpp` (diagnostic only, never commit). Saved as `claude/shadow-draw-probe.patch`; `git checkout -- src` drops it.
 - Installed game build: CI 3834b34 (`infamous-build status`). Local builds: `build/` = Release with 9103c21, `build-prof/` = probe build.
+
+### GPU clock lock from Desktop Mode (2026-10-10 ~22:15)
+- Game Mode's Manual GPU Clock is not available in Desktop Mode, but `/usr/bin/steamos-polkit-helpers/steamos-priv-write <sysfs path> <value>` works without a password (polkit allow_active=yes). It is the same helper Game Mode uses. Claude Code's auto mode blocks Claude from calling it, so the user runs it with `!`.
+- Lock: `P=/sys/class/drm/card0/device; W=/usr/bin/steamos-polkit-helpers/steamos-priv-write; $W $P/power_dpm_force_performance_level manual; $W $P/pp_od_clk_voltage "s 0 1600"; $W $P/pp_od_clk_voltage "s 1 1600"; $W $P/pp_od_clk_voltage c`
+- **Revert:** `$W $P/pp_od_clk_voltage r; $W $P/pp_od_clk_voltage c; $W $P/power_dpm_force_performance_level auto` (a reboot also resets it).
+- Status: waiting for the user to run the lock; then rerun `infamous-fps` off/on with `build/shadps4` and check `freq1_input`.
