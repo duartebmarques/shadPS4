@@ -267,3 +267,4 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - gpu_metrics: GFX 2.2 W "busy" vs CPU 6–7 W of a 12 W socket; 1600 MHz triggers PPT throttling. GPU work is latency-bound (DRAM traffic in the scattered-access regime).
 - No GS emulation (only 13 tess pairs). Next: instruction-level profiling (RGP/SQTT) to find which work is latency-bound.
 - Known visual issues parked: window-frame "refocus" flicker; particle/debris ghosting.
+- 2026-10-11: play build is now local eddff94 with `guest_sync_barriers` on (17.75 fps verified). Decode-time fences with in-place memory → device lost (rejected).
