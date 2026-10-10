@@ -244,3 +244,13 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - A 54% higher shader clock gives at most about 4.6% FPS, and nothing on top of guest_sync_barriers. So the GPU is "busy" but not shader-bound: it is stalled on memory/fabric (mclk is already at its 800 MHz max on shared LPDDR5) or on serialization (drains, tiny draws, idle waits that count as busy).
 - The earlier note "1600 = same FPS" holds. Raising the clock is not the lever; cutting memory traffic and GPU-side serialization is.
 - Next candidates: memory traffic per frame (shadow map 2048² D32 + color, guest memory in GTT versus VRAM, tiling/compression of render targets), and whether the always-3.5 GHz spinning CPU threads steal power and fabric bandwidth from the GPU (try a yielding spin or a lower CPU clock cap and measure).
+
+### 30 fps push (2026-10-10 ~22:40): game-side patches
+- The user asked for 30 fps fast. Levers: the game's own patches in `~/.local/share/shadPS4/patches/shadPS4/InfamousSecondSon.xml` (backup at `profiles/InfamousSecondSon.xml.orig`).
+- Enabled the motion blur, DOF and depth blur off switches; added a disabled "Render resolution 960x540" variant of the 720p patch (only the 1280/720 values changed).
+- Results (Release 9103c21, guest_sync_barriers on, GPU 1600): post-FX off 17.99 fps (vs 17.80); post-FX off + 960x540 18.01 fps. **Resolution and post-FX don't move FPS**, so the ~18 fps cap is serial/latency-bound, not GPU pixel work. Patch file left at 720p with the post-FX-off patches enabled. Paused at the user's request.
+- **Post-FX patches removed fire** (user report): the motion blur patch also skips an "unidentified post chain", which was evidently fire. Restored the original patch file. Don't enable those patches.
+- inplace_guest_memory 0: 14.37 fps (vs 17.80 in mode 3). In-place memory is a net win; snooped GTT is not the main cost.
+- `infamous-fps` shortened at the user's request: 1 warm-up + 3 windows of 300 frames (about 90 s plus load).
+- Feedback-loop usage off (DCC hypothesis): 17.53, rejected. CPU profile of GpuComm (53%, flat) and GpuSche (66%, mostly memcpy): emulator CPU side is not the limit.
+- **Work is now organized in `agent/` (local, git-excluded): STATUS.md, ideas/BACKLOG.md, experiments/NNN-*.md, results.csv, TOOLS.md.** Read `agent/STATUS.md` first when resuming.
