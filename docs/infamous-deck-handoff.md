@@ -207,7 +207,7 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - New GPU setting `guest_sync_barriers` (default off). A guest shader write that overlaps only accesses made by guest draws/dispatches since the last guest sync packet (partial flushes, cache flushes, ACQUIRE_MEM, waits, EOP/EOS signals) gets no barrier. RAW and every emulator transfer keep their barriers.
 - Timed FPS, same scene, Release build, 6 windows of 300 frames: **off 17.14, on 17.80 (+3.9%)**. About 41k syncs and 405k relaxed writes per 300 frames.
 - Not yet enabled in the user's config: waiting for the user to see it running without problems.
-- FPS method: `fps.sh <label> <binary> [key=value...]` (was in the old session's scratchpad, now lost) temporarily overrode config.json keys, ran unattended, timed the per-300-frame telemetry, and restored the config (`profiles/config.json.orig` is the backup).
+- FPS method: `infamous-fps <label> <binary> [key=value...]` (`~/.local/bin`, recovered from the old session) temporarily overrode config.json keys, ran unattended, timed the per-300-frame telemetry, and restored the config (`profiles/config.json.orig` is the backup).
 
 ### Per-draw shadow timing (SHAD_GPU_TIME, probe in `claude/shadow-draw-probe.patch`)
 - 2048² shadow pass: about 1040 ms of GPU per 4 s; timestamps around each draw add up to about 690 ms over about 188k draws (about 3.7 µs each).
