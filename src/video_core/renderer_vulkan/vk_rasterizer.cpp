@@ -1022,10 +1022,11 @@ void Rasterizer::OnSubmit() {
             rs.break_opcode[top] = 0;
         }
         LOG_INFO(Render,
-                 "PACKETS draws={} predicated={} dispatch={} occl={} setpred={} run={} runs={} "
-                 "outer={} brk={} per300f",
-                 pk.draws, pk.predicated_draws, pk.dispatches, pk.occlusion_events,
-                 pk.set_predication, rs.run_packets, rs.runs, rs.outer_packets, brk);
+                 "PACKETS draws={} predicated={} dispatch={} acb={} gfx2acb={} occl={} setpred={} "
+                 "run={} runs={} outer={} brk={} per300f",
+                 pk.draws, pk.predicated_draws, pk.dispatches, pk.acb_dispatches, pk.gfx_to_acb,
+                 pk.occlusion_events, pk.set_predication, rs.run_packets, rs.runs, rs.outer_packets,
+                 brk);
         pk = {};
         rs = {};
     }

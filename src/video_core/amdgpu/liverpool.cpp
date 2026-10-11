@@ -84,6 +84,12 @@ static inline std::span<const u32> NextPacket(std::span<const u32> span, size_t 
     UNREACHABLE_MSG("Wrong PM4 type {}", header->type.Value());
 }
 
+static void CountAcbDispatch(Liverpool::PacketStats& stats) {
+    ++stats.acb_dispatches;
+    stats.gfx_to_acb += stats.after_draw;
+    stats.after_draw = false;
+}
+
 [[noreturn]] static SHAD_NO_INLINE void UnknownPm4Opcode(u32 opcode, u32 count) {
     UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}", opcode, count);
 }
@@ -95,6 +101,7 @@ static inline std::span<const u32> NextPacket(std::span<const u32> span, size_t 
 SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateStamp& stamp,
                                         const PM4Header* header) {
     ++stats.draws;
+    stats.after_draw = true;
     if (header->type3.predicate.Value() == PM4Predicate::PredEnable) {
         ++stats.predicated_draws;
     }
@@ -121,8 +128,8 @@ static void NoteGuestSync(Vulkan::Rasterizer* rasterizer) {
 
 namespace {
 void WriteFenceLabel(const std::optional<Liverpool::FenceWrite>& write) {
-    if (write && write->cpu_write && !Core::Memory::Instance()->TryWriteLabel(write->address, write->value,
-                                                          write->num_bytes)) {
+    if (write && write->cpu_write &&
+        !Core::Memory::Instance()->TryWriteLabel(write->address, write->value, write->num_bytes)) {
         LOG_WARNING(Render, "Fence label {:#x} was unmapped before the GPU finished",
                     write->address);
     }
@@ -1548,6 +1555,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::DispatchDirect: {
+            CountAcbDispatch(packet_stats);
             const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
@@ -1574,6 +1582,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::DispatchIndirect: {
+            CountAcbDispatch(packet_stats);
             const auto* dispatch_indirect =
                 reinterpret_cast<const PM4CmdDispatchIndirectMec*>(header);
             auto& cs_program = GetCsRegs();

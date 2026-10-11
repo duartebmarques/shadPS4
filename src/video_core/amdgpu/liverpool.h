@@ -198,6 +198,9 @@ public:
         u64 dispatches;       // compute dispatches
         u64 occlusion_events; // ZpassDone events answered with a fake count
         u64 set_predication;  // SET_PREDICATION packets (currently ignored)
+        u64 acb_dispatches;   // compute queue dispatches
+        u64 gfx_to_acb;       // compute queue dispatches right after a graphics draw
+        bool after_draw;      // the last draw or dispatch was a graphics draw
     };
     PacketStats packet_stats{};
 

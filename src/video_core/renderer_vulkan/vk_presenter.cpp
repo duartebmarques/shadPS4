@@ -1084,7 +1084,38 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        NoteFrameTime();
     }
+}
+
+void Presenter::NoteFrameTime() {
+    // Frame pacing per 300 presented game frames: the average hides hitches, the tail shows them.
+    const auto now = std::chrono::steady_clock::now();
+    const auto prev = std::exchange(last_frame_time, now);
+    if (prev == std::chrono::steady_clock::time_point{}) {
+        return;
+    }
+    frame_times_us[num_frame_times++] =
+        static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(now - prev).count());
+    if (num_frame_times < frame_times_us.size()) {
+        return;
+    }
+    num_frame_times = 0;
+    auto sorted = frame_times_us;
+    std::ranges::sort(sorted);
+    u64 total = 0;
+    u32 over_40 = 0, over_50 = 0, over_100 = 0;
+    for (const u32 us : sorted) {
+        total += us;
+        over_40 += us > 40'000;
+        over_50 += us > 50'000;
+        over_100 += us > 100'000;
+    }
+    const auto ms = [](u64 us) { return static_cast<double>(us) / 1000.0; };
+    LOG_INFO(Render,
+             "FRAMETIME avg={:.1f} p99={:.1f} max={:.1f} >40ms={} >50ms={} >100ms={} per300f",
+             ms(total / sorted.size()), ms(sorted[sorted.size() * 99 / 100]), ms(sorted.back()),
+             over_40, over_50, over_100);
 }
 
 Frame* Presenter::GetRenderFrame() {
