@@ -198,10 +198,26 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - The shadow cost is per draw: about 2,700 draws per frame at about 5.6 µs of GPU each.
 - Next suspects: per-draw GPU-side overhead (pipeline switches, descriptor/push-constant churn, vertex fetch done in the shader) and context rolls.
 
-### Texture flicker (user-reported, 2026-10-10)
-- Symptom: a brief "refocus" on the building window frames (middle and left of the Fish Cannery view), every 2–10 s, sometimes lasting about 0.2 s.
-- Seen during runs of today's profiling builds. Whether the official 3834b34 build also has it is not yet confirmed: a 40 s x11grab capture of the CI build showed nothing, but the capture may simply have missed it.
-- The GC hypothesis (GPU-modified textures freed before their async download lands) was **not** supported. Only one non-GPU-modified 128×128/64×64 pair thrashes, every 10–25 s; GPU-modified frees only happen at load. Probe: `claude/gc-probe.patch`.
+### "Refocus" flicker (user-reported 2026-10-10, fixed 2026-10-11 in 795b116f)
+- Symptom: single frames where the background (window frames, foliage) is sharper, i.e. un-blurred.
+  ~220 per minute in the CAND-U fire scene with the GPU locked at 1600 MHz, ~7/min at 1040 MHz.
+- Cause: the game times its GPU frame with EOP timestamps (PerfCounter data select, ~5 per frame) and
+  enables an optional post chain (~6 extra full-screen draws) when the GPU time is under ~30.5 ms.
+  The emulator wrote host time at PM4 decode, so the game measured the command processor thread
+  (~31 ms per frame at 1600 MHz). The chain switched on and off every few frames, and the first frame
+  after each switch-on runs a history-reset variant: the sharp frame.
+- How it was found: a frame dump of every presented guest frame (luma) plus a list of the pipelines
+  used per frame (`claude/frame-diag.patch`). One pipeline appeared only on the spike frames (92/92).
+  The game called no time functions to decide; the EOP PerfCounter timestamps, binned by span, predicted
+  the path two frames later.
+- Fix: with honest fences, guest GPU timestamps count GPU execution time: a Vulkan timestamp at the
+  packet's place in the stream plus start/end timestamps of every submitted session, excluding gaps where
+  the GPU waited for the command thread. Wall-clock GPU timestamps were not enough: they still flickered
+  in the street scene (29/min), because those idle gaps are emulator overhead.
+- Result: 0 spikes per minute on both benchmark saves at 1040 and 1600 MHz. At 1600 MHz the game now
+  keeps the chain on.
+- Regression check: `agent/tools/flicker-regress` (local). Run it before installing a build that touches
+  fences, labels, timestamps, GPU scheduling or presentation.
 
 ### `guest_sync_barriers` (committed locally as 9103c21, not pushed)
 - New GPU setting `guest_sync_barriers` (default off). A guest shader write that overlaps only accesses made by guest draws/dispatches since the last guest sync packet (partial flushes, cache flushes, ACQUIRE_MEM, waits, EOP/EOS signals) gets no barrier. RAW and every emulator transfer keep their barriers.
@@ -266,7 +282,7 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - Front-end timestamp trace + barrier reduction A/B: barriers are where the GPU waits, not what costs. Cutting ~35% of image barriers gave no fps.
 - gpu_metrics: GFX 2.2 W "busy" vs CPU 6–7 W of a 12 W socket; 1600 MHz triggers PPT throttling. GPU work is latency-bound (DRAM traffic in the scattered-access regime).
 - No GS emulation (only 13 tess pairs). Next: instruction-level profiling (RGP/SQTT) to find which work is latency-bound.
-- Known visual issues parked: window-frame "refocus" flicker; particle/debris ghosting.
+- Known visual issues parked: particle/debris ghosting (the "refocus" flicker is fixed, see above).
 - 2026-10-11: play build is now local eddff94 with `guest_sync_barriers` on (17.75 fps verified). Decode-time fences with in-place memory → device lost (rejected).
 - Image↔buffer transfers (bbport's Deck bottleneck): ~10 async downloads/frame (27 MB), ~1% of GPU time, zero CP waits. Not our bottleneck. Patch: `claude/copy-stats.patch`.
 
