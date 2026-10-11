@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
-#include <thread>
 #include <filesystem>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <span>
+#include <thread>
 #include <vector>
 #include <CLI/CLI.hpp>
 #include <SDL3/SDL_messagebox.h>
