@@ -935,6 +935,7 @@ void Rasterizer::RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offs
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
+        .is_indirect = true,
     };
     const GraphicsPipeline* pipeline =
         SelectedOr([this, &params] { return pipeline_cache.GetGraphicsPipeline(params); });
