@@ -264,11 +264,14 @@ private:
     /// One bit per sparse block that has backing (residency_bitmap). Residency only grows, so
     /// EnsureResident sets bits and nothing clears them.
     std::vector<u64> resident_bits;
+    /// One bit per resident_bits word that is all set, so long ranges check in few words.
+    std::vector<u64> resident_full;
 
     // Guest memory in place (inplace_guest_memory 2).
     bool in_place{};
     /// One bit per sparse block bound to guest memory in place.
     std::vector<u64> in_place_bits;
+    std::vector<u64> in_place_full;
     std::mutex pending_unmaps_mutex;
     std::vector<std::pair<VAddr, u64>> pending_unmaps;
     std::atomic<bool> has_pending_unmaps{};

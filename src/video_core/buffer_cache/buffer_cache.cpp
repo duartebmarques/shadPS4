@@ -109,6 +109,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
     if (EmulatorSettings.IsResidencyBitmap()) {
         resident_bits.resize((u64{blocks_per_arena_page} * NUM_ARENA_PAGES + 63) / 64);
+        resident_full.resize((resident_bits.size() + 63) / 64);
     }
     if (EmulatorSettings.IsStreamBarrierSkip()) {
         // ObtainBuffer hands the stream buffer out for read-only binds alone, and its one GPU
@@ -127,6 +128,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
             if (Vulkan::GuestMemory::Install(instance, reqs.memoryTypeBits)) {
                 in_place = true;
                 in_place_bits.resize((u64{blocks_per_arena_page} * NUM_ARENA_PAGES + 63) / 64);
+                in_place_full.resize((in_place_bits.size() + 63) / 64);
                 in_place_write_ticks =
                     std::make_unique<std::atomic<u64>[]>(u64{1} << (40 - WriteTickShift));
                 in_place_small_reads = EmulatorSettings.GetInplaceGuestMemory() >= 3;
@@ -527,23 +529,53 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     return new_arena;
 }
 
-bool BufferCache::AllResident(u64 first_block, u64 last_block) const {
-    if (last_block >= resident_bits.size() * 64) {
+static bool AnyClear(const u64* words, u64 first_bit, u64 last_bit) {
+    for (u64 word = first_bit >> 6; word <= last_bit >> 6; ++word) {
+        u64 mask = ~u64{0};
+        if (word == first_bit >> 6) {
+            mask &= ~u64{0} << (first_bit & 63);
+        }
+        if (word == last_bit >> 6) {
+            mask &= ~u64{0} >> (63 - (last_bit & 63));
+        }
+        if ((words[word] & mask) != mask) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool AllSet(const std::vector<u64>& bits, const std::vector<u64>& full, u64 first_block,
+                   u64 last_block) {
+    if (last_block >= bits.size() * 64) {
         return false;
     }
-    for (u64 word = first_block >> 6; word <= last_block >> 6; ++word) {
-        u64 mask = ~u64{0};
-        if (word == first_block >> 6) {
-            mask &= ~u64{0} << (first_block & 63);
-        }
-        if (word == last_block >> 6) {
-            mask &= ~u64{0} >> (63 - (last_block & 63));
-        }
-        if ((resident_bits[word] & mask) != mask) {
-            return false;
-        }
+    const u64 first_word = first_block >> 6;
+    const u64 last_word = last_block >> 6;
+    if (last_word - first_word < 2) {
+        return !AnyClear(bits.data(), first_block, last_block);
     }
-    return true;
+    // The words in between are checked through the summary, one bit per full word.
+    return !AnyClear(bits.data(), first_block, (first_word << 6) | 63) &&
+           !AnyClear(full.data(), first_word + 1, last_word - 1) &&
+           !AnyClear(bits.data(), last_word << 6, last_block);
+}
+
+static void SetBit(std::vector<u64>& bits, std::vector<u64>& full, u64 block) {
+    u64& word = bits[block >> 6];
+    word |= u64{1} << (block & 63);
+    if (word == ~u64{0}) {
+        full[block >> 12] |= u64{1} << ((block >> 6) & 63);
+    }
+}
+
+static void ClearBit(std::vector<u64>& bits, std::vector<u64>& full, u64 block) {
+    bits[block >> 6] &= ~(u64{1} << (block & 63));
+    full[block >> 12] &= ~(u64{1} << ((block >> 6) & 63));
+}
+
+bool BufferCache::AllResident(u64 first_block, u64 last_block) const {
+    return AllSet(resident_bits, resident_full, first_block, last_block);
 }
 
 void BufferCache::ForEachNotInPlace(VAddr device_addr, u64 size, auto&& func) const {
@@ -572,22 +604,7 @@ void BufferCache::ForEachNotInPlace(VAddr device_addr, u64 size, auto&& func) co
 }
 
 bool BufferCache::AllInPlace(u64 first_block, u64 last_block) const {
-    if (last_block >= in_place_bits.size() * 64) {
-        return false;
-    }
-    for (u64 word = first_block >> 6; word <= last_block >> 6; ++word) {
-        u64 mask = ~u64{0};
-        if (word == first_block >> 6) {
-            mask &= ~u64{0} << (first_block & 63);
-        }
-        if (word == last_block >> 6) {
-            mask &= ~u64{0} >> (63 - (last_block & 63));
-        }
-        if ((in_place_bits[word] & mask) != mask) {
-            return false;
-        }
-    }
-    return true;
+    return AllSet(in_place_bits, in_place_full, first_block, last_block);
 }
 
 bool BufferCache::IsCpWritten(u64 first_block, u64 last_block) const {
@@ -720,9 +737,9 @@ void BufferCache::ProcessPendingUnmaps() {
             u64 run_end = block;
             while (run_end <= last_block &&
                    ((in_place_bits[run_end >> 6] >> (run_end & 63)) & 1) != 0) {
-                in_place_bits[run_end >> 6] &= ~(u64{1} << (run_end & 63));
+                ClearBit(in_place_bits, in_place_full, run_end);
                 if (!resident_bits.empty()) {
-                    resident_bits[run_end >> 6] &= ~(u64{1} << (run_end & 63));
+                    ClearBit(resident_bits, resident_full, run_end);
                 }
                 ++run_end;
             }
@@ -851,10 +868,10 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         resident_ranges.Add(backing);
         for (u64 block = run.start; block < run.end; ++block) {
             if (!resident_bits.empty()) {
-                resident_bits[block >> 6] |= u64{1} << (block & 63);
+                SetBit(resident_bits, resident_full, block);
             }
             if (run.in_place) {
-                in_place_bits[block >> 6] |= u64{1} << (block & 63);
+                SetBit(in_place_bits, in_place_full, block);
             }
         }
 
