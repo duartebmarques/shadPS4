@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -32,7 +34,24 @@
 #include <sys/sysctl.h>
 #endif
 
+// Clang PGO training builds: the emulator can exit without running the profile runtime's exit
+// hook, so dump the profile periodically. A no-op in uninstrumented builds.
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+
+static void StartPgoDumper() {
+    if (!__llvm_profile_write_file) {
+        return;
+    }
+    std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(20));
+            __llvm_profile_write_file();
+        }
+    }).detach();
+}
+
 int main(int argc, char* argv[]) {
+    StartPgoDumper();
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
