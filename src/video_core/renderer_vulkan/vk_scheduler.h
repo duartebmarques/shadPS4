@@ -8,6 +8,7 @@
 #include <bit>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -530,6 +531,20 @@ public:
         return work_semaphore.IsFree(tick);
     }
 
+    /// A GPU timestamp and the session whose command buffer holds it.
+    struct GpuTimestamp {
+        u32 slot;
+        u64 session;
+    };
+
+    /// Records a GPU timestamp at the current point of the command stream, after all earlier
+    /// work. The first call starts timing every later session.
+    GpuTimestamp WriteGpuTimestamp();
+
+    /// GPU execution time, in nanoseconds, from the first timed session up to a timestamp whose
+    /// tick finished. Gaps where the GPU waited for the next submission do not count.
+    u64 ReadGpuBusyNs(const GpuTimestamp& timestamp);
+
     /// Returns the scheduler timeline semaphore.
     [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
         return &work_semaphore;
@@ -589,7 +604,26 @@ private:
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
+        u64 seq{};
+        u32 span_slot{UINT32_MAX};
     };
+    struct BusySpan {
+        u64 session;
+        u64 tick;
+        u32 slot;
+    };
+    void AccumulateBusy(u64 session_limit, u64 tick_limit);
+    static constexpr u32 TimestampSlots = 4096;
+    vk::QueryPool timestamp_pool{};
+    vk::QueryPool span_pool{};
+    u32 timestamp_next{};
+    u32 span_next{};
+    double timestamp_period{};
+    u64 session_seq{};
+    std::mutex busy_mutex;
+    std::deque<BusySpan> busy_spans;
+    u64 busy_ticks{};
+    u64 busy_prev_end{};
     std::vector<Session> sessions;
     std::condition_variable_any event_cv;
     struct PendingOp {

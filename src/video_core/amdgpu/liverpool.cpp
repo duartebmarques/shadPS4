@@ -136,15 +136,37 @@ void WriteFenceLabel(const std::optional<Liverpool::FenceWrite>& write) {
 }
 } // Anonymous namespace
 
-void Liverpool::QueueHonestSignal(const std::optional<FenceWrite>& write,
+void Liverpool::QueueHonestSignal(std::optional<FenceWrite> write,
                                   std::optional<Platform::InterruptId> irq) {
     const u64 tick = rasterizer->CurrentTick();
+    if (write && write->timestamp != DataSelect{}) {
+        // The guest GPU clock counts GPU execution: taken on the GPU after the work before it,
+        // without the gaps where the GPU waited for this thread to record more. The decode time
+        // would show the guest how long the command processor took, not the GPU.
+        const auto timestamp = rasterizer->GetScheduler().WriteGpuTimestamp();
+        write->timestamp_slot = timestamp.slot;
+        write->timestamp_session = timestamp.session;
+        if (timestamp_clock_base_ == 0) {
+            timestamp_clock_base_ = GetGpuClock64();
+            timestamp_perf_base_ = GetGpuPerfCounter();
+        }
+    }
     if (write) {
         std::scoped_lock lk{pending_labels_mutex_};
         pending_labels_.push_back(*write);
     }
     honest_signal_tick_ = tick;
-    rasterizer->DeferAfterTick(tick, [this, write, irq] {
+    rasterizer->DeferAfterTick(tick, [this, write, irq] mutable {
+        if (write && write->timestamp != DataSelect{}) {
+            const u64 busy = rasterizer->GetScheduler().ReadGpuBusyNs(
+                {write->timestamp_slot, write->timestamp_session});
+            const s64 freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
+            write->value =
+                write->timestamp == DataSelect::GpuClock64
+                    ? timestamp_clock_base_ + busy
+                    : timestamp_perf_base_ + static_cast<u64>(static_cast<unsigned __int128>(busy) *
+                                                              freq / 1'000'000'000);
+        }
         WriteFenceLabel(write);
         if (write) {
             // Completion callbacks run in queue order, so this label is the oldest one.
@@ -1150,6 +1172,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                         write = FenceWrite{reinterpret_cast<VAddr>(address), data, num_bytes};
                     },
                     [&irq] { irq = true; });
+                const auto data_sel = event_eop->data_sel.Value();
+                if (write &&
+                    (data_sel == DataSelect::GpuClock64 || data_sel == DataSelect::PerfCounter)) {
+                    write->timestamp = data_sel;
+                }
                 QueueHonestSignal(write, irq ? std::optional{Platform::InterruptId::GfxEop}
                                              : std::nullopt);
                 break;
@@ -1657,9 +1684,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     break;
                 case DataSelect::GpuClock64:
                     write = FenceWrite{address, GetGpuClock64(), sizeof(u64)};
+                    write->timestamp = DataSelect::GpuClock64;
                     break;
                 case DataSelect::PerfCounter:
                     write = FenceWrite{address, GetGpuPerfCounter(), sizeof(u64)};
+                    write->timestamp = DataSelect::PerfCounter;
                     break;
                 case DataSelect::GdsMemStore:
                     // Recorded on the GPU in stream order; only the interrupt waits below.

@@ -36,6 +36,8 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+enum class DataSelect : u32;
+
 struct PM4CmdWaitRegMem;
 struct PM4CmdWriteData;
 
@@ -304,6 +306,8 @@ private:
     // inplace_guest_memory >= 1: fence labels, their interrupts and the GPU idle interrupt wait
     // for the GPU to finish the work recorded before them.
     bool honest_fences_{};
+    u64 timestamp_clock_base_{};
+    u64 timestamp_perf_base_{};
 
 public:
     /// A fence label captured when its packet is decoded, written after the GPU finished the
@@ -313,12 +317,16 @@ public:
         u64 value;
         u32 num_bytes;
         bool cpu_write = true; ///< False: the GPU writes it; only WAIT_REG_MEM resolution needs it.
+        /// A GPU clock source: the value is taken on the GPU, after the work before it.
+        DataSelect timestamp{};
+        u32 timestamp_slot{};
+        u64 timestamp_session{};
     };
 
 private:
     /// Queues a label write and/or interrupt to run once the GPU finished all work recorded so
     /// far, without submitting: FlushHonestSignals submits at guest submission ends and waits.
-    void QueueHonestSignal(const std::optional<FenceWrite>& write,
+    void QueueHonestSignal(std::optional<FenceWrite> write,
                            std::optional<Platform::InterruptId> irq);
     /// Submits the recorded work when it holds queued honest signals.
     void FlushHonestSignals();

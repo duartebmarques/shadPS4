@@ -194,6 +194,14 @@ void Scheduler::BeginSession() {
     };
     session.primary = command_pool.Commit();
     Check(session.primary.begin(begin_info));
+    session.seq = ++session_seq;
+    if (span_pool) {
+        session.span_slot = span_next;
+        span_next = (span_next + 1) % TimestampSlots;
+        session.primary.resetQueryPool(span_pool, session.span_slot * 2, 2);
+        session.primary.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, span_pool,
+                                        session.span_slot * 2);
+    }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -223,7 +231,76 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
+    if (session.span_slot != UINT32_MAX) {
+        session.primary.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, span_pool,
+                                        session.span_slot * 2 + 1);
+    }
     Check(session.primary.end());
+}
+
+Scheduler::GpuTimestamp Scheduler::WriteGpuTimestamp() {
+    if (!timestamp_pool) {
+        const vk::Device device = instance.GetDevice();
+        timestamp_period = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+        timestamp_pool = Check(device.createQueryPool({
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = TimestampSlots,
+        }));
+        device.resetQueryPool(timestamp_pool, 0, TimestampSlots);
+        span_pool = Check(device.createQueryPool({
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = TimestampSlots * 2,
+        }));
+    }
+    const u32 slot = timestamp_next;
+    timestamp_next = (timestamp_next + 1) % TimestampSlots;
+    CommandBuffer().writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, timestamp_pool,
+                                    slot);
+    return {slot, sessions.back().seq};
+}
+
+void Scheduler::AccumulateBusy(u64 session_limit, u64 tick_limit) {
+    const vk::Device device = instance.GetDevice();
+    while (!busy_spans.empty() && busy_spans.front().session < session_limit &&
+           busy_spans.front().tick <= tick_limit) {
+        std::array<u64, 2> ts{};
+        if (device.getQueryPoolResults(span_pool, busy_spans.front().slot * 2, 2, sizeof(ts),
+                                       ts.data(), sizeof(u64),
+                                       vk::QueryResultFlagBits::e64) != vk::Result::eSuccess) {
+            break;
+        }
+        busy_spans.pop_front();
+        const u64 start = std::max(ts[0], busy_prev_end);
+        if (ts[1] > start) {
+            busy_ticks += ts[1] - start;
+            busy_prev_end = ts[1];
+        }
+    }
+}
+
+u64 Scheduler::ReadGpuBusyNs(const GpuTimestamp& timestamp) {
+    const vk::Device device = instance.GetDevice();
+    u64 ts{};
+    const auto result =
+        device.getQueryPoolResults(timestamp_pool, timestamp.slot, 1, sizeof(ts), &ts, sizeof(ts),
+                                   vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+    device.resetQueryPool(timestamp_pool, timestamp.slot, 1);
+
+    std::scoped_lock lk{busy_mutex};
+    AccumulateBusy(timestamp.session, UINT64_MAX);
+    u64 busy = busy_ticks;
+    if (result == vk::Result::eSuccess && !busy_spans.empty() &&
+        busy_spans.front().session == timestamp.session) {
+        // The part of the timestamp's own session that ran before it.
+        u64 start{};
+        if (device.getQueryPoolResults(span_pool, busy_spans.front().slot * 2, 1, sizeof(start),
+                                       &start, sizeof(start),
+                                       vk::QueryResultFlagBits::e64) == vk::Result::eSuccess) {
+            start = std::max(start, busy_prev_end);
+            busy += ts > start ? ts - start : 0;
+        }
+    }
+    return static_cast<u64>(static_cast<double>(busy) * timestamp_period);
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
@@ -264,6 +341,19 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             cmd_buffers.push_back(session.upload);
         }
         cmd_buffers.push_back(session.primary);
+    }
+    if (span_pool) {
+        std::scoped_lock busy_lk{busy_mutex};
+        // Span slots are reused TimestampSlots sessions later: retire finished ones first.
+        if (busy_spans.size() >= TimestampSlots / 2) {
+            work_semaphore.Refresh();
+            AccumulateBusy(UINT64_MAX, work_semaphore.KnownGpuTick());
+        }
+        for (const auto& session : sessions) {
+            if (session.span_slot != UINT32_MAX) {
+                busy_spans.push_back({session.seq, signal_value, session.span_slot});
+            }
+        }
     }
     sessions.clear();
 
