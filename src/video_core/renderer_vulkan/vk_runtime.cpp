@@ -247,6 +247,35 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     }
 }
 
+void Runtime::DownloadImageInPlace(VideoCore::Image* src, vk::Buffer dst,
+                                   std::span<const vk::BufferImageCopy> download_copies) {
+    SetBackingSamples(src, src->info.num_samples);
+    Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+            vk::AccessFlagBits2::eTransferRead);
+    // Buffers bound in place alias the chunk without the barrier tracker knowing, so order the
+    // copy against all earlier and later work on it, and make it visible to the guest CPU.
+    memory_barrier.srcStageMask |= vk::PipelineStageFlagBits2::eAllCommands;
+    memory_barrier.srcAccessMask |= vk::AccessFlagBits2::eMemoryWrite;
+    FlushBarriers();
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst,
+                             download_copies);
+
+    const vk::MemoryBarrier2 after = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask =
+            vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                         vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &after,
+    });
+}
+
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 

@@ -77,6 +77,9 @@ public:
                      std::span<const vk::BufferImageCopy> upload_copies);
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                        std::span<const vk::BufferImageCopy> download_copies);
+    /// Copies an image straight into guest memory held in a GPU-visible chunk.
+    void DownloadImageInPlace(VideoCore::Image* src, vk::Buffer dst,
+                              std::span<const vk::BufferImageCopy> download_copies);
 
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,

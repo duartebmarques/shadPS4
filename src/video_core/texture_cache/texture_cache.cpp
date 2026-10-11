@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
@@ -21,6 +21,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -163,6 +164,18 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
+    if (DownloadImageInPlace(image, download_size)) {
+        if (sync) {
+            const u64 t0 = Common::FencedRDTSC();
+            scheduler.Finish();
+            scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage,
+                                 Common::FencedRDTSC() - t0);
+            Skipcache::Framework::Instance().BumpMemGen();
+        } else {
+            scheduler.DeferPriorityOperation([] { Skipcache::Framework::Instance().BumpMemGen(); });
+        }
+        return;
+    }
     const auto download =
         runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
     const vk::BufferImageCopy image_download = {
@@ -202,6 +215,38 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
 }
 
+bool TextureCache::DownloadImageInPlace(Image& image, u32 download_size) {
+    if (!EmulatorSettings.IsInplaceImageDownloads() || !Vulkan::GuestMemory::Installed()) {
+        return false;
+    }
+    const auto phys =
+        Core::Memory::Instance()->DirectPhysOf(image.info.guest_address, download_size);
+    if (!phys || (*phys & 15) != 0) {
+        return false;
+    }
+    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    if (!chunk || *phys + download_size > chunk->phys + chunk->size) {
+        return false;
+    }
+    const vk::BufferImageCopy image_download = {
+        .bufferOffset = *phys - chunk->phys,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    };
+    runtime.DownloadImageInPlace(&image, chunk->buffer, std::span{&image_download, 1});
+    return true;
+}
+
 bool TextureCache::DownloadImageMemoryAsync(ImageId image_id) {
     Image& image = slot_images[image_id];
     // Copies into a buffer need a single-sample image.
@@ -216,6 +261,10 @@ bool TextureCache::DownloadImageMemoryAsync(ImageId image_id) {
     if (download_size == 0 || download_size > image.info.guest_size ||
         download_size > MaxDownloadSize) {
         return false;
+    }
+    if (DownloadImageInPlace(image, download_size)) {
+        scheduler.DeferPriorityOperation([] { Skipcache::Framework::Instance().BumpMemGen(); });
+        return true;
     }
     // Each copy gets its own staging buffer, so no later copy can reuse the bytes before the
     // background writer has read them.

@@ -504,6 +504,10 @@ struct GPUSettings {
     // as such work may overlap on the guest GPU too. Reads after writes and every access made by
     // emulator transfers keep their barriers.
     Setting<bool> guest_sync_barriers{false};
+    // With inplace_guest_memory 2+, copy GPU-written images back into guest memory on the GPU,
+    // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a
+    // CPU copy on the completion thread, which end-of-pipe labels queue behind.
+    Setting<bool> inplace_image_downloads{true};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
     // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
@@ -768,6 +772,7 @@ struct GPUSettings {
             GPU_OVERRIDE(readback_offload),
             GPU_OVERRIDE(inplace_guest_memory),
             GPU_OVERRIDE(guest_sync_barriers),
+            GPU_OVERRIDE(inplace_image_downloads),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(pending_pop_throttle),
             GPU_OVERRIDE(stream_copy_workers),
@@ -859,7 +864,8 @@ struct GPUSettings {
     runtime_info_stamp_gate, userfaultfd, gpu_thread_core_reserve, one_thread_per_core, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
-    clean_sync_peek, readback_offload, inplace_guest_memory, guest_sync_barriers
+    clean_sync_peek, readback_offload, inplace_guest_memory, guest_sync_barriers, \
+    inplace_image_downloads
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1187,6 +1193,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
     SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
     SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
+    SETTING_FORWARD_BOOL(m_gpu, InplaceImageDownloads, inplace_image_downloads)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)

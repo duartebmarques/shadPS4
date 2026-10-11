@@ -436,6 +436,10 @@ private:
     /// Returns true when a copy was recorded.
     bool DownloadImageMemoryAsync(ImageId image_id);
 
+    /// Copies the image into its guest memory on the GPU when that memory is a GPU-visible
+    /// chunk. Returns false when it is not, and the caller copies through staging.
+    bool DownloadImageInPlace(Image& image, u32 download_size);
+
     /// Register image in the page table
     void RegisterImage(ImageId image);
 
