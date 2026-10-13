@@ -135,9 +135,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             if (const char* env = std::getenv("SHADPS4_PIPE_VERIFY")) {
                 pipe_verify_every_ = static_cast<u32>(std::max(0, std::atoi(env)));
             }
-            if (const char* env = std::getenv("SHADPS4_PIPE_SELECT")) {
-                pipe_select = std::atoi(env) != 0;
-            }
+            const char* select_env = std::getenv("SHADPS4_PIPE_SELECT");
+            pipe_select = !select_env || std::atoi(select_env) != 0;
             liverpool->draw_pipe = true;
             LOG_INFO(Render_Vulkan,
                      "Draw pipe on, register verification every {} packets, selection on the "

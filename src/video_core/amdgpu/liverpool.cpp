@@ -600,9 +600,9 @@ Liverpool::Liverpool() {
     if (const char* env = std::getenv("SHADPS4_PIPE_CONSERVATIVE")) {
         pipe_drain_all_ = std::atoi(env) != 0;
     }
-    if (const char* env = std::getenv("SHADPS4_PIPE_FENCES")) {
-        pipe_fences_ = honest_fences_ && std::atoi(env) != 0 && !pipe_drain_all_;
-    }
+    const char* fences_env = std::getenv("SHADPS4_PIPE_FENCES");
+    pipe_fences_ =
+        honest_fences_ && (!fences_env || std::atoi(fences_env) != 0) && !pipe_drain_all_;
     reg_run_ = EmulatorSettings.IsParserRegRun();
     Common::SetCoreReservationEnabled(EmulatorSettings.IsGpuThreadCoreReserve());
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
