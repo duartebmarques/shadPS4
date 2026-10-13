@@ -74,6 +74,18 @@ public:
         return record_view ? record_view->db_extent : liverpool->last_db_extent;
     }
 
+    /// The register state pipelines are selected with: the command thread's when the draw pipe
+    /// selects there (SHADPS4_PIPE_SELECT=1), else the recording state above.
+    [[nodiscard]] const AmdGpu::Regs& SelectRegs() const noexcept {
+        return pipe_select ? liverpool->regs : *record_regs;
+    }
+    [[nodiscard]] const AmdGpu::ComputeProgram& SelectCsRegs() const noexcept {
+        return pipe_select ? liverpool->GetCsRegs() : CsRegs();
+    }
+    [[nodiscard]] u64 SelectGfxStateStamp() const noexcept {
+        return pipe_select ? liverpool->GetGfxStateStamp() : GfxStateStamp();
+    }
+
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
@@ -181,6 +193,8 @@ public:
     /// Draw pipe: the recording thread submits queued honest signals after the packets before
     /// this call (directly here when it is idle).
     void RequestPipeFlush(bool force = false);
+    /// Draw pipe: an interrupt signalled in order on the recording thread (the flip packet).
+    void QueueIrq(Platform::InterruptId irq);
     /// Draw pipe: a WRITE_DATA or DMA_DATA packet run in order on the recording thread.
     void QueuePm4(const void* packet, u32 size);
     /// Draw pipe: an honest fence recorded in order after the packets before it.
@@ -198,11 +212,13 @@ private:
         Flush,
         Pm4,
         Submit,
+        Irq,
     };
     enum PipeFlags : u8 {
-        PipeReset = 1 << 0,  ///< CLEAR_STATE: defaults first
-        PipeFull = 1 << 1,   ///< the full register file follows the blocks
-        PipeVerify = 1 << 2, ///< compare the copy with the full file before taking it
+        PipeReset = 1 << 0,    ///< CLEAR_STATE: defaults first
+        PipeFull = 1 << 1,     ///< the full register file follows the blocks
+        PipeVerify = 1 << 2,   ///< compare the copy with the full file before taking it
+        PipeSelected = 1 << 3, ///< the pipeline and its stages' user data follow the args
     };
     struct PipePacket {
         PipeOp op;
@@ -229,6 +245,20 @@ private:
         VAddr arg_address;
         VAddr count_address;
     };
+    /// A pipeline selected on the command thread, then one PipeStageUd per stage and the
+    /// stages' flattened user data.
+    struct PipeSelection {
+        const Pipeline* pipeline;
+        u32 num_stages;
+        u32 flat_words;
+    };
+    struct PipeStageUd {
+        const Shader::Info* info;
+        VAddr pgm_base;
+        u32 flat_words;
+        u32 pad;
+        std::array<u32, Shader::NUM_USER_DATA_REGS> user_data;
+    };
     struct PipeFence {
         AmdGpu::Liverpool::FenceWrite write;
         bool has_write;
@@ -242,7 +272,24 @@ private:
         u32 size;
     };
     /// Stage A: hands the dirty register blocks and `args` to the recording thread.
-    void SendPipePacket(PipeOp op, const void* args, u32 args_size);
+    void SendPipePacket(PipeOp op, const void* args, u32 args_size,
+                        const Pipeline* selected = nullptr);
+    /// Stage B: installs the selecting draw's user data (Shader::Info::UdSnapshot).
+    void InstallPipeSelection(const u8* data);
+    /// The pipeline the command thread selected for the packet being recorded, else select().
+    template <typename Select>
+    auto SelectedOr(Select&& select) {
+        using Result = decltype(select());
+        if (selected_pipeline) {
+            return static_cast<Result>(selected_pipeline);
+        }
+        if (pipe_select) {
+            NoteMissingSelection();
+            return Result{};
+        }
+        return select();
+    }
+    SHAD_NO_INLINE void NoteMissingSelection();
     /// Stage B: applies a packet to the register copy and records it.
     void RunPipePacket(const u8* data, u32 size);
     void VerifyPipeRegs(const AmdGpu::Regs& expected);
@@ -571,6 +618,10 @@ private:
         AmdGpu::CbDbExtent db_extent;
     };
     std::unique_ptr<RecordView> record_view;
+    /// Draw pipe: pipelines are selected on the command thread and handed over.
+    bool pipe_select{};
+    /// Stage B: the pipeline the packet being recorded was selected with, or null.
+    const Pipeline* selected_pipeline{};
     const AmdGpu::Regs* record_regs;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;

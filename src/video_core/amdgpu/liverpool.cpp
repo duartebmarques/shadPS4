@@ -155,7 +155,7 @@ static bool GfxPacketDrainsPipe(const PM4Header* header, PM4ItOpcode opcode, boo
     switch (opcode) {
     case PM4ItOpcode::Nop: {
         const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
-        return nop->header.count.Value() != 0 &&
+        return !pipe_fences && nop->header.count.Value() != 0 &&
                nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip;
     }
     case PM4ItOpcode::DmaData:
@@ -1071,6 +1071,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             case PM4CmdNop::PayloadType::PatchedFlip: {
                 // There is no evidence that GPU CP drives flip events by parsing
                 // special NOP packets. For convenience lets assume that it does.
+                if (draw_pipe && pipe_fences_) {
+                    // The flip handler prepares the frame from the caches, in stream order.
+                    rasterizer->QueueIrq(Platform::InterruptId::GfxFlip);
+                    break;
+                }
                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
                 break;
             }
@@ -1609,8 +1614,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u64* wait_addr = wait_reg_mem->Address<u64*>();
             if (vo_port->IsVoLabel(wait_addr) &&
                 num_submits == mapped_queues[GfxQueueId].submits.size()) {
-                // The flip that frees the label was prepared at its flip packet, which drained
-                // the draw pipe: the recording thread goes on while this thread sleeps.
+                // The flip that frees the label is prepared at its flip packet, in stream order
+                // before this wait: the recording thread goes on while this thread sleeps.
                 FlushHonestSignals();
                 vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                 break;

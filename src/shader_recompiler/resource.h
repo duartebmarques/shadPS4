@@ -128,15 +128,15 @@ struct BufferResource {
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer;
         if (sharp_fetch.direct) [[likely]] {
-            std::memcpy(&buffer, info.flat_ud + sharp_fetch.offsets[0], sizeof(buffer));
+            std::memcpy(&buffer, info.FlatUd() + sharp_fetch.offsets[0], sizeof(buffer));
         } else {
-            if (!sharp_fetch.Fetch(info.flat_ud, &buffer)) {
+            if (!sharp_fetch.Fetch(info.FlatUd(), &buffer)) {
                 return AmdGpu::Buffer::Null();
             }
             if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
                 reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
             } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
-                buffer.base_address += info.pgm_base;
+                buffer.base_address += info.PgmBase();
             }
         }
         // No logging here: a log line's fmt machinery would stop this from inlining on a
@@ -174,9 +174,9 @@ struct ImageResource {
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
         if (sharp_fetch.direct) [[likely]] {
-            std::memcpy(&image, info.flat_ud + sharp_fetch.offsets[0], sizeof(image));
+            std::memcpy(&image, info.FlatUd() + sharp_fetch.offsets[0], sizeof(image));
         } else {
-            if (!Fetch(info.flat_ud, &image)) {
+            if (!Fetch(info.FlatUd(), &image)) {
                 return AmdGpu::Image::Null(is_depth);
             }
             if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
@@ -219,7 +219,7 @@ struct ImageResource {
             return scratch;
         }
         const auto& raw =
-            *reinterpret_cast<const AmdGpu::Image*>(info.flat_ud + sharp_fetch.offsets[0]);
+            *reinterpret_cast<const AmdGpu::Image*>(info.FlatUd() + sharp_fetch.offsets[0]);
         if (!raw.Valid()) [[unlikely]] {
             scratch = AmdGpu::Image::Null(is_depth);
             return scratch;
@@ -264,12 +264,12 @@ struct SamplerResource {
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
         if (sharp_fetch.direct) [[likely]] {
-            std::memcpy(&sampler, info.flat_ud + sharp_fetch.offsets[0], sizeof(sampler));
+            std::memcpy(&sampler, info.FlatUd() + sharp_fetch.offsets[0], sizeof(sampler));
             return sampler;
         }
-        sharp_fetch.Fetch(info.flat_ud, &sampler);
+        sharp_fetch.Fetch(info.FlatUd(), &sampler);
         if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
-            const u32 tsharp_dw3 = info.flat_ud[post_op_tsharp_dw3_off];
+            const u32 tsharp_dw3 = info.FlatUd()[post_op_tsharp_dw3_off];
             if (((tsharp_dw3 >> 12) & 0xff) == 0) {
                 sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }

@@ -135,9 +135,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             if (const char* env = std::getenv("SHADPS4_PIPE_VERIFY")) {
                 pipe_verify_every_ = static_cast<u32>(std::max(0, std::atoi(env)));
             }
+            if (const char* env = std::getenv("SHADPS4_PIPE_SELECT")) {
+                pipe_select = std::atoi(env) != 0;
+            }
             liverpool->draw_pipe = true;
-            LOG_INFO(Render_Vulkan, "Draw pipe on, register verification every {} packets",
-                     pipe_verify_every_);
+            LOG_INFO(Render_Vulkan,
+                     "Draw pipe on, register verification every {} packets, selection on the "
+                     "command thread: {}",
+                     pipe_verify_every_, pipe_select);
         }
     }
     // The run hold is armed by the recording thread and dropped by the command thread.
@@ -283,33 +288,38 @@ bool Rasterizer::FilterDraw() {
     return FilterDrawSlow();
 }
 
-bool Rasterizer::FilterDrawSlow() {
-    const auto& regs = Regs();
-    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
-        // Clears the render target if FCE is launched before any draws
-        EliminateFastClear();
-        return false;
+namespace {
+// What FilterDrawSlow does with a draw, from the registers alone.
+struct DrawFilter {
+    enum class Kind : u8 {
+        Draw,
+        EliminateFastClear,
+        FmaskDecompress,
+        Resolve,
+        NoPrimitive,
+        DepthStencilCopy,
+    };
+    Kind kind;
+    bool depth_copy;
+    bool stencil_copy;
+};
+
+DrawFilter ClassifyDraw(const AmdGpu::Regs& regs) {
+    using Kind = DrawFilter::Kind;
+    using Mode = AmdGpu::ColorControl::OperationMode;
+    if (regs.color_control.mode == Mode::EliminateFastClear) {
+        return {Kind::EliminateFastClear};
     }
-    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
-        // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
-        LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
-        ScopedMarkerInsert("FmaskDecompress");
-        EliminateFastClear();
-        return false;
+    if (regs.color_control.mode == Mode::FmaskDecompress) {
+        return {Kind::FmaskDecompress};
     }
-    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
-        LOG_TRACE(Render_Vulkan, "Resolve pass");
-        Resolve();
-        return false;
+    if (regs.color_control.mode == Mode::Resolve) {
+        return {Kind::Resolve};
     }
     if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
-        LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
-        ScopedMarkerInsert("PrimitiveTypeNone");
-        return false;
+        return {Kind::NoPrimitive};
     }
-
-    const bool cb_disabled =
-        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+    const bool cb_disabled = regs.color_control.mode == Mode::Disable;
     const auto depth_copy =
         regs.depth_render_override.force_z_dirty && regs.depth_render_override.force_z_valid &&
         regs.depth_buffer.DepthValid() && regs.depth_buffer.DepthWriteValid() &&
@@ -320,14 +330,43 @@ bool Rasterizer::FilterDrawSlow() {
         regs.depth_buffer.StencilWriteValid() &&
         regs.depth_buffer.StencilAddress() != regs.depth_buffer.StencilWriteAddress();
     if (cb_disabled && (depth_copy || stencil_copy)) {
+        return {Kind::DepthStencilCopy, depth_copy, stencil_copy};
+    }
+    return {Kind::Draw};
+}
+} // Anonymous namespace
+
+bool Rasterizer::FilterDrawSlow() {
+    const auto filter = ClassifyDraw(Regs());
+    switch (filter.kind) {
+    case DrawFilter::Kind::Draw:
+        return true;
+    case DrawFilter::Kind::EliminateFastClear:
+        // Clears the render target if FCE is launched before any draws
+        EliminateFastClear();
+        return false;
+    case DrawFilter::Kind::FmaskDecompress:
+        // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
+        LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
+        ScopedMarkerInsert("FmaskDecompress");
+        EliminateFastClear();
+        return false;
+    case DrawFilter::Kind::Resolve:
+        LOG_TRACE(Render_Vulkan, "Resolve pass");
+        Resolve();
+        return false;
+    case DrawFilter::Kind::NoPrimitive:
+        LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
+        ScopedMarkerInsert("PrimitiveTypeNone");
+        return false;
+    case DrawFilter::Kind::DepthStencilCopy:
         // Games may disable color buffer and enable force depth/stencil dirty and valid to
         // do a copy from one depth-stencil surface to another, without a pixel shader.
         // We need to detect this case and perform the copy, otherwise it will have no effect.
         LOG_TRACE(Render_Vulkan, "Performing depth-stencil override copy");
-        DepthStencilCopy(depth_copy, stencil_copy);
+        DepthStencilCopy(filter.depth_copy, filter.stencil_copy);
         return false;
     }
-
     return true;
 }
 
@@ -581,10 +620,10 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
     u32 instance_offset = 0;
     if (!fetch_shader.Empty()) {
         if (vertex_offset == 0 && fetch_shader.vertex_offset_sgpr != -1) {
-            vertex_offset = info.user_data[fetch_shader.vertex_offset_sgpr];
+            vertex_offset = info.UserData()[fetch_shader.vertex_offset_sgpr];
         }
         if (fetch_shader.instance_offset_sgpr != -1) {
-            instance_offset = info.user_data[fetch_shader.instance_offset_sgpr];
+            instance_offset = info.UserData()[fetch_shader.instance_offset_sgpr];
         }
     }
     return {vertex_offset, instance_offset};
@@ -616,7 +655,14 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (draw_pipe) {
         const PipeDraw args{is_indexed, index_offset};
-        SendPipePacket(PipeOp::Draw, &args, sizeof(args));
+        const Pipeline* pipeline = nullptr;
+        if (pipe_select && ClassifyDraw(liverpool->regs).kind == DrawFilter::Kind::Draw) {
+            pipeline = pipeline_cache.GetGraphicsPipeline();
+            if (!pipeline) {
+                return;
+            }
+        }
+        SendPipePacket(PipeOp::Draw, &args, sizeof(args), pipeline);
         return;
     }
     RecordDraw(is_indexed, index_offset);
@@ -628,12 +674,13 @@ void Rasterizer::RecordDraw(bool is_indexed, u32 index_offset) {
     Skipcache::Framework::Instance().OnDraw();
     scheduler.PopPendingOperations();
 
-    if (!FilterDraw()) {
+    if (!selected_pipeline && !FilterDraw()) {
         return;
     }
 
     const auto& regs = Regs();
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    const GraphicsPipeline* pipeline =
+        SelectedOr([this] { return pipeline_cache.GetGraphicsPipeline(); });
     if (!pipeline) {
         return;
     }
@@ -858,7 +905,17 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             .arg_address = arg_address,
             .count_address = count_address,
         };
-        SendPipePacket(PipeOp::DrawIndirect, &args, sizeof(args));
+        const Pipeline* pipeline = nullptr;
+        if (pipe_select && ClassifyDraw(liverpool->regs).kind == DrawFilter::Kind::Draw) {
+            pipeline = pipeline_cache.GetGraphicsPipeline({
+                .vertex_sgpr_offset = vertex_sgpr_offset,
+                .instance_sgpr_offset = instance_sgpr_offset,
+            });
+            if (!pipeline) {
+                return;
+            }
+        }
+        SendPipePacket(PipeOp::DrawIndirect, &args, sizeof(args), pipeline);
         return;
     }
     RecordDrawIndirect(is_indexed, arg_address, offset, stride, max_count, count_address,
@@ -872,7 +929,7 @@ void Rasterizer::RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offs
 
     scheduler.PopPendingOperations();
 
-    if (!FilterDraw()) {
+    if (!selected_pipeline && !FilterDraw()) {
         return;
     }
 
@@ -880,7 +937,8 @@ void Rasterizer::RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offs
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
     };
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
+    const GraphicsPipeline* pipeline =
+        SelectedOr([this, &params] { return pipeline_cache.GetGraphicsPipeline(params); });
     if (!pipeline) {
         return;
     }
@@ -961,7 +1019,11 @@ void Rasterizer::RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offs
 void Rasterizer::DispatchDirect() {
     if (draw_pipe) {
         const PipeDispatch args{.cs = liverpool->GetCsRegs()};
-        SendPipePacket(PipeOp::DispatchDirect, &args, sizeof(args));
+        const Pipeline* pipeline = pipe_select ? pipeline_cache.GetComputePipeline() : nullptr;
+        if (pipe_select && !pipeline) {
+            return;
+        }
+        SendPipePacket(PipeOp::DispatchDirect, &args, sizeof(args), pipeline);
         return;
     }
     RecordDispatchDirect();
@@ -973,7 +1035,8 @@ void Rasterizer::RecordDispatchDirect() {
     scheduler.PopPendingOperations();
 
     const auto& cs_program = CsRegs();
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline =
+        SelectedOr([this] { return pipeline_cache.GetComputePipeline(); });
     if (!pipeline) {
         return;
     }
@@ -1019,7 +1082,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (draw_pipe) {
         const PipeDispatch args{
             .cs = liverpool->GetCsRegs(), .address = address, .offset = offset, .size = size};
-        SendPipePacket(PipeOp::DispatchIndirect, &args, sizeof(args));
+        const Pipeline* pipeline = pipe_select ? pipeline_cache.GetComputePipeline() : nullptr;
+        if (pipe_select && !pipeline) {
+            return;
+        }
+        SendPipePacket(PipeOp::DispatchIndirect, &args, sizeof(args), pipeline);
         return;
     }
     RecordDispatchIndirect(address, offset, size);
@@ -1031,7 +1098,8 @@ void Rasterizer::RecordDispatchIndirect(VAddr address, u32 offset, u32 size) {
     scheduler.PopPendingOperations();
 
     const auto& cs_program = CsRegs();
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const ComputePipeline* pipeline =
+        SelectedOr([this] { return pipeline_cache.GetComputePipeline(); });
     if (!pipeline) {
         return;
     }
@@ -1534,9 +1602,9 @@ void Rasterizer::BindingSkipProbeBody(const Pipeline* pipeline) {
                 would_hit = false;
                 break;
             }
-            const size_t words = std::min<size_t>(stage->user_data.size(), snap.user_data.size());
-            if (std::memcmp(snap.user_data.data(), stage->user_data.data(), words * sizeof(u32)) !=
-                0) {
+            const auto stage_ud = stage->UserData();
+            const size_t words = std::min<size_t>(stage_ud.size(), snap.user_data.size());
+            if (std::memcmp(snap.user_data.data(), stage_ud.data(), words * sizeof(u32)) != 0) {
                 ++ctr.veto[BsVetoUserData];
                 would_hit = false;
                 break;
@@ -1562,8 +1630,9 @@ void Rasterizer::BindingSkipProbeBody(const Pipeline* pipeline) {
         }
         auto& snap = p.stages[p.num_stages++];
         snap.pgm_hash = stage->pgm_hash;
-        const size_t words = std::min<size_t>(stage->user_data.size(), snap.user_data.size());
-        std::memcpy(snap.user_data.data(), stage->user_data.data(), words * sizeof(u32));
+        const auto stage_ud = stage->UserData();
+        const size_t words = std::min<size_t>(stage_ud.size(), snap.user_data.size());
+        std::memcpy(snap.user_data.data(), stage_ud.data(), words * sizeof(u32));
         if (words < snap.user_data.size()) {
             std::memset(snap.user_data.data() + words, 0,
                         (snap.user_data.size() - words) * sizeof(u32));
@@ -2165,7 +2234,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.srt_info.flattened_bufsize_dw * sizeof(u32);
-                const u64 offset = vk_buffer.Copy(stage.flat_ud, ubo_size, alignment);
+                const u64 offset = vk_buffer.Copy(stage.FlatUd(), ubo_size, alignment);
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{vk_buffer.Handle(), offset, ubo_size};
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
@@ -3798,7 +3867,8 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
              (f32)(color & 0xff) / 255.0f, (f32)((color >> 24) & 0xff) / 255.0f})});
 }
 
-void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size) {
+void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size,
+                                const Pipeline* selected) {
     constexpr u32 BlockWords = AmdGpu::Liverpool::PipeBlockWords;
     constexpr u32 BlockBytes = BlockWords * sizeof(u32);
     liverpool->TakeExternalRegWrites();
@@ -3836,7 +3906,24 @@ void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size) {
     const u32 index_bytes = Common::AlignUp(num_blocks * sizeof(u16), 8);
     const u32 block_bytes = num_blocks * BlockBytes;
     const u32 full_bytes = (flags & PipeFull) ? sizeof(AmdGpu::Regs) : 0;
-    const u32 size = sizeof(PipePacket) + index_bytes + block_bytes + full_bytes + args_size;
+    // A selected pipeline: its stages' user data as this draw saw it, after the args.
+    u32 select_bytes = 0;
+    u32 num_stages = 0;
+    u32 flat_words = 0;
+    if (selected) {
+        flags |= PipeSelected;
+        for (const auto* info : selected->GetStages()) {
+            if (info) {
+                ++num_stages;
+                flat_words += info->srt_info.walker_func ? info->srt_info.flattened_bufsize_dw : 0;
+            }
+        }
+        ASSERT(num_stages <= Shader::Info::MaxUdSnapshots);
+        select_bytes = Common::AlignUp(args_size, 8) - args_size + sizeof(PipeSelection) +
+                       num_stages * sizeof(PipeStageUd) + flat_words * sizeof(u32);
+    }
+    const u32 size =
+        sizeof(PipePacket) + index_bytes + block_bytes + full_bytes + args_size + select_bytes;
     u8* const out = draw_pipe->Begin(size);
     PipePacket packet{
         .op = op,
@@ -3864,6 +3951,30 @@ void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size) {
     if (args_size != 0) {
         std::memcpy(tail, args, args_size);
     }
+    if (selected) {
+        tail += Common::AlignUp(args_size, 8);
+        const PipeSelection selection{selected, num_stages, flat_words};
+        std::memcpy(tail, &selection, sizeof(selection));
+        auto* stages = tail + sizeof(PipeSelection);
+        auto* flat = stages + num_stages * sizeof(PipeStageUd);
+        for (const auto* info : selected->GetStages()) {
+            if (!info) {
+                continue;
+            }
+            PipeStageUd stage{
+                .info = info,
+                .pgm_base = info->pgm_base,
+                .flat_words = info->srt_info.walker_func ? info->srt_info.flattened_bufsize_dw : 0,
+            };
+            std::memcpy(stage.user_data.data(), info->user_data.data(),
+                        std::min<size_t>(info->user_data.size(), stage.user_data.size()) *
+                            sizeof(u32));
+            std::memcpy(stages, &stage, sizeof(stage));
+            stages += sizeof(stage);
+            std::memcpy(flat, info->flat_ud, stage.flat_words * sizeof(u32));
+            flat += stage.flat_words * sizeof(u32);
+        }
+    }
     liverpool->pipe_reset = false;
     pipe_blocks_ += num_blocks;
     draw_pipe->Commit(size);
@@ -3882,6 +3993,30 @@ void Rasterizer::RequestPipeFlush(bool force) {
     SendPipePacket(PipeOp::Flush, &force, sizeof(force));
     pipe_flush_packets_ = draw_pipe->packets;
     ++pipe_flushes_;
+}
+
+void Rasterizer::NoteMissingSelection() {
+    LOG_ERROR(Render_Vulkan, "Draw pipe: a draw reached recording without a selected pipeline");
+}
+
+void Rasterizer::InstallPipeSelection(const u8* data) {
+    PipeSelection selection;
+    std::memcpy(&selection, data, sizeof(selection));
+    const auto* stages = reinterpret_cast<const PipeStageUd*>(data + sizeof(PipeSelection));
+    const auto* flat = reinterpret_cast<const u32*>(stages + selection.num_stages);
+    auto& snapshots = Shader::Info::ud_snapshots;
+    for (u32 i = 0; i < selection.num_stages; ++i) {
+        const auto& stage = stages[i];
+        snapshots[i] = {
+            .info = stage.info,
+            .user_data = stage.user_data.data(),
+            .flat = stage.flat_words != 0 ? flat : stage.user_data.data(),
+            .pgm_base = stage.pgm_base,
+        };
+        flat += stage.flat_words;
+    }
+    Shader::Info::num_ud_snapshots = selection.num_stages;
+    selected_pipeline = selection.pipeline;
 }
 
 void Rasterizer::QueuePm4(const void* packet, u32 size) {
@@ -3932,16 +4067,23 @@ void Rasterizer::RunPipePacket(const u8* data, u32 size) {
     view.cb_extent = packet.cb_extent;
     view.db_extent = packet.db_extent;
     ASSERT(tail <= data + size);
+    const auto install_selection = [&](u32 args_size) {
+        if (packet.flags & PipeSelected) {
+            InstallPipeSelection(tail + Common::AlignUp(args_size, 8));
+        }
+    };
     switch (packet.op) {
     case PipeOp::Draw: {
         PipeDraw args;
         std::memcpy(&args, tail, sizeof(args));
+        install_selection(sizeof(args));
         RecordDraw(args.is_indexed, args.index_offset);
         break;
     }
     case PipeOp::DrawIndirect: {
         PipeDrawIndirect args;
         std::memcpy(&args, tail, sizeof(args));
+        install_selection(sizeof(args));
         RecordDrawIndirect(args.is_indexed, args.arg_address, args.offset, args.size,
                            args.max_count, args.count_address, args.vertex_sgpr_offset,
                            args.instance_sgpr_offset);
@@ -3952,6 +4094,7 @@ void Rasterizer::RunPipePacket(const u8* data, u32 size) {
         PipeDispatch args;
         std::memcpy(&args, tail, sizeof(args));
         view.cs = args.cs;
+        install_selection(sizeof(args));
         if (packet.op == PipeOp::DispatchDirect) {
             RecordDispatchDirect();
         } else {
@@ -3986,7 +4129,21 @@ void Rasterizer::RunPipePacket(const u8* data, u32 size) {
                                 args.has_irq ? std::optional{args.irq} : std::nullopt);
         break;
     }
+    case PipeOp::Irq: {
+        Platform::InterruptId irq;
+        std::memcpy(&irq, tail, sizeof(irq));
+        Platform::IrqC::Instance()->Signal(irq);
+        break;
     }
+    }
+    if (selected_pipeline) {
+        selected_pipeline = nullptr;
+        Shader::Info::num_ud_snapshots = 0;
+    }
+}
+
+void Rasterizer::QueueIrq(Platform::InterruptId irq) {
+    SendPipePacket(PipeOp::Irq, &irq, sizeof(irq));
 }
 
 void Rasterizer::VerifyPipeRegs(const AmdGpu::Regs& expected) {
