@@ -159,8 +159,9 @@ static bool GfxPacketDrainsPipe(const PM4Header* header, PM4ItOpcode opcode, boo
                nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip;
     }
     case PM4ItOpcode::DmaData:
-        return reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo != 0x3022C;
+        return !pipe_fences && reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo != 0x3022C;
     case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::WriteData:
         return !pipe_fences;
     case PM4ItOpcode::EventWriteEos:
         return !pipe_fences || reinterpret_cast<const PM4CmdEventWriteEos*>(header)->command ==
@@ -209,7 +210,9 @@ static bool ComputePacketDrainsPipe(const PM4Header* header, PM4ItOpcode opcode,
     }
     switch (opcode) {
     case PM4ItOpcode::DmaData:
-        return reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo != 0x3022C;
+        return !pipe_fences && reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo != 0x3022C;
+    case PM4ItOpcode::WriteData:
+        return !pipe_fences;
     case PM4ItOpcode::ReleaseMem:
         return !pipe_fences || reinterpret_cast<const PM4CmdReleaseMem*>(header)->data_sel ==
                                    DataSelect::GdsMemStore;
@@ -283,11 +286,33 @@ void Liverpool::FlushHonestSignals() {
     if (!honest_fences_ || !rasterizer) {
         return;
     }
-    if (pipe_fences_sent_ != pipe_fences_run_.load(std::memory_order_acquire)) {
-        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonFence);
+    if (draw_pipe) {
+        // The recording thread flushes after the packets before this point, without a drain.
+        rasterizer->RequestPipeFlush();
+        return;
     }
-    if (honest_signal_tick_.load(std::memory_order_acquire) >= rasterizer->CurrentTick()) {
+    if (HonestSignalsUnsubmitted()) {
         rasterizer->Flush();
+    }
+}
+
+bool Liverpool::HonestSignalsUnsubmitted() const {
+    return honest_signal_tick_.load(std::memory_order_acquire) >= rasterizer->CurrentTick();
+}
+
+void Liverpool::RunPipePm4(const u32* packet) {
+    const auto* header = reinterpret_cast<const PM4Header*>(packet);
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::WriteData:
+        FenceDrainAndDownload(rasterizer);
+        WriteData(reinterpret_cast<const PM4CmdWriteData*>(header),
+                  (header->type3.count.Value() - 2) * 4);
+        break;
+    case PM4ItOpcode::DmaData:
+        RunDmaData(reinterpret_cast<const PM4DmaData*>(header));
+        break;
+    default:
+        UNREACHABLE_MSG("Draw pipe PM4 opcode {:#x}", u32(header->type3.opcode.Value()));
     }
 }
 
@@ -299,7 +324,6 @@ void Liverpool::HonestFence(std::optional<FenceWrite> write,
             std::scoped_lock lk{pending_labels_mutex_};
             pending_labels_.push_back(*write);
         }
-        ++pipe_fences_sent_;
         rasterizer->QueueFence(write, irq);
         return;
     }
@@ -310,7 +334,6 @@ void Liverpool::HonestFence(std::optional<FenceWrite> write,
 void Liverpool::RunPipeFence(std::optional<FenceWrite> write,
                              std::optional<Platform::InterruptId> irq) {
     QueueHonestSignal(write, irq, true);
-    pipe_fences_run_.fetch_add(1, std::memory_order_release);
 }
 
 bool Liverpool::PendingLabelSatisfies(const PM4CmdWaitRegMem* wait) {
@@ -503,6 +526,41 @@ void Liverpool::WriteData(const PM4CmdWriteData* write_data, u32 data_size) {
         return;
     }
     CpWriteOrCopy(rasterizer, write_data->Address<void*>(), write_data->data, data_size);
+}
+
+void Liverpool::RunDmaData(const PM4DmaData* dma_data) {
+    ASSERT(dma_data->command.das == 0);
+    if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
+        rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data, true);
+    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+               dma_data->dst_sel == DmaDataDst::Gds) {
+        rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
+                               dma_data->NumBytes(), true, false);
+    } else if (dma_data->src_sel == DmaDataSrc::Data &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(), dma_data->data,
+                               false);
+    } else if (dma_data->src_sel == DmaDataSrc::Gds &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
+                               dma_data->NumBytes(), false, true);
+    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>(),
+                               dma_data->NumBytes(), false, false);
+    } else {
+        UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
+                        u32(dma_data->dst_sel));
+    }
+    if (honest_fences_) {
+        // In place, the DMA may run on the GPU: a later wait on its result flushes.
+        honest_signal_tick_.store(rasterizer->CurrentTick(), std::memory_order_release);
+    }
 }
 
 Liverpool::Liverpool() {
@@ -1371,39 +1429,11 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                 break;
             }
-            ASSERT(dma_data->command.das == 0);
-            if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data,
-                                       true);
-            } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                        dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                       dma_data->dst_sel == DmaDataDst::Gds) {
-                rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                       dma_data->NumBytes(), true, false);
-            } else if (dma_data->src_sel == DmaDataSrc::Data &&
-                       (dma_data->dst_sel == DmaDataDst::Memory ||
-                        dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                       dma_data->data, false);
-            } else if (dma_data->src_sel == DmaDataSrc::Gds &&
-                       (dma_data->dst_sel == DmaDataDst::Memory ||
-                        dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                       dma_data->NumBytes(), false, true);
-            } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                        dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                       (dma_data->dst_sel == DmaDataDst::Memory ||
-                        dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>(),
-                                       dma_data->NumBytes(), false, false);
-            } else {
-                UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
-                                u32(dma_data->dst_sel));
+            if (draw_pipe && pipe_fences_) {
+                rasterizer->QueuePm4(header, (count + 1) * sizeof(u32));
+                break;
             }
-            if (honest_fences_) {
-                // In place, the DMA may run on the GPU: a later wait on its result flushes.
-                honest_signal_tick_.store(rasterizer->CurrentTick(), std::memory_order_release);
-            }
+            RunDmaData(dma_data);
             break;
         }
         case PM4ItOpcode::WriteData: {
@@ -1411,6 +1441,10 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
+                if (draw_pipe && pipe_fences_) {
+                    rasterizer->QueuePm4(header, (header->type3.NumWords() + 1) * sizeof(u32));
+                    break;
+                }
                 FenceDrainAndDownload(rasterizer);
                 WriteData(write_data, data_size);
             } else {
@@ -1560,9 +1594,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (honest_fences_ && !wait_reg_mem->Test(regs.reg_array) &&
                 PendingLabelSatisfies(wait_reg_mem)) {
                 // Met in stream order by a label the GPU writes after earlier work.
+                ++packet_stats.waits_pending;
                 break;
             }
+            packet_stats.waits += !wait_reg_mem->Test(regs.reg_array);
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                if (draw_pipe && honest_fences_ && PendingLabelSatisfies(wait_reg_mem)) {
+                    // Another queue has queued the label meanwhile.
+                    ++packet_stats.waits_pending_late;
+                    break;
+                }
+                ++packet_stats.wait_spins;
                 FlushHonestSignals();
                 YIELD_GFX();
             }
@@ -1654,7 +1696,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         const PM4ItOpcode opcode = header->type3.opcode;
         if (draw_pipe && ComputePacketDrainsPipe(header, opcode, pipe_drain_all_, pipe_fences_)) {
-            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonComputeOpcode +
+                                      static_cast<u32>(opcode));
         }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
@@ -1680,6 +1723,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
             if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                 break;
+            }
+            if (draw_pipe && pipe_fences_) {
+                // A patch of a later dispatch in this ring is resolved here, at decode.
+                const VAddr dst_addr = dma_data->DstAddress<VAddr>();
+                const auto* patched =
+                    reinterpret_cast<const PM4Header*>(dst_addr - sizeof(PM4Header));
+                const bool is_patch =
+                    (dma_data->src_sel == DmaDataSrc::Memory ||
+                     dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                    (dma_data->dst_sel == DmaDataDst::Memory ||
+                     dma_data->dst_sel == DmaDataDst::MemoryUsingL2) &&
+                    dst_addr >= base_addr && dst_addr < base_addr + acb_size &&
+                    dma_data->NumBytes() == sizeof(PM4CmdDispatchIndirect::GroupDimensions) &&
+                    patched->type == 3 && patched->type3.opcode == PM4ItOpcode::DispatchDirect;
+                if (!is_patch) {
+                    rasterizer->QueuePm4(header, (header->type3.NumWords() + 1) * sizeof(u32));
+                    break;
+                }
             }
             ASSERT(dma_data->command.das == 0);
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
@@ -1820,6 +1881,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
+                if (draw_pipe && pipe_fences_) {
+                    rasterizer->QueuePm4(header, (header->type3.NumWords() + 1) * sizeof(u32));
+                    break;
+                }
                 FenceDrainAndDownload(rasterizer);
                 WriteData(write_data, data_size);
             } else {
@@ -1846,9 +1911,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             if (honest_fences_ && !wait_reg_mem->Test(regs.reg_array) &&
                 PendingLabelSatisfies(wait_reg_mem)) {
+                ++packet_stats.acb_waits_pending;
                 break;
             }
+            packet_stats.acb_waits += !wait_reg_mem->Test(regs.reg_array);
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                if (draw_pipe && honest_fences_ && PendingLabelSatisfies(wait_reg_mem)) {
+                    ++packet_stats.acb_waits_pending_late;
+                    break;
+                }
+                ++packet_stats.acb_wait_spins;
                 FlushHonestSignals();
                 YIELD_ASC(vqid);
             }

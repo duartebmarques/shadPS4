@@ -251,6 +251,17 @@ public:
         u64 acb_dispatches;   // compute queue dispatches
         u64 gfx_to_acb;       // compute queue dispatches right after a graphics draw
         bool after_draw;      // the last draw or dispatch was a graphics draw
+        // WAIT_REG_MEM on the graphics and compute queues: met by a pending label at the first
+        // test, waits that were not met at once, loop iterations, and waits met by a label
+        // another queue queued meanwhile (draw pipe only).
+        u64 waits_pending;
+        u64 waits;
+        u64 wait_spins;
+        u64 waits_pending_late;
+        u64 acb_waits_pending;
+        u64 acb_waits;
+        u64 acb_wait_spins;
+        u64 acb_waits_pending_late;
     };
     PacketStats packet_stats{};
 
@@ -370,6 +381,10 @@ public:
         u32 timestamp_slot{};
         u64 timestamp_session{};
     };
+    /// Draw pipe recording thread: a WRITE_DATA or DMA_DATA packet handed over in order.
+    void RunPipePm4(const u32* packet);
+    /// Whether queued honest signals wait for work not submitted yet.
+    bool HonestSignalsUnsubmitted() const;
     /// Draw pipe recording thread: a fence handed over by HonestFence (its label is queued).
     void RunPipeFence(std::optional<FenceWrite> write, std::optional<Platform::InterruptId> irq);
 
@@ -385,6 +400,7 @@ private:
     void FlushHonestSignals();
     /// WRITE_DATA: on the GPU in stream order where it targets memory bound in place.
     void WriteData(const PM4CmdWriteData* write_data, u32 data_size);
+    void RunDmaData(const struct PM4DmaData* dma_data);
     /// Whether a queued, not yet written label will make the wait pass (the GPU runs the queues
     /// in recording order, so the wait is met by stream order).
     bool PendingLabelSatisfies(const PM4CmdWaitRegMem* wait);
@@ -394,10 +410,8 @@ private:
     std::deque<FenceWrite> pending_labels_;
     // Tick of the newest queued honest signal.
     std::atomic<u64> honest_signal_tick_{};
-    // Fences handed to the draw pipe, and those its recording thread has queued.
+    // SHADPS4_PIPE_FENCES: fences, WRITE_DATA and DMA_DATA run in order on the draw pipe.
     bool pipe_fences_{};
-    u64 pipe_fences_sent_{};
-    std::atomic<u64> pipe_fences_run_{};
     bool reg_run_{};
 
     struct ConstantEngine {

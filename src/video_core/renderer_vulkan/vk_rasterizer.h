@@ -178,6 +178,11 @@ public:
         }
     }
 
+    /// Draw pipe: the recording thread submits queued honest signals after the packets before
+    /// this call (directly here when it is idle).
+    void RequestPipeFlush();
+    /// Draw pipe: a WRITE_DATA or DMA_DATA packet run in order on the recording thread.
+    void QueuePm4(const void* packet, u32 size);
     /// Draw pipe: an honest fence recorded in order after the packets before it.
     void QueueFence(const std::optional<AmdGpu::Liverpool::FenceWrite>& write,
                     std::optional<Platform::InterruptId> irq);
@@ -190,6 +195,8 @@ private:
         DispatchIndirect,
         GuestSync,
         Fence,
+        Flush,
+        Pm4,
     };
     enum PipeFlags : u8 {
         PipeReset = 1 << 0,  ///< CLEAR_STATE: defaults first
@@ -707,6 +714,8 @@ private:
     u32 pipe_verify_every_{};
     u32 pipe_verify_count_{};
     bool pipe_full_next_{true};
+    u64 pipe_flush_packets_{};
+    u64 pipe_flushes_{};
     u64 pipe_verified_{};
     u64 pipe_mismatches_{};
     u64 pipe_blocks_{};

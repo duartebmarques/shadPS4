@@ -1113,11 +1113,11 @@ void Rasterizer::OnSubmit() {
                  pk.draws, pk.predicated_draws, pk.dispatches, pk.acb_dispatches, pk.gfx_to_acb,
                  pk.occlusion_events, pk.set_predication, rs.run_packets, rs.runs, rs.outer_packets,
                  brk);
-        pk = {};
-        rs = {};
         if (draw_pipe) {
             EmitDrawPipeTelemetry();
         }
+        pk = {};
+        rs = {};
     }
     auto& skipcache = Skipcache::Framework::Instance();
     if (skipcache.Active()) {
@@ -1135,7 +1135,7 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::NoteGuestSync() {
-    if (draw_pipe) {
+    if (draw_pipe && !DrawPipe::OnStageB()) {
         SendPipePacket(PipeOp::GuestSync, nullptr, 0);
         return;
     }
@@ -3837,6 +3837,25 @@ void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size) {
     draw_pipe->Commit(size);
 }
 
+void Rasterizer::RequestPipeFlush() {
+    if (draw_pipe->Idle()) {
+        if (liverpool->HonestSignalsUnsubmitted()) {
+            Flush();
+        }
+        return;
+    }
+    if (draw_pipe->packets == pipe_flush_packets_) {
+        return;
+    }
+    SendPipePacket(PipeOp::Flush, nullptr, 0);
+    pipe_flush_packets_ = draw_pipe->packets;
+    ++pipe_flushes_;
+}
+
+void Rasterizer::QueuePm4(const void* packet, u32 size) {
+    SendPipePacket(PipeOp::Pm4, packet, size);
+}
+
 void Rasterizer::QueueFence(const std::optional<AmdGpu::Liverpool::FenceWrite>& write,
                             std::optional<Platform::InterruptId> irq) {
     const PipeFence args{
@@ -3909,6 +3928,14 @@ void Rasterizer::RunPipePacket(const u8* data, u32 size) {
     case PipeOp::GuestSync:
         runtime.NoteGuestSync();
         break;
+    case PipeOp::Flush:
+        if (liverpool->HonestSignalsUnsubmitted()) {
+            Flush();
+        }
+        break;
+    case PipeOp::Pm4:
+        liverpool->RunPipePm4(reinterpret_cast<const u32*>(tail));
+        break;
     case PipeOp::Fence: {
         PipeFence args;
         std::memcpy(&args, tail, sizeof(args));
@@ -3954,8 +3981,8 @@ void Rasterizer::EmitDrawPipeTelemetry() {
         drains += pipe.drains[i];
         waited += pipe.drain_cycles[i];
     }
-    static constexpr std::array<const char*, DrawPipe::NumReasons - 256> names{
-        "cmd", "acb", "subend", "fault", "fence", "rast"};
+    static constexpr std::array<const char*, DrawPipe::NumReasons - DrawPipe::ReasonCommands> names{
+        "cmd", "subend", "fault", "fence", "rast"};
     std::string top;
     for (u32 n = 0; n < 6; ++n) {
         u32 best = 0;
@@ -3970,19 +3997,27 @@ void Rasterizer::EmitDrawPipeTelemetry() {
             break;
         }
         const std::string name =
-            best < 256 ? fmt::format("0x{:02x}", best) : std::string{names[best - 256]};
+            best < DrawPipe::ReasonComputeOpcode ? fmt::format("0x{:02x}", best)
+            : best < DrawPipe::ReasonCommands
+                ? fmt::format("acb:0x{:02x}", best - DrawPipe::ReasonComputeOpcode)
+                : std::string{names[best - DrawPipe::ReasonCommands]};
         top += fmt::format("{}{}:{}/{:.1f}ms", top.empty() ? "" : ",", name, best_count,
                            static_cast<double>(pipe.drain_cycles[best]) * 1000.0 /
                                static_cast<double>(std::max<u64>(tsc_hz_, 1)));
         pipe.drains[best] = 0;
     }
+    const auto& pk = liverpool->packet_stats;
     LOG_INFO(Render,
              "DRAWPIPE packets={} blocks={} recorder_busy={:.1f}% decoder_wait={:.1f}% "
-             "drains={} top={} verified={} mismatches={} per300f",
+             "drains={} top={} flushes={} waits gfx={}/{}/{}/{} acb={}/{}/{}/{} "
+             "(pending/unmet/spins/late) verified={} mismatches={} per300f",
              pipe.packets - pipe_last_packets_, pipe_blocks_,
              100.0 * static_cast<double>(busy - pipe_last_busy_) / static_cast<double>(window),
              100.0 * static_cast<double>(waited) / static_cast<double>(window), drains, top,
+             pipe_flushes_, pk.waits_pending, pk.waits, pk.wait_spins, pk.waits_pending_late,
+             pk.acb_waits_pending, pk.acb_waits, pk.acb_wait_spins, pk.acb_waits_pending_late,
              pipe_verified_, pipe_mismatches_);
+    pipe_flushes_ = 0;
     pipe.drains = {};
     pipe.drain_cycles = {};
     pipe_last_packets_ = pipe.packets;

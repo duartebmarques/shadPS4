@@ -93,10 +93,11 @@ public:
         return consumed.load(std::memory_order_acquire) == head;
     }
 
-    /// Why stage A drained (statistics): a PM4 opcode, or one of these.
+    /// Why stage A drained (statistics): a graphics PM4 opcode, a compute queue opcode
+    /// (ReasonComputeOpcode + opcode), or one of these.
     enum Reason : u32 {
-        ReasonCommands = 256,
-        ReasonCompute,
+        ReasonComputeOpcode = 256,
+        ReasonCommands = 512,
         ReasonSubmissionEnd,
         ReasonFault,
         ReasonFence,
