@@ -370,12 +370,17 @@ public:
         u32 timestamp_slot{};
         u64 timestamp_session{};
     };
+    /// Draw pipe recording thread: a fence handed over by HonestFence (its label is queued).
+    void RunPipeFence(std::optional<FenceWrite> write, std::optional<Platform::InterruptId> irq);
 
 private:
     /// Queues a label write and/or interrupt to run once the GPU finished all work recorded so
     /// far, without submitting: FlushHonestSignals submits at guest submission ends and waits.
     void QueueHonestSignal(std::optional<FenceWrite> write,
-                           std::optional<Platform::InterruptId> irq);
+                           std::optional<Platform::InterruptId> irq, bool label_queued = false);
+    /// An honest fence in stream order: handed to the draw pipe's recording thread
+    /// (SHADPS4_PIPE_FENCES=1), else queued here after the downloads and lane copies.
+    void HonestFence(std::optional<FenceWrite> write, std::optional<Platform::InterruptId> irq);
     /// Submits the recorded work when it holds queued honest signals.
     void FlushHonestSignals();
     /// WRITE_DATA: on the GPU in stream order where it targets memory bound in place.
@@ -387,8 +392,12 @@ private:
     // Labels queued and not yet written, oldest first; their writes pop them in order.
     std::mutex pending_labels_mutex_;
     std::deque<FenceWrite> pending_labels_;
-    // Tick of the newest queued honest signal (GPU thread only).
-    u64 honest_signal_tick_{};
+    // Tick of the newest queued honest signal.
+    std::atomic<u64> honest_signal_tick_{};
+    // Fences handed to the draw pipe, and those its recording thread has queued.
+    bool pipe_fences_{};
+    u64 pipe_fences_sent_{};
+    std::atomic<u64> pipe_fences_run_{};
     bool reg_run_{};
 
     struct ConstantEngine {

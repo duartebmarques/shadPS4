@@ -178,6 +178,10 @@ public:
         }
     }
 
+    /// Draw pipe: an honest fence recorded in order after the packets before it.
+    void QueueFence(const std::optional<AmdGpu::Liverpool::FenceWrite>& write,
+                    std::optional<Platform::InterruptId> irq);
+
 private:
     enum class PipeOp : u8 {
         Draw,
@@ -185,6 +189,7 @@ private:
         DispatchDirect,
         DispatchIndirect,
         GuestSync,
+        Fence,
     };
     enum PipeFlags : u8 {
         PipeReset = 1 << 0,  ///< CLEAR_STATE: defaults first
@@ -215,6 +220,12 @@ private:
         u32 max_count;
         VAddr arg_address;
         VAddr count_address;
+    };
+    struct PipeFence {
+        AmdGpu::Liverpool::FenceWrite write;
+        bool has_write;
+        bool has_irq;
+        Platform::InterruptId irq;
     };
     struct PipeDispatch {
         AmdGpu::ComputeProgram cs;

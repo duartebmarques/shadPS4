@@ -412,10 +412,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 std::optional<u64> BufferCache::StreamViaLane(VAddr device_addr, u32 size) {
     // Workers read the never-protected backing view and every queued byte lands before the submit
     // that reads it (see StreamCopyLane). Commit's flush would run before the workers write, so
-    // non-coherent rings copy inline, and the lane has a single producer, the GPU thread.
+    // non-coherent rings copy inline, and the lane has a single producer, the GPU thread (the
+    // recording thread with the draw pipe).
     auto& lane = StreamCopyLane::Instance();
     if (!lane.Enabled() || size < StreamCopyLane::kMinLaneBytes || !stream_buffer.is_coherent ||
-        !liverpool->OnGpuThread()) {
+        !liverpool->OnGpuThread() ||
+        (liverpool->draw_pipe && AmdGpu::Liverpool::OnCommandThread())) {
         return std::nullopt;
     }
     Core::MemoryManager::BackingSpan spans[2];
@@ -626,8 +628,7 @@ bool BufferCache::NoteCpWrite(VAddr device_addr, u64 size) {
     bool newly_in_place = false;
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
-    for (u64 block = first_block; block <= last_block && (block >> 6) < cp_written_words;
-         ++block) {
+    for (u64 block = first_block; block <= last_block && (block >> 6) < cp_written_words; ++block) {
         const u64 bit = u64{1} << (block & 63);
         auto& word = cp_written_bits[block >> 6];
         if (!(word.load(std::memory_order_relaxed) & bit)) {
@@ -639,7 +640,7 @@ bool BufferCache::NoteCpWrite(VAddr device_addr, u64 size) {
 }
 
 std::optional<std::pair<const Buffer*, u64>> BufferCache::TryInPlaceRead(VAddr device_addr,
-                                                                          u32 size) {
+                                                                         u32 size) {
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     if (IsCpWritten(first_block, last_block)) {

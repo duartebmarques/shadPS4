@@ -3837,6 +3837,17 @@ void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size) {
     draw_pipe->Commit(size);
 }
 
+void Rasterizer::QueueFence(const std::optional<AmdGpu::Liverpool::FenceWrite>& write,
+                            std::optional<Platform::InterruptId> irq) {
+    const PipeFence args{
+        .write = write.value_or(AmdGpu::Liverpool::FenceWrite{}),
+        .has_write = write.has_value(),
+        .has_irq = irq.has_value(),
+        .irq = irq.value_or(Platform::InterruptId{}),
+    };
+    SendPipePacket(PipeOp::Fence, &args, sizeof(args));
+}
+
 void Rasterizer::RunPipePacket(const u8* data, u32 size) {
     constexpr u32 BlockWords = AmdGpu::Liverpool::PipeBlockWords;
     constexpr u32 BlockBytes = BlockWords * sizeof(u32);
@@ -3898,6 +3909,16 @@ void Rasterizer::RunPipePacket(const u8* data, u32 size) {
     case PipeOp::GuestSync:
         runtime.NoteGuestSync();
         break;
+    case PipeOp::Fence: {
+        PipeFence args;
+        std::memcpy(&args, tail, sizeof(args));
+        VideoCore::StreamCopyLane::Instance().DrainProducer();
+        runtime.NoteGuestSync();
+        texture_cache.ProcessDownloadImages();
+        liverpool->RunPipeFence(args.has_write ? std::optional{args.write} : std::nullopt,
+                                args.has_irq ? std::optional{args.irq} : std::nullopt);
+        break;
+    }
     }
 }
 
