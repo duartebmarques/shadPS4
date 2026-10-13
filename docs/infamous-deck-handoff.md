@@ -39,7 +39,24 @@ Input, in `~/.local/share/shadPS4/input_config/CUSA00004.ini` (or `default.ini`)
 - `motion_shake` is bound to a keyboard key, with a Deck back button mapped to that key in Steam Input.
 - Add `touchpad_two_finger = t` for the Reggie car push, which needs two fingers on both ends of the touchpad plus a click. Map a back button to keyboard T in Steam Input.
 
-## Measurements (latest)
+## 2026-10-14: two-stage draw pipeline (current)
+- At 1600 MHz the GPU command thread (GpuComm) was the critical path: an injected 1 us per draw cost
+  exactly 4.7 ms per frame. The GPU was 57-63% busy.
+- `draw_pipe` (GPU setting, default off; the play config turns it on) splits GpuComm in two:
+  - the command thread decodes PM4 and selects pipelines;
+  - a recording thread (`shadPS4:DrawRec`, on the reserved core) records Vulkan, runs fences, flips and
+    WRITE_DATA/DMA_DATA in order, and receives only the changed 32-register blocks.
+  - Env: `SHADPS4_PIPE_FENCES`/`SHADPS4_PIPE_SELECT` (default 1), `SHADPS4_PIPE_VERIFY=N` (register check),
+    `SHADPS4_PIPE_PLACEMENT=0`.
+- GpuComm spent ~23% of its time in the kernel: ~93 vkQueueSubmit per frame at ~59 us each, plus ~750
+  timeline-semaphore queries. `ring_drain_flush_draws=0` removes ~40 submits per frame: +4% at 1600 MHz,
+  -1.7% at the auto clock.
+- CAND-U at 1600 MHz: 25.4 fps (Release, off) -> 29.5 fps (both on). Register verification found no
+  mismatches.
+- Next: the recorder is ~98% busy. Move submits to a thread or submit less often, cut the semaphore
+  queries, build with PGO.
+
+## Measurements (2026-10-10)
 - **FPS:** 15–20. It was 12–25 before this work.
 - **Mode 3:** removed all stream copies (`LANE jobs=0`, `small_inplace=15.3M` per 300 frames). CPU idle went from 17% to 56%, but FPS rose only about 1.
 - **GPU clock:** Decky PowerTools had been blocking Steam's GPU clock setting. With it uninstalled, a locked 1600 MHz gives the same FPS as 1040 MHz.
