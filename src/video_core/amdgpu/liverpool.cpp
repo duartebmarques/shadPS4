@@ -300,6 +300,14 @@ bool Liverpool::HonestSignalsUnsubmitted() const {
     return honest_signal_tick_.load(std::memory_order_acquire) >= rasterizer->CurrentTick();
 }
 
+bool Liverpool::PipeTakesReservedCore() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_PIPE_PLACEMENT");
+        return (!env || std::atoi(env) != 0) && Common::GetExclusionStripMask() != 0;
+    }();
+    return enabled;
+}
+
 void Liverpool::RunPipePm4(const u32* packet) {
     const auto* header = reinterpret_cast<const PM4Header*>(packet);
     switch (header->type3.opcode) {
@@ -651,6 +659,13 @@ void Liverpool::Process(std::stop_token stoken) {
             break;
         }
 
+        if (draw_pipe && !command_thread_moved_) {
+            command_thread_moved_ = true;
+            if (PipeTakesReservedCore()) {
+                Common::SetCurrentThreadAffinityMask(~Common::GetExclusionStripMask());
+            }
+        }
+
         VideoCore::StartCapture();
 
         curr_qid = -1;
@@ -674,7 +689,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
-                if (rasterizer && num_submits == 1) {
+                if (rasterizer && num_submits == 1 && !(draw_pipe && pipe_fences_)) {
                     // The guest sees the GPU idle once the last submission is decoded.
                     rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
                 }
@@ -695,20 +710,30 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
-        if (rasterizer) {
+        // With fences on the draw pipe the frame end and the idle signal are pipe packets.
+        const bool pipe_ordered = draw_pipe && pipe_fences_;
+        if (rasterizer && !pipe_ordered) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
         }
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
-                rasterizer->Flush();
+                if (pipe_ordered) {
+                    rasterizer->RequestPipeFlush(true);
+                } else {
+                    rasterizer->Flush();
+                }
             }
             submit_done = false;
         }
 
         if (honest_fences_ && rasterizer) {
-            QueueHonestSignal(std::nullopt, Platform::InterruptId::GpuIdle);
+            if (pipe_ordered) {
+                HonestFence(std::nullopt, Platform::InterruptId::GpuIdle);
+            } else {
+                QueueHonestSignal(std::nullopt, Platform::InterruptId::GpuIdle);
+            }
             FlushHonestSignals();
         } else {
             Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
@@ -1584,9 +1609,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u64* wait_addr = wait_reg_mem->Address<u64*>();
             if (vo_port->IsVoLabel(wait_addr) &&
                 num_submits == mapped_queues[GfxQueueId].submits.size()) {
-                if (rasterizer) {
-                    rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::WaitRegMem));
-                }
+                // The flip that frees the label was prepared at its flip packet, which drained
+                // the draw pipe: the recording thread goes on while this thread sleeps.
                 FlushHonestSignals();
                 vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                 break;

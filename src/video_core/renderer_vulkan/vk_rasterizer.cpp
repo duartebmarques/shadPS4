@@ -12,6 +12,7 @@
 
 #include "common/alignment.h"
 #include "common/rdtsc.h"
+#include "common/thread.h"
 
 #include "common/debug.h"
 #include "core/debug_state.h"
@@ -130,6 +131,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             record_view = std::make_unique<RecordView>();
             record_view->regs = liverpool->regs;
             record_regs = &record_view->regs;
+            pipe_sent_regs = std::make_unique<AmdGpu::Regs>(liverpool->regs);
             if (const char* env = std::getenv("SHADPS4_PIPE_VERIFY")) {
                 pipe_verify_every_ = static_cast<u32>(std::max(0, std::atoi(env)));
             }
@@ -229,6 +231,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                 AmdGpu::Liverpool::MarkGpuSideThread();
                 VideoCore::RegionLock::gpu_spin_rounds =
                     EmulatorSettings.GetTrackerLockSpinRounds();
+                // The recording thread is the busy one: it takes the reserved core, and the
+                // command thread moves to the others (Liverpool::Process).
+                if (AmdGpu::Liverpool::PipeTakesReservedCore()) {
+                    Common::SetCurrentThreadAffinityMask(Common::GetExclusionStripMask());
+                }
             },
             this);
     }
@@ -1080,7 +1087,16 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
-    DrainDrawPipe();
+    if (!draw_pipe) {
+        LogPacketStats();
+        RecordSubmit();
+        return;
+    }
+    LogPacketStats();
+    SendPipePacket(PipeOp::Submit, nullptr, 0);
+}
+
+void Rasterizer::LogPacketStats() {
     const u64 frame = DebugState.GetFrameNum();
     // Guest packet census. Deliberately outside the skipcache gate below: it describes what the
     // title submits, not how this fork caches. A non-zero occl or setpred means the title drives
@@ -1119,6 +1135,10 @@ void Rasterizer::OnSubmit() {
         pk = {};
         rs = {};
     }
+}
+
+void Rasterizer::RecordSubmit() {
+    const u64 frame = DebugState.GetFrameNum();
     auto& skipcache = Skipcache::Framework::Instance();
     if (skipcache.Active()) {
         static u64 last_report_frame = 0;
@@ -3783,17 +3803,35 @@ void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size) {
     constexpr u32 BlockBytes = BlockWords * sizeof(u32);
     liverpool->TakeExternalRegWrites();
     auto& dirty = liverpool->pipe_dirty;
-    u32 num_blocks = 0;
-    for (const u64 word : dirty) {
-        num_blocks += std::popcount(word);
-    }
+    const auto& regs = liverpool->regs;
+    auto& sent = *pipe_sent_regs;
     u8 flags = liverpool->pipe_reset ? PipeReset : 0;
+    if (flags & PipeReset) {
+        sent.SetDefaults();
+    }
     if (pipe_full_next_) {
         pipe_full_next_ = false;
         flags |= PipeFull;
     } else if (pipe_verify_every_ != 0 && ++pipe_verify_count_ >= pipe_verify_every_) {
         pipe_verify_count_ = 0;
         flags |= PipeFull | PipeVerify;
+    }
+    // Only the blocks whose words differ from what the recording thread already holds.
+    std::array<u16, AmdGpu::Regs::NumRegs / BlockWords> changed;
+    u32 num_blocks = 0;
+    for (u32 w = 0; w < dirty.size(); ++w) {
+        for (u64 bits = dirty[w]; bits != 0; bits &= bits - 1) {
+            const u32 block = w * 64 + std::countr_zero(bits);
+            u32* const held = &sent.reg_array[block * BlockWords];
+            const u32* const now = &regs.reg_array[block * BlockWords];
+            if (std::memcmp(held, now, BlockBytes) == 0) {
+                ++pipe_blocks_same_;
+                continue;
+            }
+            std::memcpy(held, now, BlockBytes);
+            changed[num_blocks++] = static_cast<u16>(block);
+        }
+        dirty[w] = 0;
     }
     const u32 index_bytes = Common::AlignUp(num_blocks * sizeof(u16), 8);
     const u32 block_bytes = num_blocks * BlockBytes;
@@ -3813,20 +3851,14 @@ void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size) {
     std::memcpy(out, &packet, sizeof(packet));
     u8* const indices = out + sizeof(PipePacket);
     u8* const blocks = indices + index_bytes;
-    const auto& regs = liverpool->regs;
-    u32 n = 0;
-    for (u32 w = 0; w < dirty.size(); ++w) {
-        for (u64 bits = dirty[w]; bits != 0; bits &= bits - 1) {
-            const u16 block = static_cast<u16>(w * 64 + std::countr_zero(bits));
-            std::memcpy(indices + n * sizeof(u16), &block, sizeof(u16));
-            std::memcpy(blocks + n * BlockBytes, &regs.reg_array[block * BlockWords], BlockBytes);
-            ++n;
-        }
-        dirty[w] = 0;
+    std::memcpy(indices, changed.data(), num_blocks * sizeof(u16));
+    for (u32 i = 0; i < num_blocks; ++i) {
+        std::memcpy(blocks + i * BlockBytes, &regs.reg_array[changed[i] * BlockWords], BlockBytes);
     }
     u8* tail = blocks + block_bytes;
     if (full_bytes != 0) {
         std::memcpy(tail, &regs, sizeof(AmdGpu::Regs));
+        sent = regs;
         tail += full_bytes;
     }
     if (args_size != 0) {
@@ -3837,17 +3869,17 @@ void Rasterizer::SendPipePacket(PipeOp op, const void* args, u32 args_size) {
     draw_pipe->Commit(size);
 }
 
-void Rasterizer::RequestPipeFlush() {
+void Rasterizer::RequestPipeFlush(bool force) {
     if (draw_pipe->Idle()) {
-        if (liverpool->HonestSignalsUnsubmitted()) {
+        if (force || liverpool->HonestSignalsUnsubmitted()) {
             Flush();
         }
         return;
     }
-    if (draw_pipe->packets == pipe_flush_packets_) {
+    if (draw_pipe->packets == pipe_flush_packets_ && !force) {
         return;
     }
-    SendPipePacket(PipeOp::Flush, nullptr, 0);
+    SendPipePacket(PipeOp::Flush, &force, sizeof(force));
     pipe_flush_packets_ = draw_pipe->packets;
     ++pipe_flushes_;
 }
@@ -3876,6 +3908,7 @@ void Rasterizer::RunPipePacket(const u8* data, u32 size) {
     if (packet.flags & PipeReset) {
         view.regs.SetDefaults();
     }
+    const u64 apply_start = __rdtsc();
     const u8* const indices = data + sizeof(PipePacket);
     const u8* const blocks = indices + Common::AlignUp(packet.num_blocks * sizeof(u16), 8);
     for (u32 i = 0; i < packet.num_blocks; ++i) {
@@ -3883,6 +3916,7 @@ void Rasterizer::RunPipePacket(const u8* data, u32 size) {
         std::memcpy(&block, indices + i * sizeof(u16), sizeof(u16));
         std::memcpy(&view.regs.reg_array[block * BlockWords], blocks + i * BlockBytes, BlockBytes);
     }
+    pipe_apply_cycles_.fetch_add(__rdtsc() - apply_start, std::memory_order_relaxed);
     const u8* tail = blocks + packet.num_blocks * BlockBytes;
     if (packet.flags & PipeFull) {
         const auto* full = reinterpret_cast<const AmdGpu::Regs*>(tail);
@@ -3928,10 +3962,16 @@ void Rasterizer::RunPipePacket(const u8* data, u32 size) {
     case PipeOp::GuestSync:
         runtime.NoteGuestSync();
         break;
-    case PipeOp::Flush:
-        if (liverpool->HonestSignalsUnsubmitted()) {
+    case PipeOp::Flush: {
+        bool force = false;
+        std::memcpy(&force, tail, sizeof(force));
+        if (force || liverpool->HonestSignalsUnsubmitted()) {
             Flush();
         }
+        break;
+    }
+    case PipeOp::Submit:
+        RecordSubmit();
         break;
     case PipeOp::Pm4:
         liverpool->RunPipePm4(reinterpret_cast<const u32*>(tail));
@@ -3975,6 +4015,7 @@ void Rasterizer::EmitDrawPipeTelemetry() {
     const u64 now = __rdtsc();
     const u64 window = std::max<u64>(now - pipe_last_tsc_, 1);
     const u64 busy = pipe.busy_cycles.load(std::memory_order_relaxed);
+    const u64 apply = pipe_apply_cycles_.load(std::memory_order_relaxed);
     u64 drains = 0;
     u64 waited = 0;
     for (u32 i = 0; i < DrawPipe::NumReasons; ++i) {
@@ -4010,14 +4051,20 @@ void Rasterizer::EmitDrawPipeTelemetry() {
     LOG_INFO(Render,
              "DRAWPIPE packets={} blocks={} recorder_busy={:.1f}% decoder_wait={:.1f}% "
              "drains={} top={} flushes={} waits gfx={}/{}/{}/{} acb={}/{}/{}/{} "
-             "(pending/unmet/spins/late) verified={} mismatches={} per300f",
+             "(pending/unmet/spins/late) blocks_same={} apply={:.2f}% verified={} mismatches={} "
+             "per300f",
              pipe.packets - pipe_last_packets_, pipe_blocks_,
              100.0 * static_cast<double>(busy - pipe_last_busy_) / static_cast<double>(window),
              100.0 * static_cast<double>(waited) / static_cast<double>(window), drains, top,
              pipe_flushes_, pk.waits_pending, pk.waits, pk.wait_spins, pk.waits_pending_late,
              pk.acb_waits_pending, pk.acb_waits, pk.acb_wait_spins, pk.acb_waits_pending_late,
-             pipe_verified_, pipe_mismatches_);
+             pipe_blocks_same_,
+             100.0 * static_cast<double>(apply - pipe_last_apply_) / static_cast<double>(window),
+             pipe_verified_.load(std::memory_order_relaxed),
+             pipe_mismatches_.load(std::memory_order_relaxed));
     pipe_flushes_ = 0;
+    pipe_blocks_same_ = 0;
+    pipe_last_apply_ = apply;
     pipe.drains = {};
     pipe.drain_cycles = {};
     pipe_last_packets_ = pipe.packets;

@@ -180,7 +180,7 @@ public:
 
     /// Draw pipe: the recording thread submits queued honest signals after the packets before
     /// this call (directly here when it is idle).
-    void RequestPipeFlush();
+    void RequestPipeFlush(bool force = false);
     /// Draw pipe: a WRITE_DATA or DMA_DATA packet run in order on the recording thread.
     void QueuePm4(const void* packet, u32 size);
     /// Draw pipe: an honest fence recorded in order after the packets before it.
@@ -197,6 +197,7 @@ private:
         Fence,
         Flush,
         Pm4,
+        Submit,
     };
     enum PipeFlags : u8 {
         PipeReset = 1 << 0,  ///< CLEAR_STATE: defaults first
@@ -246,6 +247,10 @@ private:
     void RunPipePacket(const u8* data, u32 size);
     void VerifyPipeRegs(const AmdGpu::Regs& expected);
     void EmitDrawPipeTelemetry();
+    /// End of a guest frame: the census lines (command thread) and the cache ticks (where the
+    /// draws are recorded).
+    void LogPacketStats();
+    void RecordSubmit();
 
     void RecordDraw(bool is_indexed, u32 index_offset);
     void RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -716,8 +721,13 @@ private:
     bool pipe_full_next_{true};
     u64 pipe_flush_packets_{};
     u64 pipe_flushes_{};
-    u64 pipe_verified_{};
-    u64 pipe_mismatches_{};
+    std::atomic<u64> pipe_verified_{};
+    std::atomic<u64> pipe_mismatches_{};
+    std::atomic<u64> pipe_apply_cycles_{};
+    u64 pipe_last_apply_{};
+    u64 pipe_blocks_same_{};
+    /// Command thread: the register file as the recording thread holds it.
+    std::unique_ptr<AmdGpu::Regs> pipe_sent_regs;
     u64 pipe_blocks_{};
     u64 pipe_last_packets_{};
     u64 pipe_last_busy_{};

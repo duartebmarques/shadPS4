@@ -30,7 +30,7 @@ class DrawPipe {
 public:
     /// Runs a packet on stage B.
     using Handler = void (*)(void* context, const u8* packet, u32 size);
-    /// Runs once on stage B before the first packet.
+    /// Runs once on stage B before the first packet (thread placement, thread flags).
     using ThreadInit = void (*)(void* context);
 
     DrawPipe(Handler handler_, ThreadInit init, void* context_)
@@ -113,13 +113,7 @@ public:
         const u32 slot = std::min<u32>(reason, ReasonRasterizer);
         ++drains[slot];
         const u64 start = __rdtsc();
-        for (u32 spins = 0; consumed.load(std::memory_order_acquire) != head; ++spins) {
-            if (spins < 4096) {
-                _mm_pause();
-            } else {
-                std::this_thread::yield();
-            }
-        }
+        WaitConsumed(head);
         drain_cycles[slot] += __rdtsc() - start;
     }
 
@@ -142,9 +136,26 @@ private:
     }
 
     void WaitForSpace(u64 at, u64 size) {
-        while (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
+        if (at + size - consumed.load(std::memory_order_acquire) > Capacity) {
+            WaitConsumed(at + size - Capacity);
+        }
+    }
+
+    /// Stage A: waits until stage B has consumed up to `target`: a short spin, then a futex
+    /// sleep that stage B ends once it gets there (a spinning stage A takes a guest core).
+    void WaitConsumed(u64 target) {
+        for (u32 spins = 0; spins < 2048; ++spins) {
+            if (consumed.load(std::memory_order_acquire) >= target) {
+                return;
+            }
             _mm_pause();
         }
+        wake_target.store(target, std::memory_order_seq_cst);
+        for (u64 seen = consumed.load(std::memory_order_seq_cst); seen < target;
+             seen = consumed.load(std::memory_order_seq_cst)) {
+            consumed.wait(seen, std::memory_order_seq_cst);
+        }
+        wake_target.store(NoTarget, std::memory_order_relaxed);
     }
 
     void Run(std::stop_token stop) {
@@ -181,14 +192,20 @@ private:
             const auto* header = reinterpret_cast<const Header*>(ring.get() + at % Capacity);
             if (header->size == 0) {
                 at += Capacity - at % Capacity;
-                consumed.store(at, std::memory_order_release);
+                consumed.store(at, std::memory_order_seq_cst);
+                if (at >= wake_target.load(std::memory_order_seq_cst)) {
+                    consumed.notify_one();
+                }
                 continue;
             }
             const u64 start = __rdtsc();
             handler(context, reinterpret_cast<const u8*>(header + 1), header->payload);
             busy_cycles.fetch_add(__rdtsc() - start, std::memory_order_relaxed);
             at += header->size;
-            consumed.store(at, std::memory_order_release);
+            consumed.store(at, std::memory_order_seq_cst);
+            if (at >= wake_target.load(std::memory_order_seq_cst)) {
+                consumed.notify_one();
+            }
         }
     }
 
@@ -200,6 +217,8 @@ private:
     u32 pending_size = 0;
     alignas(64) std::atomic<u64> published{0};
     alignas(64) std::atomic<u64> consumed{0};
+    static constexpr u64 NoTarget = ~0ull;
+    alignas(64) std::atomic<u64> wake_target{NoTarget};
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
     std::jthread thread;

@@ -162,6 +162,9 @@ public:
     static void MarkGpuSideThread() noexcept {
         gpu_side_thread = true;
     }
+    /// Draw pipe: the recording thread takes the core reserved for the command thread
+    /// (gpu_thread_core_reserve); SHADPS4_PIPE_PLACEMENT=0 keeps it on the command thread.
+    static bool PipeTakesReservedCore();
 
     /// Guest thread register write (sceGnmSetGsRingSizes).
     void SetGsRingSizes(u32 esgs_ring_size, u32 gsvs_ring_size) {
@@ -440,6 +443,7 @@ private:
     // SHADPS4_PIPE_CONSERVATIVE=1: every packet but register writes, draws and dispatches
     // drains the draw pipe.
     bool pipe_drain_all_{};
+    bool command_thread_moved_{};
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};
