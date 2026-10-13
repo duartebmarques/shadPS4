@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
 #include <boost/preprocessor/stringize.hpp>
 
@@ -112,6 +113,9 @@ SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateS
 // so the lanes drain before anything guest-visible is written. Then the downloads and the sync
 // batch, so a fence sees them.
 static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
+    if (rasterizer) {
+        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonFence);
+    }
     VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (rasterizer) {
         rasterizer->NoteGuestSync();
@@ -123,6 +127,92 @@ static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
 static void NoteGuestSync(Vulkan::Rasterizer* rasterizer) {
     if (rasterizer) {
         rasterizer->NoteGuestSync();
+    }
+}
+
+// Draw pipe: whether a graphics packet waits for the recording thread to run dry first. Register
+// writes, draws and dispatches go through the pipe; sync notes are pipe packets too.
+static bool GfxPacketDrainsPipe(const PM4Header* header, PM4ItOpcode opcode, bool drain_all) {
+    switch (opcode) {
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return false;
+    default:
+        break;
+    }
+    if (drain_all) {
+        return true;
+    }
+    switch (opcode) {
+    case PM4ItOpcode::Nop: {
+        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+        return nop->header.count.Value() != 0 &&
+               nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip;
+    }
+    case PM4ItOpcode::DmaData:
+        return reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo != 0x3022C;
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::IncrementDeCounter:
+    case PM4ItOpcode::WaitOnCeCounter:
+    case PM4ItOpcode::PfpSyncMe:
+    case PM4ItOpcode::StrmoutBufferUpdate:
+    case PM4ItOpcode::GetLodStats:
+    case PM4ItOpcode::CopyData:
+    case PM4ItOpcode::Rewind:
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::IndirectBuffer:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool ComputePacketDrainsPipe(const PM4Header* header, PM4ItOpcode opcode, bool drain_all) {
+    switch (opcode) {
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return false;
+    default:
+        break;
+    }
+    if (drain_all) {
+        return true;
+    }
+    switch (opcode) {
+    case PM4ItOpcode::DmaData:
+        return reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo != 0x3022C;
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::IndirectBuffer:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::Rewind:
+    case PM4ItOpcode::WaitRegMem:
+        return false;
+    default:
+        return true;
     }
 }
 
@@ -351,8 +441,11 @@ static_assert(RegBlocksInRange(kRtRegBlocks));
 SHAD_FORCE_INLINE static void CpWriteOrCopy(Vulkan::Rasterizer* rasterizer, void* dst,
                                             const void* src, u64 size) {
     // A CP write lands in guest memory at parse time. On hardware every earlier draw has read
-    // its inputs by then; here those reads may still be queued on the copy lanes, and the write
-    // may also be a label the guest polls before reusing buffers. Drain first.
+    // its inputs by then; here those reads may still be queued on the copy lanes or the draw
+    // pipe, and the write may also be a label the guest polls before reusing buffers. Drain first.
+    if (rasterizer) {
+        rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::DumpConstRam));
+    }
     VideoCore::StreamCopyLane::Instance().DrainProducer();
     if (!rasterizer || !rasterizer->TryCpWriteBacking(std::bit_cast<VAddr>(dst), src, size)) {
         std::memcpy(dst, src, size);
@@ -400,6 +493,9 @@ Liverpool::Liverpool() {
     gfx_stamp.classify_rt = gfx_stamp.active && EmulatorSettings.IsRtStateStamp();
     occlude_all_ = EmulatorSettings.IsOccludeAll();
     honest_fences_ = EmulatorSettings.GetInplaceGuestMemory() >= 1;
+    if (const char* env = std::getenv("SHADPS4_PIPE_CONSERVATIVE")) {
+        pipe_drain_all_ = std::atoi(env) != 0;
+    }
     reg_run_ = EmulatorSettings.IsParserRegRun();
     Common::SetCoreReservationEnabled(EmulatorSettings.IsGpuThreadCoreReserve());
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
@@ -411,6 +507,10 @@ Liverpool::~Liverpool() {
 }
 
 void Liverpool::DrainCommands() {
+    // Commands run on the caches and the scheduler, which the recording thread owns meanwhile.
+    if (rasterizer) {
+        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
+    }
     // Process incoming commands with high priority
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
@@ -427,6 +527,8 @@ void Liverpool::DrainCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    gpu_side_thread = true;
+    command_thread = true;
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
@@ -473,6 +575,10 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
+                if (rasterizer && num_submits == 1) {
+                    // The guest sees the GPU idle once the last submission is decoded.
+                    rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+                }
                 // A guest submission ended: its queued honest signals may now be waited on.
                 FlushHonestSignals();
 
@@ -490,6 +596,9 @@ void Liverpool::Process(std::stop_token stoken) {
             }
         }
 
+        if (rasterizer) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+        }
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
@@ -648,6 +757,7 @@ SHAD_FORCE_INLINE void Liverpool::SetContextRegHot(const PM4Header* header, u32 
     const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
     gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32), reg_addr);
+    MarkPipeDirty(reg_addr, count - 1);
 
     // In the case of HW, render target memory has alignment as color block operates on
     // tiles. There is no information of actual resource extents stored in CB context
@@ -706,6 +816,7 @@ SHAD_FORCE_INLINE void Liverpool::SetShRegHot(const PM4Header* header, u32 count
     } else {
         gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size, word);
     }
+    MarkPipeDirty(word, static_cast<u32>(set_size / sizeof(u32)));
 }
 
 SHAD_NO_INLINE std::span<const u32> Liverpool::RunRegisterRun(std::span<const u32> dcb) {
@@ -768,7 +879,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             body();
         }
     };
-    Vulkan::Rasterizer::PacketRunGuard run{rasterizer};
+    Vulkan::Rasterizer::PacketRunGuard run{draw_pipe ? nullptr : rasterizer};
 
     while (!dcb.empty()) {
         // One poll, one load: the drain re-tests the same counter, and the copy
@@ -822,6 +933,9 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             continue;
         }
         ++run_stats.outer_packets;
+        if (draw_pipe && GfxPacketDrainsPipe(header, opcode, pipe_drain_all_)) {
+            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+        }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -873,6 +987,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         case PM4ItOpcode::ClearState: {
             regs.SetDefaults();
             gfx_stamp.MarkDirty();
+            pipe_reset = true;
             break;
         }
         case PM4ItOpcode::SetConfigReg: {
@@ -881,6 +996,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             const auto* payload = reinterpret_cast<const u32*>(header + 2);
             gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32),
                                 reg_addr);
+            MarkPipeDirty(reg_addr, count - 1);
             break;
         }
         case PM4ItOpcode::SetContextReg: {
@@ -896,6 +1012,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             gfx_stamp.WriteRegs(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
                                 header + 2, (count - 1) * sizeof(u32),
                                 Regs::UconfigRegWordOffset + set_data->reg_offset);
+            MarkPipeDirty(Regs::UconfigRegWordOffset + set_data->reg_offset, count - 1);
             break;
         }
         case PM4ItOpcode::SetPredication: {
@@ -908,6 +1025,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             if (regs.index_buffer_type.raw != index_type->raw) {
                 regs.index_buffer_type.raw = index_type->raw;
                 gfx_stamp.MarkDirty();
+                MarkPipeDirtyField(regs.index_buffer_type);
             }
             break;
         }
@@ -919,6 +1037,10 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
             regs.num_indices = draw_index->index_count;
             regs.draw_initiator = draw_index->draw_initiator;
+            MarkPipeDirtyField(regs.max_index_size);
+            MarkPipeDirtyField(regs.index_base_address);
+            MarkPipeDirtyField(regs.num_indices);
+            MarkPipeDirtyField(regs.draw_initiator);
             if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
@@ -933,6 +1055,9 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             regs.max_index_size = draw_index_off->max_size;
             regs.num_indices = draw_index_off->index_count;
             regs.draw_initiator = draw_index_off->draw_initiator;
+            MarkPipeDirtyField(regs.max_index_size);
+            MarkPipeDirtyField(regs.num_indices);
+            MarkPipeDirtyField(regs.draw_initiator);
             if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
@@ -947,6 +1072,8 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
             regs.num_indices = draw_index->index_count;
             regs.draw_initiator = draw_index->draw_initiator;
+            MarkPipeDirtyField(regs.num_indices);
+            MarkPipeDirtyField(regs.draw_initiator);
             if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
@@ -996,6 +1123,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
             const auto offset = draw_index_indirect->data_offset;
             const auto stride = sizeof(DrawIndexedIndirectArgs);
             regs.max_index_size = index_buffer_num_indices;
+            MarkPipeDirtyField(regs.max_index_size);
             if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
@@ -1014,6 +1142,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
             const auto offset = draw_index_indirect->data_offset;
             regs.max_index_size = index_buffer_num_indices;
+            MarkPipeDirtyField(regs.max_index_size);
             if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
@@ -1033,6 +1162,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
             const auto offset = draw_index_indirect->data_offset;
             regs.max_index_size = index_buffer_num_indices;
+            MarkPipeDirtyField(regs.max_index_size);
             if (dumping_regs) {
                 DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
             }
@@ -1086,12 +1216,14 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
         case PM4ItOpcode::NumInstances: {
             const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
             regs.num_instances.num_instances = num_instances->num_instances;
+            MarkPipeDirtyField(regs.num_instances);
             break;
         }
         case PM4ItOpcode::IndexBase: {
             const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
             regs.index_base_address.base_addr_lo = index_base->addr_lo;
             regs.index_base_address.base_addr_hi = index_base->addr_hi;
+            MarkPipeDirtyField(regs.index_base_address);
             break;
         }
         case PM4ItOpcode::IndexBufferSize: {
@@ -1115,8 +1247,12 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 // TODO: handle proper synchronization, for now signal that update is done
                 // immediately
                 regs.cp_strmout_cntl.offset_update_done = 1;
+                MarkPipeDirtyField(regs.cp_strmout_cntl);
             } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                 if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                    if (rasterizer) {
+                        rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::EventWrite));
+                    }
                     ++packet_stats.occlusion_events;
                     static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                     static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
@@ -1337,6 +1473,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         switch (header->type3.opcode) {
         case PM4ItOpcode::MemSemaphore: {
+            if (rasterizer) {
+                rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::MemSemaphore));
+            }
             NoteGuestSync(rasterizer);
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
@@ -1370,6 +1509,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u64* wait_addr = wait_reg_mem->Address<u64*>();
             if (vo_port->IsVoLabel(wait_addr) &&
                 num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                if (rasterizer) {
+                    rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::WaitRegMem));
+                }
                 FlushHonestSignals();
                 vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                 break;
@@ -1470,6 +1612,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        if (draw_pipe && ComputePacketDrainsPipe(header, opcode, pipe_drain_all_)) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1572,6 +1717,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 } else {
                     gfx_stamp.WriteRegsImmediate(&regs.reg_array[word], header + 2, set_size, word);
                 }
+                MarkPipeDirty(word, static_cast<u32>(set_size / sizeof(u32)));
             }
             break;
         }

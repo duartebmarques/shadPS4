@@ -508,6 +508,11 @@ struct GPUSettings {
     // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a
     // CPU copy on the completion thread, which end-of-pipe labels queue behind.
     Setting<bool> inplace_image_downloads{true};
+    // Two-stage draw pipeline (ported from bbport). The GPU command thread decodes the command
+    // stream and hands draws and dispatches, with the registers they changed, to a recording
+    // thread that keeps its own register copy and records them. Other packets that touch the
+    // caches or the scheduler wait for the recording thread to run dry first. Read once at boot.
+    Setting<bool> draw_pipe{false};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
     // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
@@ -773,6 +778,7 @@ struct GPUSettings {
             GPU_OVERRIDE(inplace_guest_memory),
             GPU_OVERRIDE(guest_sync_barriers),
             GPU_OVERRIDE(inplace_image_downloads),
+            GPU_OVERRIDE(draw_pipe),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(pending_pop_throttle),
             GPU_OVERRIDE(stream_copy_workers),
@@ -865,7 +871,7 @@ struct GPUSettings {
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, inplace_guest_memory, guest_sync_barriers, \
-    inplace_image_downloads
+    inplace_image_downloads, draw_pipe
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1194,6 +1200,7 @@ public:
     SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
     SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
     SETTING_FORWARD_BOOL(m_gpu, InplaceImageDownloads, inplace_image_downloads)
+    SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)

@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/skipcache/skipcache.h"
@@ -588,7 +589,7 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.Regs();
     const auto BuildCommon = [&](const auto& program) {
         info.props.fp_denorm_mode32 = program.settings.fp_denorm_mode32;
         info.props.fp_denorm_mode16_64 = program.settings.fp_denorm_mode64;
@@ -720,7 +721,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         break;
     }
     case HwStage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
+        const auto& cs_pgm = rasterizer.CsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
         info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
@@ -774,7 +775,7 @@ template <bool Fuse>
 SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __restrict out,
                                                         const u32* __restrict cmp,
                                                         u64* diff) const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.Regs();
     u32 n = 0;
     // Two accumulators: a single OR chain over up to 61 words is a latency
     // chain the core cannot overlap. Words are read from the source through
@@ -845,7 +846,7 @@ SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __re
         break;
     }
     case HwStage::Compute: {
-        const auto& cs = liverpool->GetCsRegs();
+        const auto& cs = rasterizer.CsRegs();
         put(cs.settings);
         put(cs.num_thread_x);
         put(cs.num_thread_y);
@@ -943,8 +944,9 @@ SHAD_NO_INLINE void PipelineCache::ValidateRuntimeInfoMemo(HwStage stage, SwStag
 }
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
-                             AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
+                             const Rasterizer& rasterizer_, AmdGpu::Liverpool* liverpool_,
+                             u32 sparse_page_shift)
+    : instance{instance_}, scheduler{scheduler_}, rasterizer{rasterizer_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes}, layouts{instance} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -1130,7 +1132,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // at, not on the one that first stored it.
     if (last_graphics_pipeline && pipe_gen == last_graphics_pipe_gen &&
         graphics_key == last_graphics_key) {
-        last_key_stamp = liverpool->GetGfxStateStamp();
+        last_key_stamp = rasterizer.GfxStateStamp();
         key_is_last = true;
         ++key_refresh_same;
         return last_graphics_pipeline;
@@ -1191,7 +1193,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
     last_graphics_pipeline = it->second.get();
     last_graphics_pipe_gen = pipe_gen;
-    last_key_stamp = liverpool->GetGfxStateStamp();
+    last_key_stamp = rasterizer.GfxStateStamp();
     key_is_last = true;
     return last_graphics_pipeline;
 }
@@ -1202,7 +1204,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 // refresh. The Fragment runtime-info slot must be stamp-current: its rebuild
 // reads the key's color buffers, which the full refresh has already masked.
 bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
-    const u64 stamp = liverpool->GetGfxStateStamp();
+    const u64 stamp = rasterizer.GfxStateStamp();
     const auto& fs_slot = ri_stamp[static_cast<u32>(SwStage::Fragment)];
     if (!last_graphics_pipeline || pipe_gen != last_graphics_pipe_gen || stamp != last_key_stamp ||
         !fs_slot.valid || fs_slot.stamp != stamp) {
@@ -1447,7 +1449,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     key_is_last = false;
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.Regs();
     auto& key = graphics_key;
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
@@ -1596,7 +1598,7 @@ Shader::ShaderParams PipelineCache::ResolveParams(SwStage l_stage, const Pgm& pg
 }
 
 bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.Regs();
     auto& key = graphics_key;
     fetch_shader_ref = {};
     stage_hash_diff = 0;
@@ -1744,7 +1746,7 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
 
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = rasterizer.CsRegs();
     const auto cs_params = ResolveParams(SwStage::Compute, cs_pgm);
     // The compute program publishes into slot 0, which the compute lookup
     // dereferences; compute stages carry no fetch shader.
@@ -1844,7 +1846,7 @@ u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::Shad
     }
     const bool stampable =
         ri_stamp_gate && (stage == HwStage::Vertex || stage == HwStage::Fragment);
-    const u64 reg_stamp = stampable ? liverpool->GetGfxStateStamp() : 0;
+    const u64 reg_stamp = stampable ? rasterizer.GfxStateStamp() : 0;
     if (!stampable || !ri_slot.valid || ri_slot.stamp != reg_stamp ||
         ri_slot.stage != static_cast<u8>(stage) ||
         (stage == HwStage::Vertex && ri_slot.indirect_key != indirect_key_)) {

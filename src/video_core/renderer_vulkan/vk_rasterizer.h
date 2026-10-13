@@ -7,16 +7,14 @@
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
-
-namespace AmdGpu {
-struct Liverpool;
-}
 
 namespace Core {
 class MemoryManager;
@@ -50,6 +48,30 @@ public:
 
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
+    }
+
+    /// The register state draws and dispatches are recorded with: the recording thread's copy
+    /// with the draw pipe, else the command processor's.
+    [[nodiscard]] const AmdGpu::Regs& Regs() const noexcept {
+        return *record_regs;
+    }
+    [[nodiscard]] const AmdGpu::ComputeProgram& CsRegs() const noexcept {
+        return record_view ? record_view->cs : liverpool->GetCsRegs();
+    }
+    [[nodiscard]] u64 GfxStateStamp() const noexcept {
+        return record_view ? record_view->gfx_stamp : liverpool->GetGfxStateStamp();
+    }
+    [[nodiscard]] u64 DynStateStamp() const noexcept {
+        return record_view ? record_view->dyn_stamp : liverpool->GetDynStateStamp();
+    }
+    [[nodiscard]] u64 RtStateStamp() const noexcept {
+        return record_view ? record_view->rt_stamp : liverpool->GetRtStateStamp();
+    }
+    [[nodiscard]] const AmdGpu::CbDbExtent& CbExtent(u32 cb) const noexcept {
+        return record_view ? record_view->cb_extent[cb] : liverpool->last_cb_extent[cb];
+    }
+    [[nodiscard]] const AmdGpu::CbDbExtent& DbExtent() const noexcept {
+        return record_view ? record_view->db_extent : liverpool->last_db_extent;
     }
 
     void Draw(bool is_indexed, u32 index_offset = 0);
@@ -143,8 +165,77 @@ public:
 #ifdef __linux__
     u32 GetGpuCommandProcessorThreadId();
 #endif
+    /// The GPU command thread or the draw pipe's recording thread (see Liverpool::OnGpuThread).
+    bool IsGpuSideThread() const {
+        return liverpool->OnGpuThread();
+    }
+
+    /// Draw pipe, GPU command thread: waits until the recording thread has recorded every
+    /// packet handed to it. A no-op on other threads and without the draw pipe.
+    void DrainDrawPipe(u32 reason = DrawPipe::ReasonRasterizer) {
+        if (draw_pipe && !draw_pipe->Idle() && AmdGpu::Liverpool::OnCommandThread()) {
+            draw_pipe->Drain(reason);
+        }
+    }
 
 private:
+    enum class PipeOp : u8 {
+        Draw,
+        DrawIndirect,
+        DispatchDirect,
+        DispatchIndirect,
+        GuestSync,
+    };
+    enum PipeFlags : u8 {
+        PipeReset = 1 << 0,  ///< CLEAR_STATE: defaults first
+        PipeFull = 1 << 1,   ///< the full register file follows the blocks
+        PipeVerify = 1 << 2, ///< compare the copy with the full file before taking it
+    };
+    struct PipePacket {
+        PipeOp op;
+        u8 flags;
+        u16 num_blocks;
+        u32 pad;
+        u64 gfx_stamp;
+        u64 dyn_stamp;
+        u64 rt_stamp;
+        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;
+        AmdGpu::CbDbExtent db_extent;
+    };
+    struct PipeDraw {
+        bool is_indexed;
+        u32 index_offset;
+    };
+    struct PipeDrawIndirect {
+        bool is_indexed;
+        u16 vertex_sgpr_offset;
+        u16 instance_sgpr_offset;
+        u32 offset;
+        u32 size;
+        u32 max_count;
+        VAddr arg_address;
+        VAddr count_address;
+    };
+    struct PipeDispatch {
+        AmdGpu::ComputeProgram cs;
+        VAddr address;
+        u32 offset;
+        u32 size;
+    };
+    /// Stage A: hands the dirty register blocks and `args` to the recording thread.
+    void SendPipePacket(PipeOp op, const void* args, u32 args_size);
+    /// Stage B: applies a packet to the register copy and records it.
+    void RunPipePacket(const u8* data, u32 size);
+    void VerifyPipeRegs(const AmdGpu::Regs& expected);
+    void EmitDrawPipeTelemetry();
+
+    void RecordDraw(bool is_indexed, u32 index_offset);
+    void RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
+                            u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
+                            u16 instance_sgpr_offset);
+    void RecordDispatchDirect();
+    void RecordDispatchIndirect(VAddr address, u32 offset, u32 size);
+
     // Returns whether the memo it consumed or refilled may certify the next
     // draw's glue (draw_glue_memo); false whenever the glue is off.
     bool PrepareRenderState(const GraphicsPipeline* pipeline);
@@ -445,6 +536,19 @@ private:
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
+    /// The draw pipe's recording thread state: its register copy and the command processor
+    /// state of the packet it records. Null without the draw pipe.
+    struct RecordView {
+        AmdGpu::Regs regs;
+        AmdGpu::ComputeProgram cs;
+        u64 gfx_stamp;
+        u64 dyn_stamp;
+        u64 rt_stamp;
+        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;
+        AmdGpu::CbDbExtent db_extent;
+    };
+    std::unique_ptr<RecordView> record_view;
+    const AmdGpu::Regs* record_regs;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     // Generation for IsMapped's per-thread interval cache.
@@ -586,6 +690,20 @@ private:
     u64 glue_arms_{};
     u64 glue_div_{};
     bool needs_barrier{};
+
+    // Draw pipe: every pipe_verify_every-th packet carries the full register file
+    // (SHADPS4_PIPE_VERIFY); the first one always does.
+    u32 pipe_verify_every_{};
+    u32 pipe_verify_count_{};
+    bool pipe_full_next_{true};
+    u64 pipe_verified_{};
+    u64 pipe_mismatches_{};
+    u64 pipe_blocks_{};
+    u64 pipe_last_packets_{};
+    u64 pipe_last_busy_{};
+    u64 pipe_last_tsc_{};
+    // Last: the recording thread stops before anything it uses goes.
+    std::unique_ptr<DrawPipe> draw_pipe;
 };
 
 } // namespace Vulkan

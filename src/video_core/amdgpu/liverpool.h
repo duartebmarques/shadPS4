@@ -7,6 +7,7 @@
 
 #include <deque>
 
+#include <atomic>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -78,6 +79,37 @@ struct Liverpool {
     std::array<u64, (Regs::NumRegs - Regs::ContextRegWordOffset) / 64> dyn_reg_mask_{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    /// Draw pipe (vk_draw_pipe.h): the 32-word register blocks written since the last packet
+    /// handed to the recording thread, and whether a CLEAR_STATE reset the file in between.
+    static constexpr u32 PipeBlockWords = 32;
+    std::array<u64, Regs::NumRegs / PipeBlockWords / 64> pipe_dirty{};
+    bool pipe_reset{};
+    bool draw_pipe{};
+
+    void MarkPipeDirty(u32 word, u32 count) {
+        if (!draw_pipe || count == 0) {
+            return;
+        }
+        const u32 last = (word + count - 1) / PipeBlockWords;
+        for (u32 block = word / PipeBlockWords; block <= last; ++block) {
+            pipe_dirty[block / 64] |= u64{1} << (block % 64);
+        }
+    }
+    template <typename T>
+    void MarkPipeDirtyField(const T& field) {
+        const auto offset = reinterpret_cast<const u8*>(&field) -
+                            reinterpret_cast<const u8*>(regs.reg_array.data());
+        MarkPipeDirty(static_cast<u32>(offset / sizeof(u32)),
+                      static_cast<u32>((sizeof(T) + sizeof(u32) - 1) / sizeof(u32)));
+    }
+    /// Marks the registers other threads wrote (SetGsRingSizes) since the last call.
+    void TakeExternalRegWrites() {
+        if (external_reg_writes.load(std::memory_order_relaxed) &&
+            external_reg_writes.exchange(false, std::memory_order_acquire)) {
+            MarkPipeDirtyField(regs.vgt_esgs_ring_size);
+            MarkPipeDirtyField(regs.vgt_gsvs_ring_size);
+        }
+    }
 
 public:
     explicit Liverpool();
@@ -118,8 +150,24 @@ public:
                num_commands.load(std::memory_order_relaxed) != 0;
     }
 
+    /// The GPU command thread, or the draw pipe's recording thread: the threads that own the
+    /// caches and the command recording (one at a time).
     bool OnGpuThread() const noexcept {
-        return std::this_thread::get_id() == gpu_id;
+        return gpu_side_thread;
+    }
+    /// The GPU command thread only.
+    static bool OnCommandThread() noexcept {
+        return command_thread;
+    }
+    static void MarkGpuSideThread() noexcept {
+        gpu_side_thread = true;
+    }
+
+    /// Guest thread register write (sceGnmSetGsRingSizes).
+    void SetGsRingSizes(u32 esgs_ring_size, u32 gsvs_ring_size) {
+        regs.vgt_esgs_ring_size = esgs_ring_size;
+        regs.vgt_gsvs_ring_size = gsvs_ring_size;
+        external_reg_writes.store(true, std::memory_order_release);
     }
 
     u64 GetGfxStateStamp() const noexcept {
@@ -363,6 +411,12 @@ private:
 
     Vulkan::Rasterizer* rasterizer{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
+    std::atomic<bool> external_reg_writes{};
+    static inline thread_local bool gpu_side_thread = false;
+    static inline thread_local bool command_thread = false;
+    // SHADPS4_PIPE_CONSERVATIVE=1: every packet but register writes, draws and dispatches
+    // drains the draw pipe.
+    bool pipe_drain_all_{};
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};

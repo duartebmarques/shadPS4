@@ -38,6 +38,7 @@ struct Info;
 namespace Vulkan {
 
 class Instance;
+class Rasterizer;
 class Scheduler;
 class ShaderCache;
 
@@ -182,7 +183,8 @@ struct DrawIndirectParams {
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
-                           AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
+                           const Rasterizer& rasterizer, AmdGpu::Liverpool* liverpool,
+                           u32 sparse_page_shift);
     ~PipelineCache();
 
     void WarmUp();
@@ -257,6 +259,7 @@ private:
 private:
     const Instance& instance;
     Scheduler& scheduler;
+    const Rasterizer& rasterizer;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
     PipelineLayoutCache layouts; // destroyed after every pipeline
