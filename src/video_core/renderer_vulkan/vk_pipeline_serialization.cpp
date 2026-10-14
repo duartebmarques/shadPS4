@@ -303,8 +303,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
         it_pgm.value() = std::move(program);
     } else {
         // The permutation joins the cached program; its spec must point at that program's info,
-        // not at the temporary one this load built.
-        spec.info = &it_pgm.value()->info;
+        // not at the temporary one this load built. That info also takes this permutation's
+        // sharps: the pipeline layout is built from them and must match the binding counts its
+        // SPIR-V was compiled with.
+        auto& info = it_pgm.value()->info;
+        info.flattened_ud_buf = std::move(program->info.flattened_ud_buf);
+        info.flat_ud = info.flattened_ud_buf.data();
+        spec.info = &info;
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
         if (it != it_pgm.value()->modules.end()) {
             // A matching permutation is valid only at its original index. A different index means
