@@ -194,7 +194,8 @@ public:
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage,
-                           Shader::Gcn::FetchShaderData& fetch_out);
+                           Shader::Gcn::FetchShaderData& fetch_out,
+                           Shader::Backend::Bindings& binding);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
@@ -497,6 +498,7 @@ private:
     // deserialized permutations get signatures). Gates the spec-fingerprint tier and the
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.
     bool spec_fp_cache{};
+    u32 num_unchained_pipelines{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

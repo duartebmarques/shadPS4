@@ -209,7 +209,14 @@ struct Info : InfoPersistent {
 
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + samplers.size();
+        bnd.unified += buffers.size() + samplers.size();
+        // Must advance as the SPIR-V backend and the pipeline layout do: a mip fallback image
+        // takes one binding per level.
+        for (const auto& image : images) {
+            bnd.unified += image.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex
+                               ? image.NumBindings(*this)
+                               : 1;
+        }
     }
 
     void RefreshFlatBuf() {

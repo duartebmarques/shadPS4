@@ -1805,6 +1805,18 @@ SHAD_FORCE_INLINE u64 PipelineCache::Publish(u32 out_slot, SwStage l_stage,
     return hash;
 }
 
+// Every later hit of the program advances the bindings by its info, as the pipeline layout does;
+// a compile whose SPIR-V spans a different range leaves the next stages' bindings undeclared.
+static void CheckBindingSpan(const Shader::Info& info, Shader::Backend::Bindings start,
+                             const Shader::Backend::Bindings& emitted, size_t perm_idx) {
+    info.AddBindings(start);
+    if (start != emitted) {
+        LOG_ERROR(Render_Vulkan,
+                  "{} shader {:#x} permutation {} spans bindings to {}, its layout to {}",
+                  info.hw_stage, info.pgm_hash, perm_idx, emitted.unified, start.unified);
+    }
+}
+
 // The first-ever build of a program: a few hundred calls per session, each
 // carrying a StageSpecialization that must not sit in GetProgram's frame.
 u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
@@ -1816,6 +1828,7 @@ u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
     auto start = binding;
     auto ri_compile = runtime_info;
     const auto module = CompileModule(created_slot->info, ri_compile, params.code, 0, binding);
+    CheckBindingSpan(created_slot->info, start, binding, 0);
     NoteSharpVerdicts(created_slot->info);
     auto spec = Shader::StageSpecialization(created_slot->info, ri_compile, profile, start);
     const auto perm_hash = HashCombine(params.hash, 0);
@@ -2221,7 +2234,9 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
     if (hit_idx == std::numeric_limits<size_t>::max()) {
         auto new_info = Shader::Info(stage, l_stage, params);
         auto ri_compile = runtime_info;
+        const auto start = binding;
         module = CompileModule(new_info, ri_compile, params.code, perm_idx, binding);
+        CheckBindingSpan(info, start, binding, perm_idx);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
