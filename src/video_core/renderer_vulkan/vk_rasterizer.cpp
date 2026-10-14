@@ -1538,6 +1538,10 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
         LOG_INFO(Render_Skipcache, "[SkipCache] GUESTSYNC syncs={} relaxed_writes={} per300f",
                  syncs, relaxed);
     }
+    if (const auto bt = runtime.DrainBarrierTrackerStats(); bt.records) {
+        LOG_INFO(Render_Skipcache, "[SkipCache] BTRACK records={} folds={} buffers={} per300f",
+                 bt.records, bt.folds, bt.states);
+    }
     if (barrier_adds || fs.resident_checks || stream_skips || fs.sync_peeks) {
         LOG_INFO(Render_Skipcache,
                  "[SkipCache] FASTPATH barrier={}/{} resident={}/{} stream={} sync={}/{} "

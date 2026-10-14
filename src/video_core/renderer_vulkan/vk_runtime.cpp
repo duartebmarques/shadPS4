@@ -105,6 +105,9 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
     covered_range_skip = EmulatorSettings.IsCoveredRangeSkip();
     guest_sync_barriers = EmulatorSettings.IsGuestSyncBarriers();
+    if (EmulatorSettings.GetBarrierTracker() == 1) {
+        tracker.emplace(guest_sync_barriers);
+    }
 }
 
 void Runtime::TickFrame() {
@@ -757,6 +760,18 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
     if (handle == untracked_buffer) {
         return false;
     }
+    if (tracker) {
+        if (!tracker->Select(handle, false) ||
+            !tracker->Overlaps(offset, size, check_read_access)) {
+            return false;
+        }
+        if (check_read_access && guest_shader && guest_sync_barriers &&
+            !tracker->OverlapsOrdered(offset, size)) {
+            ++relaxed_write_skips;
+            return false;
+        }
+        return true;
+    }
     MakeCurrent(handle);
     const u64 end = offset + size;
     bool has_access = resource->write_ranges.Overlaps(offset, end);
@@ -780,6 +795,10 @@ void Runtime::NoteGuestSync() {
     }
     guest_accesses_unordered = false;
     ++guest_syncs;
+    if (tracker) {
+        tracker->NoteGuestSync();
+        return;
+    }
     for (auto& barriers : resources) {
         barriers.ordered_read_ranges = barriers.read_ranges;
         barriers.ordered_write_ranges = barriers.write_ranges;
@@ -807,6 +826,18 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         ASSERT_MSG(!(src_access & WRITE_MASK), "Write reported for the untracked buffer");
         ++untracked_skips;
         memory_barrier.srcStageMask |= src_stage;
+        return;
+    }
+
+    if (tracker) {
+        tracker->Select(handle, true);
+        tracker->Record(offset, size, static_cast<bool>(src_access & READ_MASK),
+                        static_cast<bool>(src_access & WRITE_MASK), guest_shader);
+        if (guest_sync_barriers && guest_shader) {
+            guest_accesses_unordered = true;
+        }
+        memory_barrier.srcStageMask |= src_stage;
+        memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
         return;
     }
 
@@ -875,6 +906,9 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
+    if (tracker) {
+        tracker->Clear();
+    }
     for (auto& resource : resources) {
         resource.read_ranges.Clear();
         resource.write_ranges.Clear();
