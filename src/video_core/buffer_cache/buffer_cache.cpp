@@ -1030,7 +1030,10 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     };
 
     info.AddWait(signal_sema, signal_tick);
+    Vulkan::Scheduler::DrainSubmits();
+    std::unique_lock queue_lk{Vulkan::Scheduler::queue_mutex};
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    queue_lk.unlock();
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     pending_binds.clear();

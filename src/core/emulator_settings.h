@@ -513,6 +513,13 @@ struct GPUSettings {
     // thread that keeps its own register copy and records them. Other packets that touch the
     // caches or the scheduler wait for the recording thread to run dry first. Read once at boot.
     Setting<bool> draw_pipe{false};
+    // Hand graphics queue submits to a submit thread, so the thread that records commands does
+    // not wait in the driver. Only submits that signal nothing but the scheduler timeline go
+    // there; the others wait for it to run dry and submit in place. Read once at boot.
+    Setting<bool> async_submit{false};
+    // A scheduler tick check that misses queries the GPU timeline (one ioctl) at most once per
+    // this many microseconds; misses in between answer "busy". Waits still query. 0 = always.
+    Setting<u32> tick_query_interval_us{0};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
     // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
@@ -779,6 +786,8 @@ struct GPUSettings {
             GPU_OVERRIDE(guest_sync_barriers),
             GPU_OVERRIDE(inplace_image_downloads),
             GPU_OVERRIDE(draw_pipe),
+            GPU_OVERRIDE(async_submit),
+            GPU_OVERRIDE(tick_query_interval_us),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(pending_pop_throttle),
             GPU_OVERRIDE(stream_copy_workers),
@@ -871,7 +880,7 @@ struct GPUSettings {
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, inplace_guest_memory, guest_sync_barriers, \
-    inplace_image_downloads, draw_pipe
+    inplace_image_downloads, draw_pipe, async_submit, tick_query_interval_us
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1218,6 +1227,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
     SETTING_FORWARD_BOOL(m_gpu, InplaceImageDownloads, inplace_image_downloads)
     SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
+    SETTING_FORWARD_BOOL(m_gpu, AsyncSubmit, async_submit)
+    SETTING_FORWARD(m_gpu, TickQueryIntervalUs, tick_query_interval_us)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)

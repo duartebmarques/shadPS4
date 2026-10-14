@@ -124,6 +124,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             Render_Vulkan,
             "bind_image_lean needs bind_noop_memo; image bindings run the full constructor");
     }
+    if (EmulatorSettings.IsAsyncSubmit()) {
+        scheduler.EnableAsyncSubmit();
+    }
     if (EmulatorSettings.IsDrawPipe()) {
         if (host_markers_enabled || guest_markers_enabled) {
             LOG_WARNING(Render_Vulkan, "draw_pipe is off: it does not support Vulkan markers");

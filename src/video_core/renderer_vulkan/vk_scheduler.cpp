@@ -15,6 +15,64 @@
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
+std::mutex Scheduler::queue_mutex;
+
+namespace {
+struct QueuedSubmit {
+    std::vector<vk::CommandBuffer> cmd_buffers;
+    vk::Semaphore timeline;
+    u64 tick;
+};
+
+struct SubmitWorker {
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<QueuedSubmit> queue;
+    bool busy{};
+    std::jthread thread;
+};
+
+SubmitWorker g_submit_worker;
+
+void SubmitThread(std::stop_token stoken, vk::Queue queue) {
+    Common::SetCurrentThreadName("shadPS4:GpuSubmit");
+    auto& w = g_submit_worker;
+    while (true) {
+        QueuedSubmit job;
+        {
+            std::unique_lock lk{w.mutex};
+            if (!w.cv.wait(lk, stoken, [&] { return !w.queue.empty(); })) {
+                return;
+            }
+            job = std::move(w.queue.front());
+            w.queue.pop_front();
+            w.busy = true;
+        }
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .signalSemaphoreValueCount = 1,
+            .pSignalSemaphoreValues = &job.tick,
+        };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_si,
+            .commandBufferCount = static_cast<u32>(job.cmd_buffers.size()),
+            .pCommandBuffers = job.cmd_buffers.data(),
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &job.timeline,
+        };
+        {
+            std::scoped_lock queue_lk{Scheduler::queue_mutex};
+            ImGui::Core::TextureManager::Submit();
+            const auto result = queue.submit(submit_info);
+            ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+        }
+        {
+            std::scoped_lock lk{w.mutex};
+            w.busy = false;
+        }
+        w.cv.notify_all();
+    }
+}
+} // Anonymous namespace
 
 Scheduler::Scheduler(const Instance& instance)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
@@ -22,12 +80,17 @@ Scheduler::Scheduler(const Instance& instance)
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
     pop_poll_throttle_ = std::max<u32>(EmulatorSettings.GetPendingPopThrottle(), 1u);
+    tick_query_interval_ns_ = u64{EmulatorSettings.GetTickQueryIntervalUs()} * 1000;
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
 
 Scheduler::~Scheduler() {
+    if (async_submit_) {
+        g_submit_worker.thread.request_stop();
+        g_submit_worker.thread.join();
+    }
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -116,6 +179,17 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     upload_cmdbuf = command_pool.Commit();
     Check(upload_cmdbuf.begin(begin_info));
     return upload_cmdbuf;
+}
+
+void Scheduler::EnableAsyncSubmit() {
+    async_submit_ = true;
+    g_submit_worker.thread = std::jthread(SubmitThread, instance.GetGraphicsQueue());
+}
+
+void Scheduler::DrainSubmits() {
+    auto& w = g_submit_worker;
+    std::unique_lock lk{w.mutex};
+    w.cv.wait(lk, [&] { return w.queue.empty() && !w.busy; });
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -382,9 +456,19 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (async_submit_ && info.num_wait_semas == 0 && info.num_signal_semas == 1 && !info.fence) {
+        {
+            std::scoped_lock lk{g_submit_worker.mutex};
+            g_submit_worker.queue.push_back({std::move(cmd_buffers), timeline, signal_value});
+        }
+        g_submit_worker.cv.notify_all();
+    } else {
+        DrainSubmits();
+        std::scoped_lock queue_lk{queue_mutex};
+        ImGui::Core::TextureManager::Submit();
+        auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    }
 
     work_semaphore.Refresh();
     BeginSession();

@@ -1076,7 +1076,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        std::unique_lock queue_lk{Scheduler::queue_mutex};
+        const bool presented = swapchain.Present();
+        queue_lk.unlock();
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }

@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -527,6 +528,13 @@ public:
         if (work_semaphore.IsFree(tick)) {
             return true;
         }
+        if (tick_query_interval_ns_ != 0) {
+            const u64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (now - last_tick_query_.load(std::memory_order_relaxed) < tick_query_interval_ns_) {
+                return false;
+            }
+            last_tick_query_.store(now, std::memory_order_relaxed);
+        }
         work_semaphore.Refresh();
         return work_semaphore.IsFree(tick);
     }
@@ -583,7 +591,15 @@ public:
         submit_hook_user_ = user;
     }
 
+    /// Hands this scheduler's plain submits to the shared submit thread (async_submit).
+    void EnableAsyncSubmit();
+
+    /// Returns once the submit thread has passed every queued submit to the driver.
+    static void DrainSubmits();
+
     static std::mutex submit_mutex;
+    /// Guards the graphics queue; the submit thread takes it without submit_mutex.
+    static std::mutex queue_mutex;
 
 private:
     void EndSession();
@@ -595,6 +611,9 @@ private:
 private:
     SubmitHook submit_hook_{};
     void* submit_hook_user_{};
+    bool async_submit_{};
+    u64 tick_query_interval_ns_{};
+    std::atomic<u64> last_tick_query_{};
     const Instance& instance;
     Semaphore work_semaphore;
     CommandPool command_pool;
