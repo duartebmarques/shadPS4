@@ -6,7 +6,6 @@ Device: Steam Deck OLED (SteamOS, gamescope, RADV, 16 GB shared RAM, GTT total 8
 ## Branch and builds
 - Fork: github.com/duartebmarques/shadPS4, branch `exodus-uma-shake`. Base: GR2fork EXODUS (0.19.1 WIP), which already includes upstream up to #5327.
 - CI runs on push, Linux only. The artifact is `shadps4-linux-sdl-<date>-<sha>` (AppImage).
-- Latest build: `3834b34`.
 - Our commits on top of EXODUS:
   - `motion_shake` input binding: fixes the graffiti soft-lock. Code in `src/input/controller.*` and `input_handler.*`.
   - Texture-cache GC with 20 s idle eviction, plus 64 MiB VMA blocks (ed51855).
@@ -39,7 +38,26 @@ Input, in `~/.local/share/shadPS4/input_config/CUSA00004.ini` (or `default.ini`)
 - `motion_shake` is bound to a keyboard key, with a Deck back button mapped to that key in Steam Input.
 - Add `touchpad_two_finger = t` for the Reggie car push, which needs two fingers on both ends of the touchpad plus a click. Map a back button to keyboard T in Steam Input.
 
-## 2026-10-14: two-stage draw pipeline (current)
+## 2026-10-14 (afternoon): upstream sync, submit thread, flicker at the auto clock (current)
+- Upstream picks: #5308 #5332 #5339 #5346 #5342 #5344 #5348 #5352 #5358 #5370. Skipped #5341 and
+  #5345 (inFAMOUS doesn't import them) and #5046 (CMask; touches the hottest render-target paths,
+  left for a separate test). Neutral on fps.
+- `async_submit` hands plain graphics submits to a submit thread (`shadPS4:GpuSubmit`). Present,
+  sparse binds, device waits and submits with extra semaphores or a fence drain it first and share
+  `Scheduler::queue_mutex`. `tick_query_interval_us` (10 in the play config) limits how often the
+  scheduler queries its timeline semaphore: with submits queued, in-place write checks missed per
+  page and issued ~1650 `SYNCOBJ_QUERY` ioctls per frame on the recording thread.
+- At 1600 MHz: CAND-U 29.5 -> 30.9 fps, BENCH-UNL ~34.3 -> ~35.5, the user's save 24.1 -> 25.2. The
+  recording thread is still the limiter (~100% busy), and the GPU is ~73% busy.
+- Flicker in a heavy scene (the user's save) at the auto clock: 36 per minute with or without
+  async, 9 with the upstream picks reverted, 0 at 1600 MHz. It's the same game-side mechanism as the
+  "refocus" flicker: the optional post chain switches on and off when GPU frame time is near its
+  ~30.5 ms limit. At the auto clock, heavy scenes sit near that limit. Play at 1600 MHz.
+- Deck motion sensors: launched from a terminal, SDL gets accelerometer and gyro samples at 250 Hz
+  but all of them are zero (Steam Input owns the device). Tilt works when Steam launches the game.
+  A Steam-launched capture while shaking is still needed to see whether the accelerometer arrives.
+
+## 2026-10-14: two-stage draw pipeline
 - At 1600 MHz the GPU command thread (GpuComm) was the critical path: an injected 1 us per draw cost
   exactly 4.7 ms per frame. The GPU was 57-63% busy.
 - `draw_pipe` (GPU setting, default off; the play config turns it on) splits GpuComm in two:
