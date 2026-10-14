@@ -504,6 +504,11 @@ struct GPUSettings {
     // as such work may overlap on the guest GPU too. Reads after writes and every access made by
     // emulator transfers keep their barriers.
     Setting<bool> guest_sync_barriers{false};
+    // Buffer barrier tracking. 0: sorted interval lists, searched and updated on every buffer
+    // access. 1: per-buffer access logs folded into the sorted lists only when a query needs
+    // them, buffers found by hash and a guest sync point reduced to a counter. Both give the same
+    // answers. Read once at boot.
+    Setting<u32> barrier_tracker{0};
     // With inplace_guest_memory 2+, copy GPU-written images back into guest memory on the GPU,
     // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a
     // CPU copy on the completion thread, which end-of-pipe labels queue behind.
@@ -784,6 +789,7 @@ struct GPUSettings {
             GPU_OVERRIDE(readback_offload),
             GPU_OVERRIDE(inplace_guest_memory),
             GPU_OVERRIDE(guest_sync_barriers),
+            GPU_OVERRIDE(barrier_tracker),
             GPU_OVERRIDE(inplace_image_downloads),
             GPU_OVERRIDE(draw_pipe),
             GPU_OVERRIDE(async_submit),
@@ -880,7 +886,7 @@ struct GPUSettings {
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, inplace_guest_memory, guest_sync_barriers, \
-    inplace_image_downloads, draw_pipe, async_submit, tick_query_interval_us
+    inplace_image_downloads, draw_pipe, async_submit, tick_query_interval_us, barrier_tracker
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1225,6 +1231,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
     SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
     SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
+    SETTING_FORWARD(m_gpu, BarrierTracker, barrier_tracker)
     SETTING_FORWARD_BOOL(m_gpu, InplaceImageDownloads, inplace_image_downloads)
     SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
     SETTING_FORWARD_BOOL(m_gpu, AsyncSubmit, async_submit)
