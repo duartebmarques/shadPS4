@@ -1,5 +1,6 @@
 {
   "GPU": {
+    "async_submit": true,
     "direct_memory_access_enabled": true,
     "draw_pipe": true,
     "guest_sync_barriers": true,
@@ -7,6 +8,7 @@
     "rcas_enabled": false,
     "readback_linear_images_enabled": true,
     "readbacks_mode": 1,
-    "ring_drain_flush_draws": 0
+    "ring_drain_flush_draws": 0,
+    "tick_query_interval_us": 10
   }
 }
