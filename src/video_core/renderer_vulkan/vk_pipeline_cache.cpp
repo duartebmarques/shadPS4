@@ -1805,6 +1805,16 @@ SHAD_FORCE_INLINE u64 PipelineCache::Publish(u32 out_slot, SwStage l_stage,
     return hash;
 }
 
+// A permutation index names the store's entries. The store can hold permutations this session has
+// not loaded, which cached pipeline keys still name; a new one takes the next unused index.
+static size_t FreePermutationIndex(u64 pgm_hash, size_t perm_idx) {
+    while (Storage::DataBase::Instance().Contains(
+        Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", HashCombine(pgm_hash, perm_idx)))) {
+        ++perm_idx;
+    }
+    return perm_idx;
+}
+
 // Every later hit of the program advances the bindings by its info, as the pipeline layout does;
 // a compile whose SPIR-V spans a different range leaves the next stages' bindings undeclared.
 static void CheckBindingSpan(const Shader::Info& info, Shader::Backend::Bindings start,
@@ -1827,21 +1837,23 @@ u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
     created_slot = std::make_unique<Program>(stage, l_stage, params);
     auto start = binding;
     auto ri_compile = runtime_info;
-    const auto module = CompileModule(created_slot->info, ri_compile, params.code, 0, binding);
-    CheckBindingSpan(created_slot->info, start, binding, 0);
+    const size_t perm_idx = FreePermutationIndex(params.hash, 0);
+    const auto module =
+        CompileModule(created_slot->info, ri_compile, params.code, perm_idx, binding);
+    CheckBindingSpan(created_slot->info, start, binding, perm_idx);
     NoteSharpVerdicts(created_slot->info);
     auto spec = Shader::StageSpecialization(created_slot->info, ri_compile, profile, start);
-    const auto perm_hash = HashCombine(params.hash, 0);
+    const auto perm_hash = HashCombine(params.hash, perm_idx);
 
     if (spec_fp_cache) {
         spec.ComputeSig();
     }
-    RegisterShaderMeta(created_slot->info, spec.fetch_shader_data, spec, perm_hash, 0);
-    created_slot->AddPermut(module, std::move(spec));
+    RegisterShaderMeta(created_slot->info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+    created_slot->InsertPermut(module, std::move(spec), perm_idx);
     id.program = created_slot.get();
     id.program_hash = params.hash;
-    return Publish(out_slot, l_stage, &created_slot->info, module, created_slot.get(), 0u,
-                   perm_hash);
+    return Publish(out_slot, l_stage, &created_slot->info, module, created_slot.get(),
+                   static_cast<u32>(perm_idx), perm_hash);
 }
 
 u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::ShaderParams& params,
@@ -2235,11 +2247,13 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
         auto new_info = Shader::Info(stage, l_stage, params);
         auto ri_compile = runtime_info;
         const auto start = binding;
+        perm_idx = FreePermutationIndex(params.hash, perm_idx);
+        perm_hash = HashCombine(params.hash, perm_idx);
         module = CompileModule(new_info, ri_compile, params.code, perm_idx, binding);
         CheckBindingSpan(info, start, binding, perm_idx);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
         module = program->modules[hit_idx].module;
