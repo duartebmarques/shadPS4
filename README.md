@@ -36,7 +36,8 @@ other platforms fall back to honest fences only.
    "Render resolution 1280x720".
 4. In Steam Input, map two back buttons to the keyboard keys Home and T.
 5. Run `./Shadps4-sdl.AppImage <games>/CUSA00004/eboot.bin`. Set the GPU clock to 1600 MHz in
-   the Quick Access performance menu. The numbers above use the in-game frame rate "Unlocked".
+   the Quick Access performance menu. At the default clock, heavy scenes can flicker: the game
+   switches a post-processing pass on and off when its GPU frame time is near its limit. The numbers above use the in-game frame rate "Unlocked".
    On the first run with a new `user` folder a "Save Migration" box appears; pick "Do nothing".
 
 ## Build
