@@ -196,8 +196,8 @@ bool Install(const Instance& instance, u32 arena_type_bits) {
         return false;
     }
     device = instance.GetDevice();
-    memory_type = FindChunkType(instance.GetPhysicalDevice().getMemoryProperties(),
-                                arena_type_bits);
+    memory_type =
+        FindChunkType(instance.GetPhysicalDevice().getMemoryProperties(), arena_type_bits);
     if (memory_type == ~0u) {
         LOG_WARNING(Render_Vulkan,
                     "Guest memory in place: no cached system memory type fits the arena");

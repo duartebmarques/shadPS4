@@ -311,13 +311,11 @@ public:
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
-
     /// Writes a GPU fence label (4 or 8 bytes) from any thread, after the GPU finished the work
 
     /// before it. Returns false, writing nothing, when the guest no longer maps the address.
 
     bool TryWriteLabel(VAddr address, u64 value, u32 num_bytes);
-
 
     /// The direct memory offset backing [address, address + size) when one Direct or Pooled
 

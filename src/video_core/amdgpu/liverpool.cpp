@@ -522,7 +522,7 @@ SHAD_FORCE_INLINE static void CpWriteOrCopy(Vulkan::Rasterizer* rasterizer, void
 }
 
 void Liverpool::WriteData(const PM4CmdWriteData* write_data, u32 data_size) {
-    const VAddr address = write_data->Address<VAddr>();
+    const VAddr address = write_data->Address<u64>();
     if (honest_fences_ && rasterizer &&
         rasterizer->WriteDataOnGpu(address, write_data->data, data_size)) {
         if (data_size <= sizeof(u64)) {

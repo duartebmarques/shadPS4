@@ -887,14 +887,12 @@ struct AddressSpace::Impl {
                                   ? std::min<u64>(size - done, (index + 1) * ChunkSize - phys)
                                   : size - done;
             const int chunk_fd = phys < chunk_limit ? chunk_fds[index] : ChunkInMemfd;
-            void* ret =
-                chunk_fd >= 0
-                    ? mmap(reinterpret_cast<void*>(virtual_addr + done), piece, prot,
-                           MAP_FIXED | MAP_SHARED, chunk_fd, phys - index * ChunkSize)
-                    : mmap(reinterpret_cast<void*>(virtual_addr + done), piece, prot,
-                           MAP_FIXED | MAP_SHARED, backing_fd, phys);
-            ASSERT_MSG(ret != MAP_FAILED, "mmap of guest memory chunk failed: {}",
-                       strerror(errno));
+            void* ret = chunk_fd >= 0
+                            ? mmap(reinterpret_cast<void*>(virtual_addr + done), piece, prot,
+                                   MAP_FIXED | MAP_SHARED, chunk_fd, phys - index * ChunkSize)
+                            : mmap(reinterpret_cast<void*>(virtual_addr + done), piece, prot,
+                                   MAP_FIXED | MAP_SHARED, backing_fd, phys);
+            ASSERT_MSG(ret != MAP_FAILED, "mmap of guest memory chunk failed: {}", strerror(errno));
             done += piece;
         }
         return true;

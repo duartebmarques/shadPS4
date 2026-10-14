@@ -16,7 +16,6 @@ namespace VideoCore {
 
 bool sparse_external_memory = false;
 
-
 std::string_view BufferTypeName(MemoryType type) {
     switch (type) {
     case MemoryType::HostUncached:
