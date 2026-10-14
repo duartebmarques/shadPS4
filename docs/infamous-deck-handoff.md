@@ -53,9 +53,19 @@ Input, in `~/.local/share/shadPS4/input_config/CUSA00004.ini` (or `default.ini`)
   async, 9 with the upstream picks reverted, 0 at 1600 MHz. It's the same game-side mechanism as the
   "refocus" flicker: the optional post chain switches on and off when GPU frame time is near its
   ~30.5 ms limit. At the auto clock, heavy scenes sit near that limit. Play at 1600 MHz.
-- Deck motion sensors: launched from a terminal, SDL gets accelerometer and gyro samples at 250 Hz
-  but all of them are zero (Steam Input owns the device). Tilt works when Steam launches the game.
-  A Steam-launched capture while shaking is still needed to see whether the accelerometer arrives.
+- Deck motion sensors (commit 647903fd): the controller fills its IMU fields only when its
+  `SETTING_IMU_MODE` (48) asks for raw accel and gyro (0x18). Steam owns that setting and SDL's Deck
+  driver never sets it, so SDL got 250 Hz of zeros. A Steam launch hides the controller
+  (`SDL_GAMECONTROLLER_IGNORE_DEVICES`) behind Steam's virtual Xbox pad, which has no sensors; the
+  tilt aim was Steam turning gyro into right-stick motion. A `shadPS4:DeckImu` thread now re-sends the
+  IMU mode every second over the vendor HID interface (interface 2, user-readable via udev
+  `uaccess`) and feeds slot 0 from the HID reports when the pad has no sensors. At rest the
+  accelerometer now reads gravity (9.83 m/s^2). The Deck accelerometer clips at +-2 G per axis;
+  whether a real shake crosses the game's threshold is still to be tested by hand.
+- Crash fix (commit 4f622217): `MntPoints::GetMount` returned a pointer into the mount vector after
+  unlocking. inFAMOUS remounts `/savedata0` on its GameState thread while SceFiosIO opens files, so
+  the path copy in `OverlayPath` read freed memory and threw (std::terminate, SIGTRAP). Mounts are now
+  returned by value. Upstream has the same code. Stack traces of past crashes: `coredumpctl info <pid>`.
 
 ## 2026-10-14: two-stage draw pipeline
 - At 1600 MHz the GPU command thread (GpuComm) was the critical path: an injected 1 us per draw cost
