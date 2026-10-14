@@ -4,6 +4,7 @@ version = 1
 path = [
     "REUSE.toml",
     "dist/**",
+    "docs/**",
     "CMakeSettings.json",
     "CMakePresets.json",
     ".github/FUNDING.yml",
