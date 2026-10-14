@@ -402,8 +402,10 @@ void GameControllers::TryOpenSDLControllers() {
                               // Player N won't be registered at all
                 }
                 auto* c = controllers[i];
-                LOG_INFO(Input, "Gamepad registered for slot {}! Handle: {}", i,
-                         SDL_GetGamepadID(pad));
+                const char* name = SDL_GetGamepadName(pad);
+                LOG_INFO(Input, "Gamepad registered for slot {}! Handle: {}, name: {}, Steam: {}",
+                         i, SDL_GetGamepadID(pad), name ? name : "",
+                         SDL_GetGamepadSteamHandle(pad));
                 slot_taken[i] = true;
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);
