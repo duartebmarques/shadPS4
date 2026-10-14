@@ -1,0 +1,12 @@
+{
+  "GPU": {
+    "direct_memory_access_enabled": true,
+    "draw_pipe": true,
+    "guest_sync_barriers": true,
+    "inplace_guest_memory": 3,
+    "rcas_enabled": false,
+    "readback_linear_images_enabled": true,
+    "readbacks_mode": 1,
+    "ring_drain_flush_draws": 0
+  }
+}
