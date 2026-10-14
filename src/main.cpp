@@ -36,9 +36,12 @@
 
 // Clang PGO training builds: the emulator can exit without running the profile runtime's exit
 // hook, so dump the profile periodically. A no-op in uninstrumented builds.
+#ifndef __APPLE__
 extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+#endif
 
 static void StartPgoDumper() {
+#ifndef __APPLE__
     if (!__llvm_profile_write_file) {
         return;
     }
@@ -48,6 +51,7 @@ static void StartPgoDumper() {
             __llvm_profile_write_file();
         }
     }).detach();
+#endif
 }
 
 int main(int argc, char* argv[]) {
