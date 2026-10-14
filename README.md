@@ -51,20 +51,18 @@ controller map and patch choices, and installs the release's tuned settings. If 
 settings, your old copy is kept as `user/custom_configs/CUSA00004.json.bak`.
 
 <details>
-<summary>Manual setup, Windows and macOS (untested)</summary>
+<summary>Manual setup and Windows (untested)</summary>
 
 - Unzip the release for your platform. Start the emulator from that folder, because it uses the
   `user` folder in the directory it starts in. Without one, it falls back to
-  `~/.local/share/shadPS4`, `%APPDATA%\shadPS4` or `~/Library/Application Support/shadPS4`, and
-  the tuned settings are not used.
+  `~/.local/share/shadPS4` or `%APPDATA%\shadPS4`, and the tuned settings are not used.
 - Put the update next to the game as `<game folder>-UPDATE` (or `-patch`). Put DLC folders in
   `user/addcont/CUSA00004/`.
 - Put the patch file in `user/patches/shadPS4/` and set `isEnabled="true"` on the two patches
   above.
-- Run `Shadps4-sdl.AppImage <game folder>/eboot.bin` (`shadPS4.exe` on Windows, `shadps4` on
-  macOS).
+- Run `Shadps4-sdl.AppImage <game folder>/eboot.bin` (`shadPS4.exe` on Windows).
 - `inplace_guest_memory` 2 and 3 need Linux and an AMD GPU with RADV. Elsewhere they fall back to
-  mode 1. `draw_pipe` and `async_submit` are untested on Windows and macOS. If the game misbehaves
+  mode 1. `draw_pipe` and `async_submit` are untested on Windows. If the game misbehaves
   there, set them to `false` in `user/custom_configs/CUSA00004.json`.
 </details>
 
@@ -76,8 +74,8 @@ cmake --build build
 ```
 See [`CLAUDE.md`](CLAUDE.md) for the exact toolchain (Ubuntu 24.04 distrobox, clang-19).
 
-To cut a release, push a tag: `git tag v1.0 && git push origin v1.0`. CI builds Linux, Windows
-and macOS and publishes one zip per platform (executable, `user/`, `LICENSE`, `README.md`, and
+To cut a release, push a tag: `git tag v1.0 && git push origin v1.0`. CI builds Linux and Windows
+and publishes one zip per platform (executable, `user/`, `LICENSE`, `README.md`, and
 `install.sh` on Linux). To try a CI build, pass its AppImage to the installer with `--appimage FILE`.
 
 ## Credits

@@ -75,15 +75,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-26]
+        os: [windows-latest, ubuntu-latest]
         include:
           - os: windows-latest
             compiler_cxx: clang-cl
             compiler_c: clang-cl
           - os: ubuntu-latest
-            compiler_cxx: clang++
-            compiler_c: clang
-          - os: macos-26
             compiler_cxx: clang++
             compiler_c: clang
 
@@ -187,7 +184,9 @@ jobs:
         name: shadps4-win64-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
         path: ${{github.workspace}}/build/shadPS4.exe
 
+  # Disabled: this fork targets the Steam Deck; set to true to build macOS again.
   macos-sdl:
+    if: false
     runs-on: macos-26
     needs: get-info
     steps:
@@ -353,7 +352,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [get-info, windows-sdl, macos-sdl, linux-sdl]
+    needs: [get-info, windows-sdl, linux-sdl]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -371,7 +370,7 @@ jobs:
         TAG: ${{ github.ref_name }}
       run: |
         set -euo pipefail
-        for platform in linux win64 macos; do
+        for platform in linux win64; do
           src=$(echo ./artifacts/shadps4-${platform}-sdl-*/)
           dir=./stage/${platform}
           mkdir -p "$dir"
