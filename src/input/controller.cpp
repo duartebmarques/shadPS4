@@ -5,12 +5,14 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
 #include <SDL3/SDL.h>
 
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/system/userservice.h"
@@ -225,8 +227,7 @@ void GameController::PushStateLocked(u64 timestamp) {
         constexpr float frequency = 7.0f;         // Hz
         const float t = static_cast<float>(timestamp - m_shake_start) / 1'000'000.f;
         const float wave = std::sin(2.0f * 3.14159265f * frequency * t) >= 0.0f ? 1.0f : -1.0f;
-        const float shaken[3] = {accel_buf[0] + amplitude * wave,
-                                 accel_buf[1] + amplitude * wave,
+        const float shaken[3] = {accel_buf[0] + amplitude * wave, accel_buf[1] + amplitude * wave,
                                  accel_buf[2] + amplitude * wave};
         m_state.OnAccel(shaken);
     } else {
@@ -292,6 +293,64 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
 }
 
 static bool is_first_check = true;
+
+#ifdef __linux__
+namespace {
+// The Steam Deck controller fills its IMU fields only when its IMU mode asks for raw data. Steam
+// owns that setting and SDL's Deck driver never sets it, so the readings stay zero. A Steam launch
+// also hides the controller behind a virtual pad without sensors. This keeps the raw stream on
+// and, while the pad in use has no sensors, reads the motion from the controller directly.
+void DeckImuThread(std::stop_token stop, GameController* controller) {
+    Common::SetCurrentThreadName("shadPS4:DeckImu");
+    SDL_hid_device* dev = nullptr;
+    if (SDL_hid_device_info* infos = SDL_hid_enumerate(0x28de, 0x1205)) {
+        for (auto* info = infos; info; info = info->next) {
+            if (info->interface_number == 2) {
+                dev = SDL_hid_open_path(info->path);
+                break;
+            }
+        }
+        SDL_hid_free_enumeration(infos);
+    }
+    if (!dev) {
+        return;
+    }
+    LOG_INFO(Input, "Steam Deck controller found, keeping its IMU stream on");
+    constexpr float accel_scale = 2.0f * SDL_STANDARD_GRAVITY / 32768.0f;
+    constexpr float gyro_scale = 2000.0f * (SDL_PI_F / 180.0f) / 32768.0f;
+    u64 last_mode_ms = 0;
+    while (!stop.stop_requested()) {
+        const u64 now_ms = SDL_GetTicks();
+        if (now_ms - last_mode_ms >= 1000) {
+            // ID_SET_SETTINGS_VALUES, one setting: SETTING_IMU_MODE = raw accel | raw gyro.
+            u8 report[65] = {0, 0x87, 3, 48, 0x18, 0x00};
+            SDL_hid_send_feature_report(dev, report, sizeof(report));
+            last_mode_ms = now_ms;
+        }
+        // Deck state report: 4-byte header, then the accel and gyro words at payload offset 20.
+        u8 data[64];
+        const int size = SDL_hid_read_timeout(dev, data, sizeof(data), 100);
+        if (size < 36 || data[2] != 0x09) {
+            continue;
+        }
+        SDL_Gamepad* pad = controller->m_sdl_gamepad;
+        if (pad && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
+            continue;
+        }
+        s16 raw[6];
+        std::memcpy(raw, data + 24, sizeof(raw));
+        // Same axes as SDL's Deck driver.
+        const float accel[3] = {raw[0] * accel_scale, raw[2] * accel_scale, -raw[1] * accel_scale};
+        const float gyro[3] = {raw[3] * gyro_scale, raw[5] * gyro_scale, -raw[4] * gyro_scale};
+        controller->UpdateGyro(gyro);
+        controller->UpdateAcceleration(accel);
+    }
+    SDL_hid_close(dev);
+}
+
+std::jthread g_deck_imu_thread;
+} // Anonymous namespace
+#endif
 
 void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
@@ -371,6 +430,11 @@ void GameControllers::TryOpenSDLControllers() {
             }
         }
     }
+#ifdef __linux__
+    if (EmulatorSettings.IsMotionControlsEnabled() && !g_deck_imu_thread.joinable()) {
+        g_deck_imu_thread = std::jthread(DeckImuThread, controllers[0]);
+    }
+#endif
     if (is_first_check) [[unlikely]] {
         is_first_check = false;
         if (controller_count == 0) {
