@@ -51,7 +51,7 @@ controller map and patch choices, and installs the release's tuned settings. If 
 settings, your old copy is kept as `user/custom_configs/CUSA00004.json.bak`.
 
 <details>
-<summary>Manual setup and Windows (untested)</summary>
+<summary>Manual setup</summary>
 
 - Unzip the release for your platform. Start the emulator from that folder, because it uses the
   `user` folder in the directory it starts in. Without one, it falls back to
@@ -60,10 +60,10 @@ settings, your old copy is kept as `user/custom_configs/CUSA00004.json.bak`.
   `user/addcont/CUSA00004/`.
 - Put the patch file in `user/patches/shadPS4/` and set `isEnabled="true"` on the two patches
   above.
-- Run `Shadps4-sdl.AppImage <game folder>/eboot.bin` (`shadPS4.exe` on Windows).
-- `inplace_guest_memory` 2 and 3 need Linux and an AMD GPU with RADV. Elsewhere they fall back to
-  mode 1. `draw_pipe` and `async_submit` are untested on Windows. If the game misbehaves
-  there, set them to `false` in `user/custom_configs/CUSA00004.json`.
+- Run `Shadps4-sdl.AppImage <game folder>/eboot.bin`.
+- Releases are Linux only. Other platforms need a build from source and are untested:
+  `inplace_guest_memory` 2 and 3 need Linux and an AMD GPU with RADV (elsewhere they fall back to
+  mode 1), and `draw_pipe` / `async_submit` may need `false` in `user/custom_configs/CUSA00004.json`.
 </details>
 
 ## Build
@@ -74,9 +74,8 @@ cmake --build build
 ```
 See [`CLAUDE.md`](CLAUDE.md) for the exact toolchain (Ubuntu 24.04 distrobox, clang-19).
 
-To cut a release, push a tag: `git tag v1.0 && git push origin v1.0`. CI builds Linux and Windows
-and publishes one zip per platform (executable, `user/`, `LICENSE`, `README.md`, and
-`install.sh` on Linux). To try a CI build, pass its AppImage to the installer with `--appimage FILE`.
+To cut a release, push a tag: `git tag v1.0 && git push origin v1.0`. CI builds Linux and
+publishes a zip (AppImage, `user/`, `LICENSE`, `README.md`, `install.sh`). To try a CI build, pass its AppImage to the installer with `--appimage FILE`.
 
 ## Credits
 - [shadPS4](https://github.com/shadps4-emu/shadPS4): the emulator ([website](https://shadps4.net/)).

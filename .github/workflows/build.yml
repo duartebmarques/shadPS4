@@ -75,11 +75,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [ubuntu-latest]
         include:
-          - os: windows-latest
-            compiler_cxx: clang-cl
-            compiler_c: clang-cl
           - os: ubuntu-latest
             compiler_cxx: clang++
             compiler_c: clang
@@ -142,7 +139,9 @@ jobs:
         run: ctest --test-dir build --output-on-failure --progress -E 'GcnTest'
         shell: bash
 
+  # Disabled: this fork targets the Steam Deck; set to true to build Windows again.
   windows-sdl:
+    if: false
     runs-on: windows-2025-vs2026
     needs: get-info
     steps:
@@ -352,7 +351,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [get-info, windows-sdl, linux-sdl]
+    needs: [get-info, linux-sdl]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -370,7 +369,7 @@ jobs:
         TAG: ${{ github.ref_name }}
       run: |
         set -euo pipefail
-        for platform in linux win64; do
+        for platform in linux; do
           src=$(echo ./artifacts/shadps4-${platform}-sdl-*/)
           dir=./stage/${platform}
           mkdir -p "$dir"
