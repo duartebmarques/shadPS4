@@ -399,23 +399,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
         // The permutation joins the cached program; its spec must point at that program's info,
         // not at the temporary one this load built.
         spec.info = &it_pgm.value()->info;
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
-        if (it != it_pgm.value()->modules.end()) {
-            // A matching permutation is valid only at its original index. A different index means
-            // the store holds entries from more than one cache generation, so this pipeline is
-            // left to compile at runtime.
-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
-            if (perm_idx != idx) {
-                LOG_WARNING(Render_Vulkan,
-                            "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
-                            "preload",
-                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
-                return false;
-            }
-            module = it->module;
-        } else {
-            module = CompileSPV(spv, instance.GetDevice());
-        }
+        // The same specialization can sit at several indices: a session that had not loaded one
+        // stores the next under a free index. Each index keeps the module of its own SPIR-V.
+        const auto& permuts = it_pgm.value()->modules;
+        module = perm_idx < permuts.size() && permuts[perm_idx].spec == spec
+                     ? permuts[perm_idx].module
+                     : CompileSPV(spv, instance.GetDevice());
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
     if (!chained) {
