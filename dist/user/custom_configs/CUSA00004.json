@@ -3,6 +3,8 @@
     "async_submit": true,
     "direct_memory_access_enabled": true,
     "draw_pipe": true,
+    "full_screen": true,
+    "full_screen_mode": "Fullscreen",
     "guest_sync_barriers": true,
     "inplace_guest_memory": 3,
     "rcas_enabled": false,

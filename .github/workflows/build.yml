@@ -378,7 +378,9 @@ jobs:
           cp -r "$src". "$dir"/
           cp -r dist/user "$dir"/user
           cp LICENSE README.md "$dir"/
-          chmod a+x "$dir"/Shadps4-sdl.AppImage "$dir"/shadps4 2>/dev/null || true
+          echo "$TAG" > "$dir"/VERSION
+          if [ "$platform" = linux ]; then cp dist/install.sh "$dir"/; fi
+          chmod a+x "$dir"/Shadps4-sdl.AppImage "$dir"/install.sh "$dir"/shadps4 2>/dev/null || true
           (cd "$dir" && zip -r "$GITHUB_WORKSPACE/shadps4-${TAG}-${platform}.zip" .)
         done
         ls -la ./*.zip
