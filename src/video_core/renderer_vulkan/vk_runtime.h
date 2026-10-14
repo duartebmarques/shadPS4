@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <optional>
+
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_barrier_tracker.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
@@ -48,6 +51,11 @@ public:
     /// stream_barrier_skip telemetry: accesses of the untracked buffer left unrecorded.
     u64 DrainUntrackedSkips() {
         return std::exchange(untracked_skips, 0);
+    }
+
+    /// barrier_tracker 1 telemetry: recorded accesses, list folds and buffers tracked.
+    BarrierTracker::Stats DrainBarrierTrackerStats() {
+        return tracker ? tracker->DrainStats() : BarrierTracker::Stats{};
     }
 
     /// guest_sync_barriers telemetry: guest sync points that ordered pending guest accesses, and
@@ -126,6 +134,7 @@ private:
     };
     BufferBarriers* resource{};
     std::vector<BufferBarriers> resources;
+    std::optional<BarrierTracker> tracker;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
     bool covered_range_skip{};
