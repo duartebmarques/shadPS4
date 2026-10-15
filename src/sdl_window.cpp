@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_init.h>
@@ -450,6 +451,9 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
 
     switch (event->type) {
     case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        if (std::getenv("SHAD_IMU_REPLAY")) {
+            return;
+        }
         switch ((SDL_SensorType)event->gsensor.sensor) {
         case SDL_SENSOR_GYRO:
             gamepad = controllers.GetGamepadIndexFromJoystickId(event->gsensor.which);

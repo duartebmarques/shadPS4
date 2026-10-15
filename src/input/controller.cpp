@@ -401,7 +401,7 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
                 clicking = click;
             }
         }
-        if (pad && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
+        if (pad && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL) && !std::getenv("SHAD_IMU_REPLAY")) {
             continue;
         }
         s16 raw[6];
@@ -494,6 +494,9 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
         const float gyro[3] = {raw[3] * gyro_scale, raw[5] * gyro_scale, -raw[4] * gyro_scale};
         controller->UpdateGyro(gyro);
         controller->UpdateAcceleration(accel);
+        if (replay_pos > 0) {
+            controller->PollState();
+        }
         if (!csv) {
             const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
                               fmt::format("motion-{}.csv", std::time(nullptr));
