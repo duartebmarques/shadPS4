@@ -1954,6 +1954,17 @@ void TextureCache::GarbageCollectImages() {
     if (below_trigger && idle_tick == 0) {
         return;
     }
+    // The fast UpdateImage tier skips the LRU touch for kTouchIntervalTicks, so an image in use
+    // can carry an old gc tick. Its fast state shows the use; such an image is not a candidate.
+    const u64 now_tick = scheduler.CurrentTick();
+    const auto in_use = [&](Image& image) {
+        if (!image_fast_state || now_tick - (image.ReadFastState() >> Image::kFastStateTouchShift) >
+                                     kTouchIntervalTicks) {
+            return false;
+        }
+        image_lru_cache.Touch(image, gc_tick);
+        return true;
+    };
     lru_lazy_gc_runs_ += lru_lazy_touch;
     u64 lazy_visits = 0;
     bool lazy_hard = false;
@@ -1978,7 +1989,7 @@ void TextureCache::GarbageCollectImages() {
                 image_lru_cache.Touch(image, gc_tick);
                 return false;
             }
-            if (image.SafeToDownload()) {
+            if (image.SafeToDownload() || in_use(image)) {
                 return false;
             }
             --idle_deletions;
@@ -2015,6 +2026,9 @@ void TextureCache::GarbageCollectImages() {
         }
         if (num_deletions == 0) {
             return true;
+        }
+        if (in_use(image)) {
+            return false;
         }
         --num_deletions;
         const bool download = image.SafeToDownload();
