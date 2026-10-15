@@ -323,6 +323,12 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
     constexpr float accel_scale = 2.0f * SDL_STANDARD_GRAVITY / 32768.0f;
     constexpr float gyro_scale = 2000.0f * (SDL_PI_F / 180.0f) / 32768.0f;
     u64 last_mode_ms = 0;
+    // The accelerometer saturates at +-2 G, half a DualShock 4's range, so a hard shake reads
+    // flat at the rail. While an axis stays there, continue it with the slope it reached the
+    // rail with, up to the DualShock 4's +-4 G.
+    float accel_last[3]{};
+    float accel_slope[3]{};
+    int accel_saturated[3]{};
     // The motion fed to the game, for analysing gestures: log/motion-<time>.csv, G and deg/s.
     std::FILE* csv = nullptr;
     bool touching = false;
@@ -372,8 +378,23 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
         }
         s16 raw[6];
         std::memcpy(raw, data + 24, sizeof(raw));
+        float accel_raw[3];
+        for (int i = 0; i < 3; ++i) {
+            if (raw[i] != SDL_MAX_SINT16 && raw[i] != SDL_MIN_SINT16) {
+                accel_slope[i] = raw[i] - accel_last[i];
+                accel_last[i] = raw[i];
+                accel_saturated[i] = 0;
+                accel_raw[i] = raw[i];
+                continue;
+            }
+            const float sign = raw[i] > 0 ? 1.0f : -1.0f;
+            const float slope = std::max(sign * accel_slope[i], 0.0f);
+            const float value = sign * accel_last[i] + slope * ++accel_saturated[i];
+            accel_raw[i] = sign * std::clamp(value, 32768.0f, 65536.0f);
+        }
         // Same axes as SDL's Deck driver.
-        const float accel[3] = {raw[0] * accel_scale, raw[2] * accel_scale, -raw[1] * accel_scale};
+        const float accel[3] = {accel_raw[0] * accel_scale, accel_raw[2] * accel_scale,
+                                -accel_raw[1] * accel_scale};
         const float gyro[3] = {raw[3] * gyro_scale, raw[5] * gyro_scale, -raw[4] * gyro_scale};
         controller->UpdateGyro(gyro);
         controller->UpdateAcceleration(accel);
