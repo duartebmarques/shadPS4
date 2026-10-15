@@ -395,9 +395,9 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].rightStick.y = states[i].axes[static_cast<int>(Input::Axis::RightY)];
         pData[i].analogButtons.l2 = states[i].axes[static_cast<int>(Input::Axis::TriggerLeft)];
         pData[i].analogButtons.r2 = states[i].axes[static_cast<int>(Input::Axis::TriggerRight)];
-        pData[i].acceleration.x = states[i].acceleration.x * 0.098;
-        pData[i].acceleration.y = states[i].acceleration.y * 0.098;
-        pData[i].acceleration.z = states[i].acceleration.z * 0.098;
+        pData[i].acceleration.x = states[i].acceleration.x / 9.80665f;
+        pData[i].acceleration.y = states[i].acceleration.y / 9.80665f;
+        pData[i].acceleration.z = states[i].acceleration.z / 9.80665f;
         pData[i].angularVelocity.x = states[i].angularVelocity.x;
         pData[i].angularVelocity.y = states[i].angularVelocity.y;
         pData[i].angularVelocity.z = states[i].angularVelocity.z;
