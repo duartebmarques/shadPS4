@@ -2206,8 +2206,8 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
             // perm_index_by_sig keeps only the first index per sig (AddPermut), so a sig
             // collision still needs the scan.
             for (size_t i = 0; i < program->modules.size(); ++i) {
-                const auto& ms = program->modules[i].spec;
-                if (ms.sig == spec.sig && ms.sig2 == spec.sig2) {
+                const auto& m = program->modules[i];
+                if (m.module && m.spec.sig == spec.sig && m.spec.sig2 == spec.sig2) {
                     hit_idx = i;
                     break;
                 }
@@ -2217,7 +2217,8 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
                 // permutation can go unrecognised by (sig, sig2) while being the same
                 // specialization; compiling it again stores a duplicate the warm-up later
                 // refuses to preload. Settle a miss structurally before compiling.
-                const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+                const auto it = std::ranges::find_if(
+                    program->modules, [&](const auto& m) { return m.module && m.spec == spec; });
                 if (it != program->modules.end()) {
                     hit_idx = static_cast<size_t>(std::distance(program->modules.begin(), it));
                 }
@@ -2237,7 +2238,8 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
             }
         }
         if (hit_idx == std::numeric_limits<size_t>::max()) {
-            const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+            const auto it = std::ranges::find_if(
+                program->modules, [&](const auto& m) { return m.module && m.spec == spec; });
             if (it != program->modules.end()) {
                 hit_idx = static_cast<size_t>(std::distance(program->modules.begin(), it));
             }
