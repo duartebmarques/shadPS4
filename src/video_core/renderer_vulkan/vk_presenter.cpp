@@ -15,6 +15,7 @@
 #include "imgui/notifications_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
+#include "imgui/renderer/texture_manager.h"
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -492,6 +493,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
+    // ImGui draws into the present command buffers: its textures outlive them.
+    ImGui::Core::TextureManager::SetGpuTimeline(
+        [this] { return present_scheduler.CurrentTick(); },
+        [this](u64 tick) { return present_scheduler.IsFree(tick); });
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
     ImGui::Friends::Register();
     ImGui::ShadNetNotify::Register();
@@ -503,6 +508,7 @@ Presenter::~Presenter() {
     ImGui::ShadNetNotify::Unregister();
     ImGui::Friends::Unregister();
     ImGui::Layer::RemoveLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
+    ImGui::Core::TextureManager::SetGpuTimeline({}, {});
 
     draw_scheduler.Finish();
     present_scheduler.Finish();

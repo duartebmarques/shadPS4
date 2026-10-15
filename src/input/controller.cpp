@@ -3,15 +3,19 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
 #include <utility>
 
 #include <SDL3/SDL.h>
+#include <fmt/format.h>
 
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
@@ -319,6 +323,9 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
     constexpr float accel_scale = 2.0f * SDL_STANDARD_GRAVITY / 32768.0f;
     constexpr float gyro_scale = 2000.0f * (SDL_PI_F / 180.0f) / 32768.0f;
     u64 last_mode_ms = 0;
+    // The motion fed to the game, for analysing gestures: log/motion-<time>.csv, G and deg/s.
+    std::FILE* csv = nullptr;
+    u64 last_flush_ms = 0;
     while (!stop.stop_requested()) {
         const u64 now_ms = SDL_GetTicks();
         if (now_ms - last_mode_ms >= 1000) {
@@ -344,6 +351,27 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
         const float gyro[3] = {raw[3] * gyro_scale, raw[5] * gyro_scale, -raw[4] * gyro_scale};
         controller->UpdateGyro(gyro);
         controller->UpdateAcceleration(accel);
+        if (!csv) {
+            const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                              fmt::format("motion-{}.csv", std::time(nullptr));
+            csv = std::fopen(path.string().c_str(), "w");
+            if (!csv) {
+                continue;
+            }
+            std::fputs("t_ms,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps\n", csv);
+        }
+        constexpr float to_g = 1.0f / SDL_STANDARD_GRAVITY;
+        constexpr float to_dps = 180.0f / SDL_PI_F;
+        std::fprintf(csv, "%llu,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f\n",
+                     static_cast<unsigned long long>(now_ms), accel[0] * to_g, accel[1] * to_g,
+                     accel[2] * to_g, gyro[0] * to_dps, gyro[1] * to_dps, gyro[2] * to_dps);
+        if (now_ms - last_flush_ms >= 1000) {
+            std::fflush(csv);
+            last_flush_ms = now_ms;
+        }
+    }
+    if (csv) {
+        std::fclose(csv);
     }
     SDL_hid_close(dev);
 }

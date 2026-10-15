@@ -108,7 +108,8 @@ struct Job {
 struct UploadJob {
     Inner* core = nullptr;
     Vulkan::UploadTextureData data;
-    int tick = 0; // Used to skip the first frame when destroying to await the current frame to draw
+    u64 free_tick = 0; // A destroy waits for this GPU tick: frames drawing the texture are done
+    u32 waits = 0;
 };
 
 static bool g_is_worker_running = false;
@@ -121,14 +122,18 @@ static std::deque<Job> g_job_list;
 static std::mutex g_upload_mtx;
 static std::deque<UploadJob> g_upload_list;
 
+static std::function<u64()> g_current_tick;
+static std::function<bool(u64)> g_is_tick_free;
+
 namespace Core::TextureManager {
 
 Inner::~Inner() {
     if (upload_data.im_texture != nullptr) {
         std::unique_lock lk{g_upload_mtx};
+        // The command buffer being recorded can still draw the texture; wait for one more.
         g_upload_list.emplace_back(UploadJob{
             .data = this->upload_data,
-            .tick = 2,
+            .free_tick = g_current_tick ? g_current_tick() + 1 : 0,
         });
     }
 }
@@ -223,6 +228,12 @@ void DecodePngFile(std::filesystem::path path, Inner* core) {
     g_worker_cv.notify_one();
 }
 
+void SetGpuTimeline(std::function<u64()> current_tick, std::function<bool(u64)> is_tick_free) {
+    std::unique_lock lk{g_upload_mtx};
+    g_current_tick = std::move(current_tick);
+    g_is_tick_free = std::move(is_tick_free);
+}
+
 void Submit() {
     UploadJob upload;
     {
@@ -233,8 +244,8 @@ void Submit() {
         // Upload one texture at a time to avoid slow down
         upload = g_upload_list.front();
         g_upload_list.pop_front();
-        if (upload.tick > 0) {
-            --upload.tick;
+        if (upload.core == nullptr && g_is_tick_free && !g_is_tick_free(upload.free_tick)) {
+            ++upload.waits;
             g_upload_list.emplace_back(upload);
             return;
         }
@@ -246,6 +257,8 @@ void Submit() {
             delete upload.core;
         }
     } else {
+        LOG_INFO(ImGui, "Destroying a released texture after GPU tick {} ({} submits waited)",
+                 upload.free_tick, upload.waits);
         upload.data.Destroy();
     }
 }
