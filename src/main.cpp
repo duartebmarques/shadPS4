@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 #include <CLI/CLI.hpp>
@@ -33,22 +37,54 @@
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
-// Clang PGO training builds: the emulator can exit without running the profile runtime's exit
-// hook, so dump the profile periodically. A no-op in uninstrumented builds.
-#ifndef __APPLE__
+// Clang PGO training builds: dump a complete profile every minute and at quick_exit. Each dump goes
+// to a temp file that is renamed over the final per-process file, so a kill never leaves a torn
+// profile. Runs shorter than 5 minutes leave no file. A no-op in uninstrumented builds.
+#ifdef __linux__
 extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+extern "C" void __llvm_profile_set_filename(const char*) __attribute__((weak));
+extern "C" const char* __llvm_profile_get_filename(void) __attribute__((weak));
+
+static std::string g_pgo_path;
+static std::mutex g_pgo_mutex;
+static std::chrono::steady_clock::time_point g_pgo_start;
+
+static void WritePgoProfile() {
+    if (std::chrono::steady_clock::now() - g_pgo_start < std::chrono::minutes(5)) {
+        return;
+    }
+    std::scoped_lock lock{g_pgo_mutex};
+    const std::string tmp = g_pgo_path + ".tmp";
+    __llvm_profile_set_filename(tmp.c_str());
+    const int ret = __llvm_profile_write_file();
+    __llvm_profile_set_filename(g_pgo_path.c_str());
+    if (ret == 0) {
+        std::rename(tmp.c_str(), g_pgo_path.c_str());
+    }
+}
 #endif
 
 static void StartPgoDumper() {
-#ifndef __APPLE__
-    if (!__llvm_profile_write_file) {
+#ifdef __linux__
+    if (!__llvm_profile_write_file || !__llvm_profile_set_filename ||
+        !__llvm_profile_get_filename) {
         return;
     }
+    g_pgo_path = __llvm_profile_get_filename();
+    const auto pos = g_pgo_path.find("%p");
+    if (pos != std::string::npos) {
+        g_pgo_path.replace(pos, 2, std::to_string(getpid()));
+    }
+    g_pgo_start = std::chrono::steady_clock::now();
+    std::at_quick_exit(WritePgoProfile);
     std::thread([] {
         for (;;) {
-            std::this_thread::sleep_for(std::chrono::seconds(20));
-            __llvm_profile_write_file();
+            std::this_thread::sleep_for(std::chrono::seconds(60));
+            WritePgoProfile();
         }
     }).detach();
 #endif
