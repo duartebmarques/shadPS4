@@ -326,6 +326,7 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
     // The motion fed to the game, for analysing gestures: log/motion-<time>.csv, G and deg/s.
     std::FILE* csv = nullptr;
     bool touching = false;
+    bool clicking = false;
     u64 last_flush_ms = 0;
     while (!stop.stop_requested()) {
         const u64 now_ms = SDL_GetTicks();
@@ -343,11 +344,14 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
         }
         SDL_Gamepad* pad = controller->m_sdl_gamepad;
         if (!pad || SDL_GetNumGamepadTouchpads(pad) == 0) {
-            // Trackpads at payload offset 12: left x, y, right x, y; (0, 0) while untouched. The
-            // touched one (left first) is the DS4 touchpad, so swipes reach the game.
+            // Low button word: touch left 0x80000 / right 0x100000, click left 0x20000 / right
+            // 0x40000. Trackpads at payload offset 12: left x, y, right x, y. The touched one
+            // (left first) is the DS4 touchpad, so swipes reach the game.
+            u32 buttons;
+            std::memcpy(&buttons, data + 8, sizeof(buttons));
             s16 pads[4];
             std::memcpy(pads, data + 16, sizeof(pads));
-            const int side = (pads[0] || pads[1]) ? 0 : (pads[2] || pads[3]) ? 2 : -1;
+            const int side = (buttons & 0x80000) ? 0 : (buttons & 0x100000) ? 2 : -1;
             if (side >= 0) {
                 const float x = (pads[side] + 32768.0f) / 65535.0f;
                 const float y = 1.0f - (pads[side + 1] + 32768.0f) / 65535.0f;
@@ -356,6 +360,11 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
             } else if (touching) {
                 controller->SetTouchpadState(0, false, 0.0f, 0.0f);
                 touching = false;
+            }
+            const bool click = (buttons & 0x60000) != 0;
+            if (click != clicking) {
+                controller->Button(Libraries::Pad::OrbisPadButtonDataOffset::TouchPad, click);
+                clicking = click;
             }
         }
         if (pad && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) {
