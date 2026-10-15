@@ -262,7 +262,8 @@ void Liverpool::QueueHonestSignal(std::optional<FenceWrite> write,
     rasterizer->DeferAfterTick(tick, [this, write, irq] mutable {
         if (write && write->timestamp != DataSelect{}) {
             const u64 busy = rasterizer->GetScheduler().ReadGpuBusyNs(
-                {write->timestamp_slot, write->timestamp_session});
+                                 {write->timestamp_slot, write->timestamp_session}) *
+                             guest_gpu_time_percent_ / 100;
             const s64 freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
             write->value =
                 write->timestamp == DataSelect::GpuClock64
@@ -597,6 +598,7 @@ Liverpool::Liverpool() {
     gfx_stamp.classify_rt = gfx_stamp.active && EmulatorSettings.IsRtStateStamp();
     occlude_all_ = EmulatorSettings.IsOccludeAll();
     honest_fences_ = EmulatorSettings.GetInplaceGuestMemory() >= 1;
+    guest_gpu_time_percent_ = std::max(EmulatorSettings.GetGuestGpuTimePercent(), 1u);
     if (const char* env = std::getenv("SHADPS4_PIPE_CONSERVATIVE")) {
         pipe_drain_all_ = std::atoi(env) != 0;
     }

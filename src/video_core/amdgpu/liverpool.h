@@ -370,6 +370,7 @@ private:
     bool honest_fences_{};
     u64 timestamp_clock_base_{};
     u64 timestamp_perf_base_{};
+    u64 guest_gpu_time_percent_{100};
 
 public:
     /// A fence label captured when its packet is decoded, written after the GPU finished the
