@@ -264,6 +264,14 @@ The probe code is in `claude/diagnostic-probes.patch` (local); apply it with `gi
 - Regression check: `agent/tools/flicker-regress` (local). Run it before installing a build that touches
   fences, labels, timestamps, GPU scheduling or presentation.
 
+### Post-chain flicker: the game's rule (decoded 2026-10-15 from the 1.07 eboot)
+- GPU time = (end - start) EOP PerfCounter ticks x 30000 / 800 MHz, so 1000 units = 33.3 ms (function 0x596ef0).
+- Decision (0x87285d): the optional post chain stays on while GPU time < 33.3 ms and turns back on below 31.7 ms;
+  it also needs an adaptive quality level (0-2, driven by a sub-pass time and frame headroom) to be 0. Each
+  switch resets a one-frame counter, and the first frame after a switch-on resets the chain history (sharp frame).
+- The 1.67 ms hysteresis is smaller than the chain's own GPU cost on the Deck, so near the budget it oscillates.
+  `guest_gpu_time_percent` p keeps it on while p x GPU time < 33.3 ms; 50 covers frames up to ~67 ms (play config).
+
 ### `guest_sync_barriers` (committed locally as 9103c21, not pushed)
 - New GPU setting `guest_sync_barriers` (default off). A guest shader write that overlaps only accesses made by guest draws/dispatches since the last guest sync packet (partial flushes, cache flushes, ACQUIRE_MEM, waits, EOP/EOS signals) gets no barrier. RAW and every emulator transfer keep their barriers.
 - Timed FPS, same scene, Release build, 6 windows of 300 frames: **off 17.14, on 17.80 (+3.9%)**. About 41k syncs and 405k relaxed writes per 300 frames.
