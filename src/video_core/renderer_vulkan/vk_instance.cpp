@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -387,8 +388,20 @@ bool Instance::CreateDevice() {
         return false;
     }
 
+    // Under gamescope (Steam Deck Gaming Mode) the GPU-bound emulator starves the Steam overlays
+    // and the compositor of GPU time at equal priority, so they are slow to appear. A low priority
+    // queue yields to them only while they have work.
+    static constexpr vk::DeviceQueueGlobalPriorityCreateInfoKHR low_priority = {
+        .globalPriority = vk::QueueGlobalPriorityKHR::eLow,
+    };
+    const bool yield_to_compositor = std::getenv("GAMESCOPE_WAYLAND_DISPLAY") != nullptr &&
+                                     add_extension(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
+    if (yield_to_compositor) {
+        LOG_INFO(Render_Vulkan, "Running under gamescope: low GPU queue priority");
+    }
     static constexpr std::array queue_priorities = {1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
+        .pNext = yield_to_compositor ? &low_priority : nullptr,
         .queueFamilyIndex = queue_family_index,
         .queueCount = static_cast<u32>(queue_priorities.size()),
         .pQueuePriorities = queue_priorities.data(),
