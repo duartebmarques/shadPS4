@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/pad/pad_errors.h"
 #include "core/user_settings.h"
@@ -13,6 +14,8 @@
 #include "pad.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <array>
 #include <optional>
 
@@ -467,6 +470,22 @@ int PS4_SYSV_ABI scePadReadHistory() {
 int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     LOG_TRACE(Lib_Pad, "handle: {}", handle);
     const int result = scePadRead(handle, pData, 1);
+    static FILE* pad_log = [] {
+        const char* env = std::getenv("SHAD_PAD_LOG");
+        return env ? std::fopen(env, "w") : nullptr;
+    }();
+    if (pad_log && result >= 0) {
+        static u64 n = 0;
+        std::fprintf(pad_log, "%llu %llu %.4f %.4f %.4f %.3f %.3f %.3f %x\n",
+                     static_cast<unsigned long long>(Kernel::sceKernelGetProcessTime()),
+                     static_cast<unsigned long long>(pData->timestamp), pData->acceleration.x,
+                     pData->acceleration.y, pData->acceleration.z, pData->angularVelocity.x,
+                     pData->angularVelocity.y, pData->angularVelocity.z,
+                     static_cast<u32>(pData->buttons));
+        if (++n % 64 == 0) {
+            std::fflush(pad_log);
+        }
+    }
     return result < 0 ? result : ORBIS_OK;
 }
 

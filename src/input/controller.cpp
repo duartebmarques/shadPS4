@@ -2,14 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <SDL3/SDL.h>
 #include <fmt/format.h>
@@ -28,6 +33,25 @@ namespace Input {
 using Libraries::Pad::OrbisPadButtonDataOffset;
 
 namespace {
+
+// DIAG: SHAD_SHAKE_TEST / SHAD_INPUT_SCRIPT
+struct ShakeSpec {
+    float amp_g = 2.5f;
+    float freq = 7.0f;
+    int axes = 7;
+    float clip_g = 0.0f;
+    int sine = 0;
+};
+ShakeSpec g_shake_spec;
+
+ShakeSpec ParseShakeSpec(const char* s) {
+    ShakeSpec spec;
+    if (s) {
+        std::sscanf(s, "%f/%f/%d/%f/%d", &spec.amp_g, &spec.freq, &spec.axes, &spec.clip_g,
+                    &spec.sine);
+    }
+    return spec;
+}
 
 void CalculateOrientation(const Libraries::Pad::OrbisFVector3& angular_velocity, float delta_time,
                           const Libraries::Pad::OrbisFQuaternion& last_orientation,
@@ -225,14 +249,18 @@ void GameController::PushStateLocked(u64 timestamp) {
     m_state.UpdateAxisSmoothing(timestamp);
     m_state.OnGyro(gyro_buf);
     if (m_shake_active) {
-        // Emulate shaking a spray can: a strong ~7 Hz oscillation on every axis on top of the
-        // real reading, so the shake registers whatever axis or orientation the game checks.
-        constexpr float amplitude = 2.5f * 9.81f; // m/s^2, about 2.5 G
-        constexpr float frequency = 7.0f;         // Hz
+        const ShakeSpec spec = g_shake_spec;
+        const float amplitude = spec.amp_g * 9.81f;
         const float t = static_cast<float>(timestamp - m_shake_start) / 1'000'000.f;
-        const float wave = std::sin(2.0f * 3.14159265f * frequency * t) >= 0.0f ? 1.0f : -1.0f;
-        const float shaken[3] = {accel_buf[0] + amplitude * wave, accel_buf[1] + amplitude * wave,
-                                 accel_buf[2] + amplitude * wave};
+        const float sn = std::sin(2.0f * 3.14159265f * spec.freq * t);
+        const float wave = spec.sine ? sn : (sn >= 0.0f ? 1.0f : -1.0f);
+        float shaken[3];
+        for (int i = 0; i < 3; ++i) {
+            shaken[i] = accel_buf[i] + ((spec.axes >> i) & 1 ? amplitude * wave : 0.0f);
+            if (spec.clip_g > 0.0f) {
+                shaken[i] = std::clamp(shaken[i], -spec.clip_g * 9.81f, spec.clip_g * 9.81f);
+            }
+        }
         m_state.OnAccel(shaken);
     } else {
         m_state.OnAccel(accel_buf);
@@ -378,6 +406,74 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
         }
         s16 raw[6];
         std::memcpy(raw, data + 24, sizeof(raw));
+        // DIAG: SHAD_IMU_REPLAY=<motion csv>:<start_s>:<from_ms>:<to_ms>:<loops> replays a recorded
+        // motion-*.csv segment (G, deg/s, axes as fed to the game) as raw Deck reports, one row per
+        // report.
+        static std::vector<std::array<s16, 6>> replay_rows = [] {
+            std::vector<std::array<s16, 6>> rows;
+            const char* env = std::getenv("SHAD_IMU_REPLAY");
+            if (!env) {
+                return rows;
+            }
+            char file[512] = {};
+            float start_s = 0, from_ms = 0, to_ms = 1e12f;
+            int loops = 1;
+            std::sscanf(env, "%511[^:]:%f:%f:%f:%d", file, &start_s, &from_ms, &to_ms, &loops);
+            std::FILE* f = std::fopen(file, "r");
+            if (!f) {
+                return rows;
+            }
+            char line[256];
+            std::fgets(line, sizeof(line), f);
+            double t0 = -1;
+            std::vector<std::array<s16, 6>> seg;
+            const auto to_raw = [](float v, float per) {
+                return static_cast<s16>(std::clamp(v * per, -32768.0f, 32767.0f));
+            };
+            while (std::fgets(line, sizeof(line), f)) {
+                double t;
+                float ax, ay, az, gx, gy, gz;
+                if (std::sscanf(line, "%lf,%f,%f,%f,%f,%f,%f", &t, &ax, &ay, &az, &gx, &gy, &gz) !=
+                    7) {
+                    continue;
+                }
+                if (t0 < 0) {
+                    t0 = t;
+                }
+                if (t - t0 < from_ms || t - t0 > to_ms) {
+                    continue;
+                }
+                constexpr float gper = 32768.0f / 2000.0f;
+                const s16 r0 =
+                    std::abs(ax) >= 1.995f ? (ax > 0 ? 32767 : -32768) : to_raw(ax, 16384.0f);
+                const s16 r2 =
+                    std::abs(ay) >= 1.995f ? (ay > 0 ? 32767 : -32768) : to_raw(ay, 16384.0f);
+                const s16 r1 =
+                    std::abs(az) >= 1.995f ? (az > 0 ? -32768 : 32767) : to_raw(-az, 16384.0f);
+                seg.push_back({r0, r1, r2, to_raw(gx, gper), to_raw(-gz, gper), to_raw(gy, gper)});
+            }
+            std::fclose(f);
+            for (int i = 0; i < loops; ++i) {
+                rows.insert(rows.end(), seg.begin(), seg.end());
+            }
+            LOG_WARNING(Input, "IMUREPLAY {} rows from {} start {} s", rows.size(), file, start_s);
+            return rows;
+        }();
+        static size_t replay_pos = 0;
+        static const float replay_start = [] {
+            const char* env = std::getenv("SHAD_IMU_REPLAY");
+            const char* c = env ? std::strchr(env, ':') : nullptr;
+            return c ? std::strtof(c + 1, nullptr) : 0.0f;
+        }();
+        if (replay_pos < replay_rows.size() && now_ms >= replay_start * 1000.0f) {
+            if (replay_pos == 0) {
+                LOG_WARNING(Input, "IMUREPLAY begin");
+            }
+            std::memcpy(raw, replay_rows[replay_pos].data(), sizeof(raw));
+            if (++replay_pos == replay_rows.size()) {
+                LOG_WARNING(Input, "IMUREPLAY end");
+            }
+        }
         float accel_raw[3];
         for (int i = 0; i < 3; ++i) {
             if (raw[i] != SDL_MAX_SINT16 && raw[i] != SDL_MIN_SINT16) {
@@ -426,6 +522,76 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
 std::jthread g_deck_imu_thread;
 } // Anonymous namespace
 #endif
+
+namespace {
+void InputScriptThread(std::stop_token stop, GameController* controller, std::string script) {
+    using B = OrbisPadButtonDataOffset;
+    const auto start = std::chrono::steady_clock::now();
+    size_t pos = 0;
+    while (pos < script.size() && !stop.stop_requested()) {
+        size_t end = script.find(';', pos);
+        if (end == std::string::npos) {
+            end = script.size();
+        }
+        const std::string item = script.substr(pos, end - pos);
+        pos = end + 1;
+        float at = 0;
+        char name[64] = {};
+        int hold = 100;
+        char extra[128] = {};
+        if (std::sscanf(item.c_str(), "%f:%63[a-z]:%d:%127s", &at, name, &hold, extra) < 2) {
+            continue;
+        }
+        std::this_thread::sleep_until(start +
+                                      std::chrono::milliseconds(static_cast<int>(at * 1000)));
+        const std::string n = name;
+        LOG_WARNING(Input, "INPUTSCRIPT t={} {} hold={} {}", at, n, hold, extra);
+        if (n == "shake") {
+            g_shake_spec = ParseShakeSpec(extra[0] ? extra : nullptr);
+            controller->SetShake(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(hold));
+            controller->SetShake(false);
+            continue;
+        }
+        B b = B::None;
+        if (n == "cross")
+            b = B::Cross;
+        else if (n == "circle")
+            b = B::Circle;
+        else if (n == "square")
+            b = B::Square;
+        else if (n == "triangle")
+            b = B::Triangle;
+        else if (n == "options")
+            b = B::Options;
+        else if (n == "up")
+            b = B::Up;
+        else if (n == "down")
+            b = B::Down;
+        else if (n == "left")
+            b = B::Left;
+        else if (n == "right")
+            b = B::Right;
+        else if (n == "lone")
+            b = B::L1;
+        else if (n == "rone")
+            b = B::R1;
+        else if (n == "ltwo")
+            b = B::L2;
+        else if (n == "rtwo")
+            b = B::R2;
+        else if (n == "touchpad")
+            b = B::TouchPad;
+        if (b == B::None) {
+            continue;
+        }
+        controller->Button(b, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(hold));
+        controller->Button(b, false);
+    }
+}
+std::jthread g_input_script_thread;
+} // namespace
 
 void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
@@ -512,6 +678,12 @@ void GameControllers::TryOpenSDLControllers() {
         g_deck_imu_thread = std::jthread(DeckImuThread, controllers[0]);
     }
 #endif
+    if (const char* script = std::getenv("SHAD_INPUT_SCRIPT");
+        script && !g_input_script_thread.joinable()) {
+        g_shake_spec = ParseShakeSpec(std::getenv("SHAD_SHAKE_TEST"));
+        g_input_script_thread =
+            std::jthread(InputScriptThread, controllers[0], std::string(script));
+    }
     if (is_first_check) [[unlikely]] {
         is_first_check = false;
         if (controller_count == 0) {
