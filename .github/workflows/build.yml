@@ -309,6 +309,150 @@ jobs:
         name: shadps4-linux-sdl-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
         path: Shadps4-sdl.AppImage
 
+  pgo-check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+    steps:
+    - name: Check for the pgo-profile release
+      id: check
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if gh release view pgo-profile -R ${{ github.repository }} --json assets -q '.assets[].name' | grep -qx shadps4.profdata; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+  linux-sdl-pgo-gen:
+    runs-on: ubuntu-24.04
+    needs: get-info
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Add LLVM repository
+      run: |
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        sudo add-apt-repository 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt install -y libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libglfw3-dev libgles2-mesa-dev libfuse2 clang-19 mold build-essential libasound2-dev libpulse-dev libopenal-dev libudev-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev
+
+    - name: Cache CMake Configuration
+      uses: actions/cache@v5
+      env:
+          cache-name: ${{ runner.os }}-sdl-pgogen-cache-cmake-configuration
+      with:
+          path: |
+            ${{github.workspace}}/build
+          key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+          restore-keys: |
+            ${{ env.cache-name }}-
+
+    - name: Cache CMake Build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      env:
+          cache-name: ${{ runner.os }}-sdl-pgogen-cache-cmake-build
+      with:
+        append-timestamp: false
+        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    - name: Print CPU Info
+      run: cat /proc/cpuinfo
+
+    - name: Configure CMake
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-generate=/home/deck/Documents/Projects/shadPS4-exodus-uma-shake/profiles/pgo/train-%p.profraw" -DCMAKE_CXX_FLAGS="-fprofile-instr-generate=/home/deck/Documents/Projects/shadPS4-exodus-uma-shake/profiles/pgo/train-%p.profraw" -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
+
+    - name: Package and Upload Linux(ubuntu64) SDL artifact
+      run: |
+        ls -la ${{ github.workspace }}/build/shadps4
+
+    - name: Run AppImage packaging script
+      run:  ./.github/workflows/scripts/linux-appimage-sdl.sh
+
+    - name: Package and Upload Linux SDL artifact
+      run: |
+        tar cf shadps4-linux-sdl.tar.gz -C ${{github.workspace}}/build shadps4
+    - uses: actions/upload-artifact@v7
+      with:
+        name: shadps4-linux-sdl-pgogen-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
+        path: Shadps4-sdl.AppImage
+
+  linux-sdl-pgo:
+    runs-on: ubuntu-24.04
+    needs: [get-info, pgo-check]
+    if: github.event_name == 'workflow_dispatch' || needs.pgo-check.outputs.exists == 'true'
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Add LLVM repository
+      run: |
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        sudo add-apt-repository 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt install -y libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libglfw3-dev libgles2-mesa-dev libfuse2 clang-19 mold build-essential libasound2-dev libpulse-dev libopenal-dev libudev-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev
+
+    - name: Cache CMake Configuration
+      uses: actions/cache@v5
+      env:
+          cache-name: ${{ runner.os }}-sdl-pgo-cache-cmake-configuration
+      with:
+          path: |
+            ${{github.workspace}}/build
+          key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+          restore-keys: |
+            ${{ env.cache-name }}-
+
+    - name: Cache CMake Build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      env:
+          cache-name: ${{ runner.os }}-sdl-pgo-cache-cmake-build
+      with:
+        append-timestamp: false
+        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    - name: Print CPU Info
+      run: cat /proc/cpuinfo
+
+    - name: Download PGO profile
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release download pgo-profile -R ${{ github.repository }} -p shadps4.profdata -D $RUNNER_TEMP
+
+    - name: Configure CMake
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-use=${{ runner.temp }}/shadps4.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_CXX_FLAGS="-fprofile-instr-use=${{ runner.temp }}/shadps4.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
+
+    - name: Package and Upload Linux(ubuntu64) SDL artifact
+      run: |
+        ls -la ${{ github.workspace }}/build/shadps4
+
+    - name: Run AppImage packaging script
+      run:  ./.github/workflows/scripts/linux-appimage-sdl.sh
+
+    - name: Package and Upload Linux SDL artifact
+      run: |
+        tar cf shadps4-linux-sdl.tar.gz -C ${{github.workspace}}/build shadps4
+    - uses: actions/upload-artifact@v7
+      with:
+        name: shadps4-linux-sdl-pgo-${{ needs.get-info.outputs.date }}-${{ needs.get-info.outputs.shorthash }}
+        path: Shadps4-sdl.AppImage
+
   linux-sdl-gcc:
     runs-on: ubuntu-24.04
     needs: get-info
