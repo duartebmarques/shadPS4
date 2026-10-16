@@ -494,8 +494,8 @@ jobs:
 
 
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [get-info, linux-sdl]
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.linux-sdl.result == 'success' }}
+    needs: [get-info, linux-sdl, linux-sdl-pgo]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -506,29 +506,33 @@ jobs:
       uses: actions/download-artifact@v8
       with:
         path: ./artifacts
-        pattern: shadps4-*-sdl-*
+        pattern: shadps4-linux-sdl-*
 
-    - name: Package release zips
+    - name: Package release zip
       env:
         TAG: ${{ github.ref_name }}
       run: |
         set -euo pipefail
-        for platform in linux; do
-          src=$(echo ./artifacts/shadps4-${platform}-sdl-*/)
-          dir=./stage/${platform}
-          mkdir -p "$dir"
-          cp -r "$src". "$dir"/
-          cp -r dist/user "$dir"/user
-          cp LICENSE README.md "$dir"/
-          echo "$TAG" > "$dir"/VERSION
-          if [ "$platform" = linux ]; then cp dist/install.sh "$dir"/; fi
-          chmod a+x "$dir"/Shadps4-sdl.AppImage "$dir"/install.sh "$dir"/shadps4 2>/dev/null || true
-          (cd "$dir" && zip -r "$GITHUB_WORKSPACE/shadps4-${TAG}-${platform}.zip" .)
-        done
+        # The PGO build is the faster one; the plain build is the fallback when it was skipped.
+        src=$(ls -d ./artifacts/shadps4-linux-sdl-pgo-2*/ 2>/dev/null | head -1)
+        [ -n "$src" ] || src=$(ls -d ./artifacts/shadps4-linux-sdl-2*/ | head -1)
+        echo "AppImage from $src"
+        dir=./stage/linux
+        mkdir -p "$dir"
+        cp "$src"Shadps4-sdl.AppImage "$dir"/
+        cp -r dist/user "$dir"/user
+        cp LICENSE README.md dist/install.sh "$dir"/
+        echo "$TAG" > "$dir"/VERSION
+        chmod a+x "$dir"/Shadps4-sdl.AppImage "$dir"/install.sh
+        (cd "$dir" && zip -r "$GITHUB_WORKSPACE/shadps4-${TAG}-linux.zip" .)
+        cp dist/install.sh ./install.sh
+        sed "s/@TAG@/$TAG/g" dist/RELEASE.md > ./release-notes.md
         ls -la ./*.zip
 
     - name: Publish GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        files: ./*.zip
-        generate_release_notes: true
+        files: |
+          ./*.zip
+          ./install.sh
+        body_path: ./release-notes.md

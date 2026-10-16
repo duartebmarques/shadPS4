@@ -1,9 +1,13 @@
 #!/bin/bash
 # Installs or updates shadPS4 for inFAMOUS Second Son (CUSA00004) on Linux / Steam Deck.
 #
-#   ./install.sh            install from this folder: finds the game, its update and DLC,
-#                           sets up the patches, copies old saves and adds a Steam shortcut
+#   ./install.sh            install: finds the game, its update and DLC, sets up the patches,
+#                           copies old saves and adds a Steam shortcut. Run on its own (no
+#                           release files next to it), it downloads the latest release first.
 #   ./install.sh --update   download the latest release and install it over this one
+#
+# One line, in a Desktop Mode terminal (Konsole):
+#   bash <(curl -fsSL https://github.com/duartebmarques/shadPS4/releases/latest/download/install.sh)
 #
 # Options:
 #   --dir DIR          install folder (default: ~/Applications/shadPS4-infamous)
@@ -19,10 +23,13 @@ set -euo pipefail
 TITLE_ID="CUSA00004"
 APP_NAME="inFAMOUS Second Son"
 REPO="duartebmarques/shadPS4"
+EXTRACTOR_REPO="AzaharPlus/shadPS4Plus"
 PATCH_URL="https://raw.githubusercontent.com/shadps4-emu/ps4_cheats/main/PATCHES/InfamousSecondSon.xml"
 DEFAULT_PATCHES=("Skip intro movie" "Render resolution 1280x720")
 
-SRC="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# Empty when the script comes from a pipe (bash <(curl ...)).
+SRC="$(cd "$(dirname "$(readlink -f "$0")")" 2>/dev/null && pwd || true)"
+ARGS=("$@")
 DIR="$HOME/Applications/shadPS4-infamous"
 GAME=""
 SEARCH=()
@@ -34,7 +41,7 @@ YES=0
 UPDATE=0
 
 # Started from a file manager: reopen in a terminal so the questions can be answered.
-if [ ! -t 0 ] && [ -z "${INFAMOUS_IN_TERM:-}" ]; then
+if [ ! -t 0 ] && [ -z "${INFAMOUS_IN_TERM:-}" ] && [ -f "$0" ]; then
     export INFAMOUS_IN_TERM=1
     if command -v konsole >/dev/null; then
         exec konsole --hold -e bash "$0" "$@"
@@ -45,6 +52,7 @@ fi
 
 die() { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
+step() { printf '\n\033[1m[%s/6] %s\033[0m\n' "$1" "$2"; }
 warn() { echo "warning: $*" >&2; }
 ask() {
     [ "$YES" = 1 ] && return 0
@@ -238,7 +246,8 @@ def shortcut(vdf, name, exe, start, icon):
     os.replace(vdf + ".tmp", vdf)
     print(appid)
 
-def latest(repo):
+def latest(repo, pattern=r"-linux\.zip$"):
+    # Prints "tag<TAB>url" of the first asset of the latest release whose name matches pattern.
     import json, urllib.request
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
@@ -247,10 +256,10 @@ def latest(repo):
     except OSError as e:
         sys.exit(f"{url}: {e}")
     for a in rel["assets"]:
-        if a["name"].endswith("-linux.zip"):
+        if re.search(pattern, a["name"]):
             print(rel["tag_name"] + "\t" + a["browser_download_url"])
             return
-    sys.exit("the latest release has no -linux.zip")
+    sys.exit(f"the latest release of {repo} has no {pattern} asset")
 
 cmd, *args = sys.argv[1:]
 {"scan": scan, "patches": patches, "shortcut": shortcut, "latest": latest}[cmd](*args)
@@ -273,8 +282,8 @@ put() {
     mv -f "$2.new.$$" "$2"
 }
 
-# ---- Update: fetch the latest release and run its installer ----
-if [ "$UPDATE" = 1 ]; then
+# ---- Update, or a lone install.sh: fetch the latest release and run its installer ----
+if [ "$UPDATE" = 1 ] || { [ -z "$APPIMAGE" ] && [ ! -f "$SRC/Shadps4-sdl.AppImage" ]; }; then
     command -v curl >/dev/null || die "curl is required"
     command -v unzip >/dev/null || die "unzip is required"
     rel="$(py latest "$REPO")" || die "could not look up the latest release"
@@ -289,11 +298,11 @@ if [ "$UPDATE" = 1 ]; then
     info "Downloading $tag..."
     curl -fL --progress-bar -o "$work/release.zip" "$url"
     unzip -q "$work/release.zip" -d "$work/release"
-    args=(--dir "$DIR")
-    if [ "$STEAM" = 0 ]; then args+=(--no-steam); fi
-    if [ -n "$STEAM_DIR" ]; then args+=(--steam-dir "$STEAM_DIR"); fi
-    if [ "$YES" = 1 ]; then args+=(--yes); fi
-    bash "$work/release/install.sh" "${args[@]}"
+    args=()
+    for a in "${ARGS[@]}"; do
+        if [ "$a" != --update ]; then args+=("$a"); fi
+    done
+    INFAMOUS_IN_TERM=1 bash "$work/release/install.sh" "${args[@]}"
     exit
 fi
 
@@ -301,7 +310,7 @@ if game_running; then
     die "the game is running; close it first"
 fi
 
-# ---- 1. Emulator and the shipped settings ----
+step 1 "Emulator and tuned settings"
 [ -n "$APPIMAGE" ] || APPIMAGE="$SRC/Shadps4-sdl.AppImage"
 [ -f "$APPIMAGE" ] || die "Shadps4-sdl.AppImage not found next to install.sh (use --appimage)"
 # The shipped user folder; an installed copy keeps it as .dist for reinstalls.
@@ -343,7 +352,7 @@ put "$DIST/patches/shadPS4/files.json" "$U/patches/shadPS4/files.json"
 # Without these, the first start of a new user folder asks a "Save Migration" question.
 mkdir -p "$U/home/1000/savedata" "$U/home/1000/trophy" "$U/home/1000/inputs"
 
-# ---- 2. Patches: skip the intro, render at 1280x720 ----
+step 2 "Game patches (skip intro, 1280x720)"
 pf="$U/patches/shadPS4/InfamousSecondSon.xml"
 if curl -fsSL --max-time 30 -o "$pf.dl" "$PATCH_URL" &&
     on="$(py patches "$pf.dl" "$pf" "${DEFAULT_PATCHES[@]}")"; then
@@ -359,7 +368,7 @@ else
     fi
 fi
 
-# ---- 3. Game, update and DLC ----
+step 3 "Looking for the game, its update and DLC"
 roots=()
 if [ -n "$GAME" ]; then roots+=("$(dirname "$GAME")"); fi
 roots+=("${SEARCH[@]}")
@@ -383,6 +392,14 @@ if [ -z "$GAME" ] && [ -z "$(field game)" ] && [ -n "$(field pkg)" ]; then
     if [ -z "$EXTRACTOR" ]; then
         EXTRACTOR="$(find "$HOME" /run/media -maxdepth 5 -iname 'pkg_extractor*.AppImage' \
             -not -path '*/.*' 2>/dev/null | head -1 || true)"
+    fi
+    if [ -z "$EXTRACTOR" ] && ask "Download the pkg extractor ($EXTRACTOR_REPO, a few MB)?"; then
+        rel="$(py latest "$EXTRACTOR_REPO" 'PkgExtractor.*linux\.AppImage$')" ||
+            die "could not look up the pkg extractor"
+        mkdir -p "$DIR/tools"
+        EXTRACTOR="$DIR/tools/pkg_extractor.AppImage"
+        curl -fL --progress-bar -o "$EXTRACTOR" "${rel#*$'\t'}"
+        chmod +x "$EXTRACTOR"
     fi
     [ -n "$EXTRACTOR" ] || die "extracting pkg files needs pkg_extractor (pass --extractor FILE)"
     dest="$(dirname "${pkgs[0]}")"
@@ -446,7 +463,7 @@ while IFS= read -r d; do
     info "DLC: $(basename "$d")"
 done < <(field dlc)
 
-# ---- 4. Saves from an earlier shadPS4 setup (copied, never moved) ----
+step 4 "Saves from an earlier shadPS4 setup"
 data="${XDG_DATA_HOME:-$HOME/.local/share}/shadPS4"
 for old in "$data/home/1000/savedata/$TITLE_ID" "$data/savedata/1/$TITLE_ID"; do
     if [ -d "$old" ] && [ ! -e "$U/home/1000/savedata/$TITLE_ID" ]; then
@@ -458,7 +475,7 @@ for old in "$data/home/1000/savedata/$TITLE_ID" "$data/savedata/1/$TITLE_ID"; do
     fi
 done
 
-# ---- 5. Launcher ----
+step 5 "Launcher"
 launcher="$DIR/$APP_NAME.sh"
 {
     echo '#!/bin/bash'
@@ -498,6 +515,7 @@ add_shortcuts() {
     info "Steam shortcut \"$APP_NAME\" added ($n Steam account(s))"
 }
 
+step 6 "Steam shortcut"
 if [ "$STEAM" = 1 ]; then
     own_steam=0
     if [ -z "$STEAM_DIR" ]; then
@@ -531,12 +549,18 @@ fi
 
 cat <<EOF
 
-Done. Play "$APP_NAME" from your Steam library, or run:
-    "$launcher"
-Once, in Gaming Mode:
-  - Controller settings for the game: map two back buttons to the keyboard keys Home (shake,
-    for graffiti) and T (two-finger touchpad press, for the car push).
-  - Performance (optional): a manual GPU clock of 1600 MHz avoids flicker in heavy scenes.
-To update later:
+All done! Go back to Gaming Mode and start "$APP_NAME" from your library
+(Library > Non-Steam).
+
+Once, in Gaming Mode, while the game runs: press ... > Performance, turn on
+"Advanced view" and "Use per-game profile", then "Manual GPU clock" at 1600 MHz.
+Turn the frame limit OFF there: the emulator caps the game at 30 fps itself.
+
+Good to know:
+  - The first start builds shaders: expect stutter for the first minutes, then it goes away.
+  - Shaking the Deck shakes the controller (graffiti), and the trackpads work as the
+    PS4 touchpad. On a pad without motion, use the keyboard keys Home (shake) and T
+    (two-finger touchpad press) from the game's controller settings.
+To update later, run:
     "$DIR/install.sh" --update
 EOF
