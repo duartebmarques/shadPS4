@@ -438,7 +438,7 @@ if [ -n "$GAME" ]; then
     [ -f "$GAME/eboot.bin" ] || die "no eboot.bin in $GAME"
 else
     mapfile -t games < <(field game)
-    [ "${#games[@]}" -gt 0 ] || die "$TITLE_ID not found. Copy your game dump (or its .pkg files) to ~/Games or an SD card, then run install.sh again, or pass the folder with --game DIR"
+    [ "${#games[@]}" -gt 0 ] || die "$TITLE_ID not found. It can be anywhere in your home folder or on an SD card (not in a hidden folder, at most 6 folders deep): copy your game dump or its .pkg files there and run install.sh again, or pass its folder with --game DIR"
     GAME="${games[0]}"
     if [ "${#games[@]}" -gt 1 ]; then
         warn "found ${#games[@]} copies of the game, using the first (choose with --game DIR)"
