@@ -34,7 +34,8 @@ void BarrierTracker::List::AddSorted(std::span<const Interval> ranges,
     }
     // Intervals ending before the first range stay where they are: only the tail from there is
     // merged, and accesses mostly land near the end of a buffer's list.
-    const auto first = std::ranges::lower_bound(intervals, ranges.front().start, {}, &Interval::end);
+    const auto first =
+        std::ranges::lower_bound(intervals, ranges.front().start, {}, &Interval::end);
     scratch.clear();
     scratch.reserve(std::distance(first, intervals.end()) + ranges.size());
     const auto push = [&scratch](const Interval& range) {
