@@ -505,10 +505,15 @@ add_shortcuts() {
             continue
         fi
         mkdir -p "$cfg/grid"
+        # The game's own PS4 art, so the library tile isn't blank.
         if [ -f "$GAME/sce_sys/pic1.png" ]; then
             cp "$GAME/sce_sys/pic1.png" "$cfg/grid/${appid}_hero.png"
+            cp "$GAME/sce_sys/pic1.png" "$cfg/grid/${appid}.png"
         fi
-        if [ -n "$icon" ]; then cp "$icon" "$cfg/grid/${appid}_icon.png"; fi
+        if [ -n "$icon" ]; then
+            cp "$icon" "$cfg/grid/${appid}_icon.png"
+            cp "$icon" "$cfg/grid/${appid}p.png"
+        fi
         n=$((n + 1))
     done
     [ "$n" -gt 0 ] || return 1
