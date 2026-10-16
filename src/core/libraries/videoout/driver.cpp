@@ -259,10 +259,10 @@ std::mutex g_lat_mutex;
 std::deque<std::pair<u64, u64>> g_lat_guest;
 FILE* g_lat_file = [] {
     const char* path = std::getenv("SHAD_LAT_LOG");
-    const char* home = std::getenv("HOME");
-    const std::string fallback = std::string{home ? home : "."} + "/.local/share/shadPS4/log/lat-" +
-                                 std::to_string(std::time(nullptr)) + ".txt";
-    FILE* f = std::fopen(path ? path : fallback.c_str(), "w");
+    if (!path) {
+        return static_cast<FILE*>(nullptr);
+    }
+    FILE* f = std::fopen(path, "w");
     if (f) {
         std::fputs("guest_flip_us pad_read_us present_start_us present_end_us queued\n", f);
     }
