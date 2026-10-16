@@ -70,6 +70,9 @@ struct GraphicsPipelineKey {
 
 class GraphicsPipeline : public Pipeline {
 public:
+    /// Set on the threads that compile pipelines in the background.
+    static inline thread_local bool compiling_in_background = false;
+
     struct SerializationSupport {
         VertexInputs<vk::VertexInputAttributeDescription> vertex_attributes{};
         VertexInputs<vk::VertexInputBindingDescription> vertex_bindings{};

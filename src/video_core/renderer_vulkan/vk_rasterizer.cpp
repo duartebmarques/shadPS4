@@ -909,10 +909,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         };
         const Pipeline* pipeline = nullptr;
         if (pipe_select && ClassifyDraw(liverpool->regs).kind == DrawFilter::Kind::Draw) {
-            pipeline = pipeline_cache.GetGraphicsPipeline({
-                .vertex_sgpr_offset = vertex_sgpr_offset,
-                .instance_sgpr_offset = instance_sgpr_offset,
-            });
+            pipeline = pipeline_cache.GetGraphicsPipeline(
+                {
+                    .vertex_sgpr_offset = vertex_sgpr_offset,
+                    .instance_sgpr_offset = instance_sgpr_offset,
+                },
+                true);
             if (!pipeline) {
                 return;
             }
@@ -941,7 +943,7 @@ void Rasterizer::RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offs
         .is_indirect = true,
     };
     const GraphicsPipeline* pipeline =
-        SelectedOr([this, &params] { return pipeline_cache.GetGraphicsPipeline(params); });
+        SelectedOr([this, &params] { return pipeline_cache.GetGraphicsPipeline(params, true); });
     if (!pipeline) {
         return;
     }
