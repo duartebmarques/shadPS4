@@ -24,7 +24,7 @@ TITLE_ID="CUSA00004"
 APP_NAME="inFAMOUS Second Son"
 REPO="duartebmarques/shadPS4"
 EXTRACTOR_REPO="AzaharPlus/shadPS4Plus"
-PATCH_URL="https://raw.githubusercontent.com/shadps4-emu/ps4_cheats/main/PATCHES/InfamousSecondSon.xml"
+PATCH_URL="https://raw.githubusercontent.com/shadps4-emu/ps4_cheats/e34463942099072e5d8f5e2bcb3d7d927683b349/PATCHES/InfamousSecondSon.xml"
 DEFAULT_PATCHES=("Skip intro movie" "Render resolution 1280x720")
 
 # Empty when the script comes from a pipe (bash <(curl ...)).
@@ -162,6 +162,9 @@ def patches(new, old, *defaults):
         want = {name_of(t) for t in META.findall(txt) if 'isEnabled="true"' in t}
     else:
         want = set(defaults)
+        names = {name_of(t) for t in META.findall(open(new, encoding="utf-8").read())}
+        for d in sorted(want - names):
+            print(f"warning: patch '{d}' is not in the patch file", file=sys.stderr)
     txt = open(new, encoding="utf-8").read()
     if "<Patch>" not in txt:
         sys.exit("not a patch file")
@@ -435,7 +438,7 @@ if [ -n "$GAME" ]; then
     [ -f "$GAME/eboot.bin" ] || die "no eboot.bin in $GAME"
 else
     mapfile -t games < <(field game)
-    [ "${#games[@]}" -gt 0 ] || die "$TITLE_ID not found. Pass its folder with --game DIR"
+    [ "${#games[@]}" -gt 0 ] || die "$TITLE_ID not found. Copy your game dump (or its .pkg files) to ~/Games or an SD card, then run install.sh again, or pass the folder with --game DIR"
     GAME="${games[0]}"
     if [ "${#games[@]}" -gt 1 ]; then
         warn "found ${#games[@]} copies of the game, using the first (choose with --game DIR)"
