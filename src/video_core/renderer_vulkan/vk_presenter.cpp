@@ -1127,6 +1127,12 @@ void Presenter::NoteFrameTime() {
              over_40, over_50, over_100);
 }
 
+void Presenter::DiscardFrame(Frame* frame) {
+    std::scoped_lock fl{free_mutex};
+    free_queue.push(frame);
+    free_cv.notify_one();
+}
+
 Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;

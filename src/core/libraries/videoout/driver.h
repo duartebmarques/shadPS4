@@ -7,8 +7,12 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <optional>
 #include <queue>
 
 namespace Vulkan {
@@ -19,6 +23,9 @@ namespace Libraries::VideoOut {
 
 void LatNotePadRead();
 void LatNoteGuestFlip();
+
+/// Holds the calling guest thread after a flip for the frame cap.
+void PaceGuestFrame();
 
 struct VideoOutPort {
     SceVideoOutResolutionStatus resolution;
@@ -95,6 +102,10 @@ public:
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
 
+    /// Called by the guest thread after it queued a flip: holds it until its next frame should
+    /// start for the frame cap.
+    void PaceGuestFlip();
+
 private:
     struct Request {
         Vulkan::Frame* frame;
@@ -102,23 +113,65 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        s64 not_before_ns; // Frame cap slot
 
         operator bool() const noexcept {
             return frame != nullptr;
         }
     };
 
-    void Flip(const Request& req);
+    enum class SwapKind {
+        Game,  // A guest flip, dropped if a newer one arrives before it is presented
+        Blank, // Video port out not open
+        Last,  // Used when there is no flip request
+    };
+
+    struct SwapRequest {
+        SwapKind kind;
+        Vulkan::Frame* frame;
+        bool hdr;
+        s64 vblank_ns;     // Vblank the flip was made on, 0 if it was flipped between vblanks
+        s64 not_before_ns; // Frame cap slot, the present is held until then
+    };
+
+    void Flip(const Request& req, s64 vblank_ns = 0);
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
+    void QueueSwap(const SwapRequest& req);
+    void SwapThread(std::stop_token token);
+    void TrackDisplay(s64 vblank_ns, s64 display_ns);
+    s64 NoteFrameReady();
 
     std::mutex mutex;
     std::condition_variable request_cv;
     VideoOutPort main_port{};
-    std::jthread present_thread;
     std::queue<Request> requests;
+    u32 present_pacing{};
+    std::mutex swap_mutex;
+    std::condition_variable_any swap_cv;
+    std::deque<SwapRequest> swap_requests;
+    bool swap_busy{};
+    u64 swap_dropped{};
+    // Phase lock: how far the vblanks should move later, from the time frames reach the display.
+    std::atomic<s64> vblank_shift_ns{};
+    s64 display_floor_ns{};
+    s64 display_margin_ns{};
+    s64 last_display_delay_ns{};
+    s64 last_miss_ns{};
+    u64 display_misses{};
+    u64 display_samples{};
+    // Frame cap: the display slot of the last frame and how long before its slot a frame is
+    // started.
+    s64 cap_period_ns{};
+    std::mutex cap_mutex;
+    s64 cap_slot_ns{};
+    s64 cap_lead_ns{};
+    u64 cap_submitted{};
+    u64 cap_ready{};
+    std::jthread present_thread;
+    std::jthread swap_thread;
 };
 
 } // namespace Libraries::VideoOut

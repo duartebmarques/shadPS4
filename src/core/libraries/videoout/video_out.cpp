@@ -152,6 +152,10 @@ s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
     return pending;
 }
 
+void PaceGuestFrame() {
+    driver->PaceGuestFlip();
+}
+
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {
     auto* port = driver->GetPort(handle);
     if (!port) {
@@ -183,6 +187,7 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
         LOG_ERROR(Lib_VideoOut, "Flip queue is full");
         return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
     }
+    driver->PaceGuestFlip();
 
     return ORBIS_OK;
 }

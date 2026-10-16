@@ -2412,17 +2412,22 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     auto* cmdbuf = dcb_gpu_addrs[count - 1];
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
-    std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    s32 result;
+    {
+        std::scoped_lock lk{m_submit_lock};
+        WaitGpuIdle();
 
-    const s32 patch_result =
-        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
-    if (patch_result != ORBIS_OK) {
-        return patch_result;
+        const s32 patch_result = PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode,
+                                                  flip_arg, nullptr /*unk*/);
+        if (patch_result != ORBIS_OK) {
+            return patch_result;
+        }
+
+        result = PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
+                               const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
     }
-
-    return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
-                         const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    Libraries::VideoOut::PaceGuestFrame();
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,

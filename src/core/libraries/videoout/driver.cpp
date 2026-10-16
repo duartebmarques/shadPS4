@@ -1,13 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -53,6 +57,13 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
+    present_pacing = EmulatorSettings.GetPresentPacing();
+    if (const u32 cap = EmulatorSettings.GetFrameCap(); cap != 0) {
+        cap_period_ns = 1'000'000'000 / cap;
+    }
+    if (present_pacing != 0) {
+        swap_thread = std::jthread([&](std::stop_token token) { SwapThread(token); });
+    }
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
@@ -276,34 +287,81 @@ void LatNoteGuestFlip() {
     }
 }
 
-void VideoOutDriver::Flip(const Request& req) {
-    // Update HDR status before presenting.
-    presenter->SetHDR(req.port->is_hdr);
+namespace {
+std::unordered_map<Vulkan::Frame*, std::pair<u64, u64>> g_lat_frames;
 
-    // Present the frame.
-    const u64 lat_start = g_lat_file ? Libraries::Kernel::sceKernelGetProcessTime() : 0;
-    presenter->Present(req.frame);
-    if (g_lat_file && req.index != -1) {
-        const u64 lat_end = Libraries::Kernel::sceKernelGetProcessTime();
-        std::pair<u64, u64> guest{0, 0};
-        size_t queued = 0;
-        {
-            std::scoped_lock lk{g_lat_mutex};
-            if (!g_lat_guest.empty()) {
-                guest = g_lat_guest.front();
-                g_lat_guest.pop_front();
-            }
-            queued = g_lat_guest.size();
+void LatTagFrame(Vulkan::Frame* frame) {
+    if (g_lat_file) {
+        std::scoped_lock lk{g_lat_mutex};
+        if (!g_lat_guest.empty()) {
+            g_lat_frames[frame] = g_lat_guest.front();
+            g_lat_guest.pop_front();
         }
-        std::fprintf(g_lat_file, "%llu %llu %llu %llu %zu\n",
-                     static_cast<unsigned long long>(guest.first),
-                     static_cast<unsigned long long>(guest.second),
-                     static_cast<unsigned long long>(lat_start),
-                     static_cast<unsigned long long>(lat_end), queued);
-        if (lat_end - g_lat_flush_us > 1'000'000) {
-            std::fflush(g_lat_file);
-            g_lat_flush_us = lat_end;
+    }
+}
+
+void LatDropFrame(Vulkan::Frame* frame) {
+    if (g_lat_file) {
+        std::scoped_lock lk{g_lat_mutex};
+        g_lat_frames.erase(frame);
+    }
+}
+
+void LatFramePresented(Vulkan::Frame* frame, u64 start) {
+    if (!g_lat_file) {
+        return;
+    }
+    const u64 end = Libraries::Kernel::sceKernelGetProcessTime();
+    std::pair<u64, u64> guest{0, 0};
+    size_t queued = 0;
+    {
+        std::scoped_lock lk{g_lat_mutex};
+        if (const auto it = g_lat_frames.find(frame); it != g_lat_frames.end()) {
+            guest = it->second;
+            g_lat_frames.erase(it);
         }
+        queued = g_lat_guest.size();
+    }
+    if (guest.first == 0) {
+        return;
+    }
+    std::fprintf(
+        g_lat_file, "%llu %llu %llu %llu %zu\n", static_cast<unsigned long long>(guest.first),
+        static_cast<unsigned long long>(guest.second), static_cast<unsigned long long>(start),
+        static_cast<unsigned long long>(end), queued);
+    if (end - g_lat_flush_us > 1'000'000) {
+        std::fflush(g_lat_file);
+        g_lat_flush_us = end;
+    }
+}
+
+s64 SteadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
+void VideoOutDriver::Flip(const Request& req, s64 vblank_ns) {
+    if (req.index != -1) {
+        LatTagFrame(req.frame);
+    }
+    if (present_pacing != 0) {
+        QueueSwap({
+            .kind = SwapKind::Game,
+            .frame = req.frame,
+            .hdr = req.port->is_hdr,
+            .vblank_ns = vblank_ns,
+            .not_before_ns = req.not_before_ns,
+        });
+    } else {
+        // Update HDR status before presenting.
+        presenter->SetHDR(req.port->is_hdr);
+
+        // Present the frame.
+        const u64 lat_start = g_lat_file ? Libraries::Kernel::sceKernelGetProcessTime() : 0;
+        presenter->Present(req.frame);
+        LatFramePresented(req.frame, lat_start);
     }
 
     // Update flip status.
@@ -344,14 +402,131 @@ void VideoOutDriver::Flip(const Request& req) {
 }
 
 void VideoOutDriver::DrawBlankFrame() {
+    if (present_pacing != 0) {
+        QueueSwap({.kind = SwapKind::Blank});
+        return;
+    }
     const auto empty_frame = presenter->PrepareBlankFrame(true);
     presenter->Present(empty_frame, false, false);
 }
 
 void VideoOutDriver::DrawLastFrame() {
+    if (present_pacing != 0) {
+        QueueSwap({.kind = SwapKind::Last});
+        return;
+    }
     const auto frame = presenter->PrepareLastFrame();
     if (frame != nullptr) {
         presenter->Present(frame, true);
+    }
+}
+
+void VideoOutDriver::QueueSwap(const SwapRequest& req) {
+    std::scoped_lock lk{swap_mutex};
+    if (req.kind != SwapKind::Game) {
+        // Redraws only fill time the swap thread would otherwise sit idle.
+        if (swap_busy || !swap_requests.empty()) {
+            return;
+        }
+    } else {
+        // Frames whose time has come but are still waiting, because the compositor is holding the
+        // previous present, are replaced by the newest one instead of queueing behind it.
+        const s64 now = SteadyNs();
+        std::erase_if(swap_requests, [&](const SwapRequest& queued) {
+            if (queued.kind == SwapKind::Game && queued.not_before_ns > now) {
+                return false;
+            }
+            if (queued.kind == SwapKind::Game) {
+                LatDropFrame(queued.frame);
+                presenter->DiscardFrame(queued.frame);
+                ++swap_dropped;
+            }
+            return true;
+        });
+    }
+    swap_requests.push_back(req);
+    swap_cv.notify_one();
+}
+
+void VideoOutDriver::SwapThread(std::stop_token token) {
+    Common::SetCurrentThreadName("shadPS4:SwapThread");
+    const bool phase_lock = present_pacing >= 2 && presenter->IsPresentWaitSupported();
+    LOG_INFO(Lib_VideoOut, "Presenting on a separate thread, phase lock {}", phase_lock);
+    while (true) {
+        SwapRequest req;
+        {
+            std::unique_lock lk{swap_mutex};
+            if (!swap_cv.wait(lk, token, [this] { return !swap_requests.empty(); })) {
+                break;
+            }
+            req = swap_requests.front();
+            swap_requests.pop_front();
+            swap_busy = true;
+        }
+        const u64 lat_start = g_lat_file ? Libraries::Kernel::sceKernelGetProcessTime() : 0;
+        switch (req.kind) {
+        case SwapKind::Game:
+            if (const s64 wait = req.not_before_ns - SteadyNs(); wait > 0) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds{wait});
+            }
+            presenter->SetHDR(req.hdr);
+            presenter->Present(req.frame);
+            LatFramePresented(req.frame, lat_start);
+            break;
+        case SwapKind::Blank:
+            presenter->Present(presenter->PrepareBlankFrame(true), false, false);
+            break;
+        case SwapKind::Last:
+            if (const auto frame = presenter->PrepareLastFrame(); frame != nullptr) {
+                presenter->Present(frame, true);
+            }
+            break;
+        }
+        if (phase_lock && req.kind == SwapKind::Game && req.vblank_ns != 0 &&
+            presenter->WaitForPresent(100'000'000)) {
+            TrackDisplay(req.vblank_ns, SteadyNs());
+        }
+        std::scoped_lock lk{swap_mutex};
+        swap_busy = false;
+    }
+    std::scoped_lock lk{swap_mutex};
+    for (const auto& queued : swap_requests) {
+        if (queued.kind == SwapKind::Game) {
+            presenter->DiscardFrame(queued.frame);
+        }
+    }
+}
+
+void VideoOutDriver::TrackDisplay(s64 vblank_ns, s64 display_ns) {
+    // A frame flipped on a vblank reaches the display on the first refresh it is ready for. The
+    // delay is shortest when it is ready just before that refresh, and a refresh longer when it
+    // just misses it. Walk the vblanks later until a frame misses: the frame before the miss
+    // gives the shortest delay that still makes it. Then hold the delay a margin above that,
+    // widening the margin after each miss and narrowing it slowly while none happen.
+    constexpr s64 Ms = 1'000'000;
+    const s64 delay = display_ns - vblank_ns;
+    const s64 prev = std::exchange(last_display_delay_ns, delay);
+    if (prev == 0) {
+        display_margin_ns = 2 * Ms;
+        last_miss_ns = display_ns;
+        return;
+    }
+    if (delay > prev + 6 * Ms) {
+        display_floor_ns = display_floor_ns == 0 ? prev : std::min(display_floor_ns, prev);
+        display_margin_ns = std::min(display_margin_ns + Ms / 2, 6 * Ms);
+        last_miss_ns = display_ns;
+        ++display_misses;
+    } else if (display_ns - last_miss_ns > 60'000 * Ms && display_margin_ns > 3 * Ms / 2) {
+        display_margin_ns -= Ms / 4;
+        last_miss_ns = display_ns;
+    }
+    const s64 error = display_floor_ns == 0 ? Ms : delay - (display_floor_ns + display_margin_ns);
+    vblank_shift_ns.fetch_add(std::clamp(error / 4, -Ms / 2, Ms / 2), std::memory_order_relaxed);
+    if (++display_samples % 300 == 0) {
+        LOG_INFO(Lib_VideoOut,
+                 "PHASELOCK delay={:.1f} floor={:.1f} margin={:.2f} misses={} dropped={} ms",
+                 delay / 1e6, display_floor_ns / 1e6, display_margin_ns / 1e6, display_misses,
+                 swap_dropped);
     }
 }
 
@@ -381,7 +556,56 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     return true;
 }
 
+void VideoOutDriver::PaceGuestFlip() {
+    if (cap_period_ns == 0) {
+        return;
+    }
+    const s64 now = SteadyNs();
+    s64 release;
+    {
+        std::scoped_lock lk{cap_mutex};
+        // The next frame's slot comes after those of the frames still in flight. Start it a lead
+        // before that slot, the lead being learned from how early frames have been ready.
+        const s64 in_flight = static_cast<s64>(cap_submitted + 1 - cap_ready);
+        const s64 slot = cap_slot_ns + (in_flight + 1) * cap_period_ns;
+        release = std::clamp(slot - cap_lead_ns, now, now + cap_period_ns);
+        ++cap_submitted;
+    }
+    if (release > now) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds{release - now});
+    }
+}
+
+s64 VideoOutDriver::NoteFrameReady() {
+    if (cap_period_ns == 0) {
+        return 0;
+    }
+    constexpr s64 TargetEarly = 2'000'000;
+    const s64 now = SteadyNs();
+    std::scoped_lock lk{cap_mutex};
+    ++cap_ready;
+    if (cap_slot_ns == 0) {
+        cap_slot_ns = now;
+        cap_lead_ns = cap_period_ns;
+        return now;
+    }
+    // A frame is shown on its slot, one period after the last one. One that is ready late is
+    // shown when ready and moves the slots with it; one more than half a period late restarts
+    // them.
+    const s64 slot = cap_slot_ns + cap_period_ns;
+    const s64 early = slot - now;
+    if (early < 0) {
+        cap_lead_ns += (TargetEarly - early) / 2;
+    } else {
+        cap_lead_ns += (TargetEarly - early) / 8;
+    }
+    cap_lead_ns = std::clamp<s64>(cap_lead_ns, 0, 3 * cap_period_ns);
+    cap_slot_ns = early < -cap_period_ns / 2 ? now : std::max(slot, now);
+    return cap_slot_ns;
+}
+
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+    const s64 not_before_ns = NoteFrameReady();
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -400,6 +624,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
+            .not_before_ns = not_before_ns,
         });
     }
     request_cv.notify_one();
@@ -491,10 +716,18 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
-                Flip(request);
+                Flip(request, main_port.flip_rate != 0 ? SteadyNs() : 0);
                 FRAME_END;
                 last_flip = std::chrono::steady_clock::now();
             }
+        }
+
+        // Phase lock: move the vblanks toward the display's refreshes a little at a time.
+        if (const s64 shift = vblank_shift_ns.load(std::memory_order_relaxed); shift != 0) {
+            constexpr s64 MaxStep = 500'000;
+            const s64 step = std::clamp(shift, -MaxStep, MaxStep);
+            vblank_shift_ns.fetch_sub(step, std::memory_order_relaxed);
+            timer.Skip(std::chrono::nanoseconds{-step});
         }
 
         {
