@@ -519,6 +519,11 @@ struct GPUSettings {
     // its next frame is done just before its slot, instead of being done early and waiting in a
     // queue, which keeps the input it reads as recent as possible. Read once at boot.
     Setting<u32> frame_cap{0};
+    // A new pipeline of a pass drawn every frame (its render target drawn to in each of the last 8
+    // frames, more than 12 indices, not indirect) compiles on worker threads and its draws are
+    // skipped until it is ready, instead of the GPU thread waiting for the compile. Needs
+    // VK_EXT_vertex_input_dynamic_state.
+    Setting<bool> async_pipelines{true};
     // With inplace_guest_memory 2+, copy GPU-written images back into guest memory on the GPU,
     // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a
     // CPU copy on the completion thread, which end-of-pipe labels queue behind.
@@ -806,6 +811,7 @@ struct GPUSettings {
             GPU_OVERRIDE(barrier_tracker),
             GPU_OVERRIDE(present_pacing),
             GPU_OVERRIDE(frame_cap),
+            GPU_OVERRIDE(async_pipelines),
             GPU_OVERRIDE(inplace_image_downloads),
             GPU_OVERRIDE(draw_pipe),
             GPU_OVERRIDE(async_submit),
@@ -905,7 +911,7 @@ struct GPUSettings {
     clean_sync_peek, readback_offload, inplace_guest_memory, guest_sync_barriers, \
     inplace_image_downloads, draw_pipe, async_submit, tick_query_interval_us, \
     guest_gpu_time_percent, barrier_tracker, present_pacing, \
-    frame_cap
+    frame_cap, async_pipelines
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1253,6 +1259,7 @@ public:
     SETTING_FORWARD(m_gpu, BarrierTracker, barrier_tracker)
     SETTING_FORWARD(m_gpu, PresentPacing, present_pacing)
     SETTING_FORWARD(m_gpu, FrameCap, frame_cap)
+    SETTING_FORWARD_BOOL(m_gpu, AsyncPipelines, async_pipelines)
     SETTING_FORWARD_BOOL(m_gpu, InplaceImageDownloads, inplace_image_downloads)
     SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
     SETTING_FORWARD_BOOL(m_gpu, AsyncSubmit, async_submit)
