@@ -37,6 +37,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
     width = width_;
     height = height_;
     needs_recreation = false;
+    present_id = 0;
 
     Destroy();
 
@@ -132,7 +133,14 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
+    const bool track = instance.IsPresentWaitSupported();
+    const u64 id = present_id + 1;
+    const vk::PresentIdKHR present_id_info = {
+        .swapchainCount = 1,
+        .pPresentIds = &id,
+    };
     const vk::PresentInfoKHR present_info = {
+        .pNext = track ? &present_id_info : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -149,8 +157,19 @@ bool Swapchain::Present() {
     }
 
     frame_index = (frame_index + 1) % image_count;
+    if (track && !needs_recreation) {
+        present_id = id;
+    }
 
     return !needs_recreation;
+}
+
+bool Swapchain::WaitForPresent(u64 timeout_ns) {
+    if (present_id == 0 || needs_recreation) {
+        return false;
+    }
+    return instance.GetDevice().waitForPresentKHR(swapchain, present_id, timeout_ns) ==
+           vk::Result::eSuccess;
 }
 
 void Swapchain::FindPresentFormat() {

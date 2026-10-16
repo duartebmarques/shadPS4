@@ -127,6 +127,11 @@ public:
         return maintenance_8;
     }
 
+    /// Returns true if VK_KHR_present_id and VK_KHR_present_wait are supported
+    bool IsPresentWaitSupported() const {
+        return present_wait;
+    }
+
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
@@ -552,6 +557,7 @@ private:
     bool maintenance_5{};
     bool maintenance_6{};
     bool maintenance_8{};
+    bool present_wait{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};

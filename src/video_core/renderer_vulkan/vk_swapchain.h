@@ -34,6 +34,10 @@ public:
     /// Presents the current image and move to the next one
     bool Present();
 
+    /// Waits until the last presented image reached the display. False if it timed out or present
+    /// wait is unsupported.
+    bool WaitForPresent(u64 timeout_ns);
+
     vk::SurfaceKHR GetSurface() const {
         return surface;
     }
@@ -131,6 +135,7 @@ private:
     u32 image_count = 0;
     u32 image_index = 0;
     u32 frame_index = 0;
+    u64 present_id = 0;
     bool needs_recreation = true;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
