@@ -29,8 +29,14 @@ BarrierTracker::BarrierTracker(bool track_order_) : track_order{track_order_} {
 
 void BarrierTracker::List::AddSorted(std::span<const Interval> ranges,
                                      std::vector<Interval>& scratch) {
+    if (ranges.empty()) {
+        return;
+    }
+    // Intervals ending before the first range stay where they are: only the tail from there is
+    // merged, and accesses mostly land near the end of a buffer's list.
+    const auto first = std::ranges::lower_bound(intervals, ranges.front().start, {}, &Interval::end);
     scratch.clear();
-    scratch.reserve(intervals.size() + ranges.size());
+    scratch.reserve(std::distance(first, intervals.end()) + ranges.size());
     const auto push = [&scratch](const Interval& range) {
         if (!scratch.empty() && range.start <= scratch.back().end) {
             scratch.back().end = std::max(scratch.back().end, range.end);
@@ -38,7 +44,7 @@ void BarrierTracker::List::AddSorted(std::span<const Interval> ranges,
             scratch.push_back(range);
         }
     };
-    auto it = intervals.begin();
+    auto it = first;
     for (const Interval& range : ranges) {
         for (; it != intervals.end() && it->start < range.start; ++it) {
             push(*it);
@@ -48,7 +54,8 @@ void BarrierTracker::List::AddSorted(std::span<const Interval> ranges,
     for (; it != intervals.end(); ++it) {
         push(*it);
     }
-    intervals.swap(scratch);
+    intervals.erase(first, intervals.end());
+    intervals.insert(intervals.end(), scratch.begin(), scratch.end());
 }
 
 void BarrierTracker::Fold(List& list, const std::vector<Interval>& log, std::size_t& folded,
