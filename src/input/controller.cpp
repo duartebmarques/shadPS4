@@ -400,9 +400,13 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
     u64 last_mode_ms = 0;
     // The accelerometer saturates at +-2 G, half a DualShock 4's range, so a hard shake reads
     // flat at the rail. While an axis stays there, continue it with the slope it reached the
-    // rail with, up to the DualShock 4's +-4 G.
+    // rail with, up to the DualShock 4's +-4 G. The firmware subtracts a small per-axis bias in
+    // wrapping 16-bit math, so the rail reads near +-32767 but not exactly, and the same value
+    // from both sides: the direction is the side the axis reached it from.
+    constexpr s16 accel_rail = 32512;
     float accel_last[3]{};
     float accel_slope[3]{};
+    float accel_sign[3]{};
     int accel_saturated[3]{};
     // The motion fed to the game, for analysing gestures: log/motion-<time>.csv, G and deg/s.
     std::FILE* csv = nullptr;
@@ -455,14 +459,18 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
         std::memcpy(raw, data + 24, sizeof(raw));
         float accel_raw[3];
         for (int i = 0; i < 3; ++i) {
-            if (raw[i] != SDL_MAX_SINT16 && raw[i] != SDL_MIN_SINT16) {
+            if (raw[i] > -accel_rail && raw[i] < accel_rail) {
                 accel_slope[i] = raw[i] - accel_last[i];
                 accel_last[i] = raw[i];
                 accel_saturated[i] = 0;
                 accel_raw[i] = raw[i];
                 continue;
             }
-            const float sign = raw[i] > 0 ? 1.0f : -1.0f;
+            if (accel_saturated[i] == 0) {
+                const float from = std::abs(accel_last[i]) > 8192.0f ? accel_last[i] : raw[i];
+                accel_sign[i] = from > 0 ? 1.0f : -1.0f;
+            }
+            const float sign = accel_sign[i];
             const float slope = std::max(sign * accel_slope[i], 0.0f);
             const float value = sign * accel_last[i] + slope * ++accel_saturated[i];
             accel_raw[i] = sign * std::clamp(value, 32768.0f, 65536.0f);
