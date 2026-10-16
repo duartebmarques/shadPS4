@@ -212,7 +212,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR>();
+        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
+        vk::PhysicalDevicePresentIdFeaturesKHR, vk::PhysicalDevicePresentWaitFeaturesKHR>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -359,6 +360,10 @@ bool Instance::CreateDevice() {
         supports_guest_memory_export = fd && dma_buf;
     }
 #endif
+    present_wait = feature_chain.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId &&
+                   feature_chain.get<vk::PhysicalDevicePresentWaitFeaturesKHR>().presentWait &&
+                   add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+                   add_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -578,6 +583,12 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDevicePresentIdFeaturesKHR{
+            .presentId = true,
+        },
+        vk::PhysicalDevicePresentWaitFeaturesKHR{
+            .presentWait = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -631,6 +642,10 @@ bool Instance::CreateDevice() {
     }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+    }
+    if (!present_wait) {
+        device_chain.unlink<vk::PhysicalDevicePresentIdFeaturesKHR>();
+        device_chain.unlink<vk::PhysicalDevicePresentWaitFeaturesKHR>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());

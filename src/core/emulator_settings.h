@@ -510,6 +510,16 @@ struct GPUSettings {
     // them, buffers found by hash and a guest sync point reduced to a counter. Both give the same
     // answers. Read once at boot.
     Setting<u32> barrier_tracker{0};
+    // Presentation. 0: the vblank thread presents each flip itself and waits while the compositor
+    // blocks the present. 1: the vblank thread completes flips on time and a separate thread
+    // presents them; a frame still waiting when a newer one arrives is dropped. 2: as 1, and the
+    // vblanks of games that flip on vblanks are phase-locked to the display (experimental).
+    // Read once at boot.
+    Setting<u32> present_pacing{1};
+    // Frame rate cap in fps, 0 for none. After each guest flip the guest thread is held so that
+    // its next frame is done just before its slot, instead of being done early and waiting in a
+    // queue, which keeps the input it reads as recent as possible. Read once at boot.
+    Setting<u32> frame_cap{0};
     // With inplace_guest_memory 2+, copy GPU-written images back into guest memory on the GPU,
     // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a
     // CPU copy on the completion thread, which end-of-pipe labels queue behind.
@@ -796,6 +806,8 @@ struct GPUSettings {
             GPU_OVERRIDE(inplace_guest_memory),
             GPU_OVERRIDE(guest_sync_barriers),
             GPU_OVERRIDE(barrier_tracker),
+            GPU_OVERRIDE(present_pacing),
+            GPU_OVERRIDE(frame_cap),
             GPU_OVERRIDE(inplace_image_downloads),
             GPU_OVERRIDE(draw_pipe),
             GPU_OVERRIDE(async_submit),
@@ -895,7 +907,8 @@ struct GPUSettings {
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, fast_shader_math, pipeline_sync_budget_ms, \
     one_core_gpu_thread_pin, inplace_guest_memory, guest_sync_barriers, inplace_image_downloads, \
-    draw_pipe, async_submit, tick_query_interval_us, guest_gpu_time_percent, barrier_tracker
+    draw_pipe, async_submit, tick_query_interval_us, guest_gpu_time_percent, barrier_tracker, \
+    present_pacing, frame_cap
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1240,6 +1253,8 @@ public:
     SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
     SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
     SETTING_FORWARD(m_gpu, BarrierTracker, barrier_tracker)
+    SETTING_FORWARD(m_gpu, PresentPacing, present_pacing)
+    SETTING_FORWARD(m_gpu, FrameCap, frame_cap)
     SETTING_FORWARD_BOOL(m_gpu, InplaceImageDownloads, inplace_image_downloads)
     SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
     SETTING_FORWARD_BOOL(m_gpu, AsyncSubmit, async_submit)

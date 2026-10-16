@@ -103,6 +103,18 @@ public:
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
 
+    /// Returns a prepared frame that will not be presented to the free frames.
+    void DiscardFrame(Frame* frame);
+
+    /// Waits until the last presented frame reached the display.
+    bool WaitForPresent(u64 timeout_ns) {
+        return swapchain.WaitForPresent(timeout_ns);
+    }
+
+    bool IsPresentWaitSupported() const {
+        return instance.IsPresentWaitSupported();
+    }
+
 private:
     Frame* GetRenderFrame();
 
