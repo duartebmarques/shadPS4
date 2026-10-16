@@ -16,7 +16,7 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/gr2_online/online_host.h"
-#include "core/libraries/np/np_handler.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/user_settings.h"
 #include "imgui/shadnet_notifications_layer.h"
 
