@@ -1,10 +1,13 @@
 {
   "GPU": {
     "async_submit": true,
+    "barrier_tracker": 1,
     "direct_memory_access_enabled": true,
     "draw_pipe": true,
+    "frame_cap": 30,
     "full_screen": true,
     "full_screen_mode": "Fullscreen",
+    "guest_gpu_time_percent": 50,
     "guest_sync_barriers": true,
     "inplace_guest_memory": 3,
     "rcas_enabled": false,
