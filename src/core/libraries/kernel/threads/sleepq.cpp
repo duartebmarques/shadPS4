@@ -40,7 +40,7 @@ public:
     }
 
 private:
-    static constexpr int SpinCount = 128;
+    static constexpr int SpinCount = 2048;
     static constexpr u32 Free = 0;
     static constexpr u32 Locked = 1;
     static constexpr u32 Contended = 2;
