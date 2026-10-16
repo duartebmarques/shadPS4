@@ -1,6 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <deque>
+#include <mutex>
+#include <string>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -233,12 +241,65 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+namespace {
+std::atomic<u64> g_lat_pad_us{0};
+std::mutex g_lat_mutex;
+std::deque<std::pair<u64, u64>> g_lat_guest;
+FILE* g_lat_file = [] {
+    const char* path = std::getenv("SHAD_LAT_LOG");
+    const char* home = std::getenv("HOME");
+    const std::string fallback = std::string{home ? home : "."} + "/.local/share/shadPS4/log/lat-" +
+                                 std::to_string(std::time(nullptr)) + ".txt";
+    FILE* f = std::fopen(path ? path : fallback.c_str(), "w");
+    if (f) {
+        std::fputs("guest_flip_us pad_read_us present_start_us present_end_us queued\n", f);
+    }
+    return f;
+}();
+} // namespace
+
+void LatNotePadRead() {
+    if (g_lat_file) {
+        g_lat_pad_us.store(Libraries::Kernel::sceKernelGetProcessTime(), std::memory_order_relaxed);
+    }
+}
+
+void LatNoteGuestFlip() {
+    if (g_lat_file) {
+        std::scoped_lock lk{g_lat_mutex};
+        g_lat_guest.emplace_back(Libraries::Kernel::sceKernelGetProcessTime(),
+                                 g_lat_pad_us.load(std::memory_order_relaxed));
+        if (g_lat_guest.size() > 64) {
+            g_lat_guest.pop_front();
+        }
+    }
+}
+
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
+    const u64 lat_start = g_lat_file ? Libraries::Kernel::sceKernelGetProcessTime() : 0;
     presenter->Present(req.frame);
+    if (g_lat_file && req.index != -1) {
+        const u64 lat_end = Libraries::Kernel::sceKernelGetProcessTime();
+        std::pair<u64, u64> guest{0, 0};
+        size_t queued = 0;
+        {
+            std::scoped_lock lk{g_lat_mutex};
+            if (!g_lat_guest.empty()) {
+                guest = g_lat_guest.front();
+                g_lat_guest.pop_front();
+            }
+            queued = g_lat_guest.size();
+        }
+        std::fprintf(g_lat_file, "%llu %llu %llu %llu %zu\n",
+                     static_cast<unsigned long long>(guest.first),
+                     static_cast<unsigned long long>(guest.second),
+                     static_cast<unsigned long long>(lat_start),
+                     static_cast<unsigned long long>(lat_end), queued);
+    }
 
     // Update flip status.
     auto* port = req.port;

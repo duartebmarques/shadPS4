@@ -17,6 +17,9 @@ struct Frame;
 
 namespace Libraries::VideoOut {
 
+void LatNotePadRead();
+void LatNoteGuestFlip();
+
 struct VideoOutPort {
     SceVideoOutResolutionStatus resolution;
     std::array<VideoOutBuffer, MaxDisplayBuffers> buffer_slots;
