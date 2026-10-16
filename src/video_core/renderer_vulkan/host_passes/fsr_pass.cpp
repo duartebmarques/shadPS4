@@ -8,6 +8,7 @@
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/skipcache/skipcache.h"
 
 #define A_CPU
 #include "core/debug_state.h"
@@ -236,6 +237,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             }};
 
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, easu_pipeline.get());
+            VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
                                         set_writes);
             cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
@@ -311,6 +313,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             }};
 
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, rcas_pipeline.get());
+            VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
                                         set_writes);
             cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
@@ -356,6 +359,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         }};
 
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, easu_pipeline.get());
+        VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
         cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
                                     set_writes);
         cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,

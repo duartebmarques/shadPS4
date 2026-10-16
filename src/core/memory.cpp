@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -26,6 +31,8 @@ MemoryManager::MemoryManager() {
                         VirtualMemoryArea{region.lower(), region.upper() - region.lower()});
         LOG_INFO(Kernel_Vmm, "{:#x} - {:#x}", region.lower(), region.upper());
     }
+    RefreshVmaBounds();
+    backing_write_memo_ = EmulatorSettings.IsBackingWriteMemo();
 
     // Pre-initialize direct backing
     auto total_size = ORBIS_KERNEL_TOTAL_MEM_DEV_PRO;
@@ -38,6 +45,7 @@ MemoryManager::MemoryManager() {
         total_size += extra_fmem * 1_MB;
     }
     total_direct_size = total_size;
+    direct_backing_limit = total_size;
     dmem_map.clear();
     dmem_map.emplace(0, PhysicalMemoryArea{0, total_direct_size});
 
@@ -99,13 +107,7 @@ void MemoryManager::SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1
              total_flexible_size, total_direct_size);
 }
 
-u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
-    static constexpr u64 MinSizeToClamp = 1_GB;
-    // Dont bother with clamping if the size is small so we dont pay a map lookup on every buffer.
-    if (size < MinSizeToClamp) {
-        return size;
-    }
-
+u64 MemoryManager::ClampRangeSizeSlow(VAddr virtual_addr, u64 size) {
     std::shared_lock lk{mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
                virtual_addr);
@@ -161,27 +163,253 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+// One resolved physical chunk of a backed area: guest [base, end) maps to
+// backing while the map generation still equals generation.
+struct BackingChunkMemo {
+    u64 generation;
+    VAddr base;
+    VAddr end;
+    u8* backing;
+};
+struct BackingWriteMemo {
+    std::array<BackingChunkMemo, 4> entries{};
+    size_t next{};
+    u64 calls{};
+    u64 hits{};
+    u64 hit_bytes{};
+    u64 miss_bytes{};
+    u64 multi{};
+};
+static constinit thread_local BackingWriteMemo tls_backing_write_memo{};
+
+static std::atomic<BackingWriteObserver> g_backing_observer{nullptr};
+static std::atomic<void*> g_backing_observer_user{nullptr};
+
+void SetBackingWriteObserver(BackingWriteObserver observer, void* user) {
+    g_backing_observer_user.store(user, std::memory_order_release);
+    g_backing_observer.store(observer, std::memory_order_release);
+}
+
+static std::atomic<void (*)()> g_unmap_drain{nullptr};
+// Open push windows: incremented by ResolveBackingSpans while it still holds
+// the shared lock, closed by EndBackingPush after the jobs are queued. The
+// holder never blocks between the two (queueing is lock-free), so the unmap
+// side's bounded wait cannot deadlock. The lane's unsafe mode passes
+// open_push_window=false and accepts the unmap race.
+static std::atomic<u32> g_backing_push_windows{0};
+
+void MemoryManager::EndBackingPush() {
+    g_backing_push_windows.fetch_sub(1, std::memory_order_release);
+}
+
+void MemoryManager::RegisterUnmapDrain(void (*drain)()) {
+    g_unmap_drain.store(drain, std::memory_order_release);
+}
+
+u32 MemoryManager::ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out,
+                                       u32 max_spans, bool open_push_window) {
+    // Shared lock unless a GuestCopyScope already holds it (see GuestCopyScope); the vma map
+    // and phys_areas are stable under either hold.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!tls_in_guest_copy_scope) {
+        lk.lock();
+    }
+    // Chunk memo, keyed on the map generation: the
+    // stream lane resolves thousands of small ranges per frame and nearly all
+    // of them land in the same few backing chunks.
+    static constexpr size_t NumMemoEntries = 4;
+    static thread_local std::array<BackingChunkMemo, NumMemoEntries> memo{};
+    static thread_local size_t memo_next = 0;
+    for (const auto& entry : memo) {
+        if (entry.generation == vma_generation && virtual_addr >= entry.base &&
+            virtual_addr + size <= entry.end) {
+            out[0] = BackingSpan{entry.backing + (virtual_addr - entry.base), size};
+            if (open_push_window) {
+                g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
+            }
+            return 1;
+        }
+    }
+
+    u32 num_spans = 0;
+    VAddr addr = virtual_addr;
+    u64 remaining = size;
+    auto vma_it = FindVMA(addr);
+    while (remaining != 0) {
+        const auto& vma = vma_it->second;
+        if (!vma.Overlaps(addr, 1) || !HasPhysicalBacking(vma)) {
+            return 0;
+        }
+        u64 start_in_vma = addr - vma_it->first;
+        auto phys = std::prev(vma.phys_areas.upper_bound(start_in_vma));
+        for (; remaining != 0 && phys != vma.phys_areas.end(); ++phys) {
+            if (start_in_vma < phys->first) {
+                return 0; // hole between physical areas
+            }
+            const u64 start_in_dma = start_in_vma - phys->first;
+            if (start_in_dma >= phys->second.size) {
+                continue;
+            }
+            u8* backing = impl.BackingBase() + phys->second.base + start_in_dma;
+            const u64 chunk = std::min<u64>(remaining, phys->second.size - start_in_dma);
+            if (num_spans == max_spans) {
+                return 0;
+            }
+            out[num_spans++] = BackingSpan{backing, chunk};
+            if (num_spans == 1 && chunk == size) {
+                memo[memo_next] = BackingChunkMemo{
+                    .generation = vma_generation,
+                    .base = addr - start_in_dma,
+                    .end = addr - start_in_dma + phys->second.size,
+                    .backing = backing - start_in_dma,
+                };
+                memo_next = (memo_next + 1) % NumMemoEntries;
+            }
+            remaining -= chunk;
+            addr += chunk;
+            start_in_vma += chunk;
+        }
+        if (remaining != 0) {
+            ++vma_it;
+            if (vma_it->first != addr) {
+                return 0;
+            }
+        }
+    }
+    // Opened while the shared lock is still held; see g_backing_push_windows.
+    if (open_push_window) {
+        g_backing_push_windows.fetch_add(1, std::memory_order_acquire);
+    }
+    return num_spans;
+}
+
+namespace {
+// A memcpy of a runtime 4 or 8 bytes is two overlapping stores in glibc. GPU labels (EOP/EOS
+// fences) go through TryWriteBacking; a thread preempted between the two stores could write
+// the label again after the game had already moved on and freed its block. Write such small
+// aligned values with one store. Ported from bbport (deadinside28/bloodborne_pc).
+inline void CopyToBacking(void* dst, const void* src, u64 size) {
+    const auto addr = reinterpret_cast<uintptr_t>(dst);
+    if (size == 8 && (addr & 7) == 0) {
+        u64 v;
+        std::memcpy(&v, src, 8);
+        __atomic_store_n(static_cast<u64*>(dst), v, __ATOMIC_RELEASE);
+    } else if (size == 4 && (addr & 3) == 0) {
+        u32 v;
+        std::memcpy(&v, src, 4);
+        __atomic_store_n(static_cast<u32*>(dst), v, __ATOMIC_RELEASE);
+    } else {
+        std::memcpy(dst, src, size);
+    }
+}
+} // Anonymous namespace
+
+std::optional<PAddr> MemoryManager::DirectPhysOf(VAddr address, u64 size) {
+    // Called from the GPU thread, which a writer may be waiting on (rasterizer unmap paths):
+    // never block for long. Without the answer the caller keeps the copying path.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!tls_in_guest_copy_scope &&
+        !lk.try_lock_until(std::chrono::steady_clock::now() + std::chrono::milliseconds{1})) {
+        return std::nullopt;
+    }
+    if (!IsValidMapping(address, size)) {
+        return std::nullopt;
+    }
+    const auto vma_handle = FindVMA(address);
+    if (vma_handle == vma_map.end()) {
+        return std::nullopt;
+    }
+    const auto& vma = vma_handle->second;
+    if ((vma.type != VMAType::Direct && vma.type != VMAType::Pooled) ||
+        !vma.Contains(address, size) || vma.phys_areas.empty()) {
+        return std::nullopt;
+    }
+    const u64 offset_in_vma = address - vma.base;
+    const auto phys_handle = std::prev(vma.phys_areas.upper_bound(offset_in_vma));
+    const u64 offset_in_area = offset_in_vma - phys_handle->first;
+    if (offset_in_area + size > phys_handle->second.size) {
+        return std::nullopt;
+    }
+    return phys_handle->second.base + offset_in_area;
+}
+
+void MemoryManager::InstallGuestMemoryChunks(AddressSpace::ChunkAllocator alloc,
+                                             AddressSpace::ChunkRelease release, void* user) {
+    std::scoped_lock lk{mutex};
+    std::vector<std::pair<PAddr, u64>> in_use;
+    for (const auto& [base, vma] : vma_map) {
+        if (vma.type != VMAType::Direct && vma.type != VMAType::Pooled) {
+            continue;
+        }
+        for (const auto& [offset, area] : vma.phys_areas) {
+            in_use.emplace_back(area.base, area.size);
+        }
+    }
+    impl.InstallChunks(direct_backing_limit, alloc, release, user, in_use);
+}
+
+bool MemoryManager::TryWriteLabel(VAddr address, u64 value, u32 num_bytes) {
+    void* const ptr = reinterpret_cast<void*>(address);
+    // The mutex is recursive-shared: TryWriteBacking may take it again below. Labels are
+    // written by the scheduler's completion thread, which must not stall behind a writer that
+    // waits on the GPU: past a short wait, store through the guest address as the CP did.
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!lk.try_lock_until(std::chrono::steady_clock::now() + std::chrono::milliseconds{2})) {
+        CopyToBacking(ptr, &value, num_bytes);
+        return true;
+    }
+    if (!IsValidMapping(address, num_bytes)) {
+        return false;
+    }
+    if (TryWriteBacking(ptr, &value, num_bytes)) {
+        return true;
+    }
+    // No physical backing: store through the guest address, as one store.
+    CopyToBacking(ptr, &value, num_bytes);
+    return true;
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
-    std::shared_lock lk{mutex};
+    // Shared lock unless a GuestCopyScope already holds it (see GuestCopyScope).
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!tls_in_guest_copy_scope) {
+        lk.lock();
+    }
+    // The observer runs before any byte moves, so an epoch consumer that reads
+    // its counters after the bytes always sees the advanced value.
+    if (const auto observer = g_backing_observer.load(std::memory_order_acquire)) {
+        observer(g_backing_observer_user.load(std::memory_order_acquire), virtual_addr, size);
+    }
+    if (backing_write_memo_) {
+        // Per-thread chunk memo, revalidated by the map generation under the shared lock; the
+        // map only mutates under the exclusive lock.
+        auto& memo = tls_backing_write_memo;
+        ++memo.calls;
+        for (const auto& e : memo.entries) {
+            if (e.generation == vma_generation && virtual_addr >= e.base &&
+                virtual_addr + size <= e.end) {
+                ++memo.hits;
+                memo.hit_bytes += size;
+                CopyToBacking(e.backing + (virtual_addr - e.base), data, size);
+                return true;
+            }
+        }
+        memo.miss_bytes += size;
+    }
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
 
-    std::vector<VirtualMemoryArea> vmas_to_write;
-    auto current_vma = FindVMA(virtual_addr);
-    while (current_vma->second.Overlaps(virtual_addr, size)) {
-        if (!HasPhysicalBacking(current_vma->second)) {
-            break;
-        }
-        vmas_to_write.emplace_back(current_vma->second);
-        current_vma++;
-    }
-
-    if (vmas_to_write.empty()) {
+    // The shared lock held for this function, or the outer scope's, keeps the map and therefore
+    // this iterator stable.
+    const u64 total = size;
+    auto vma_it = FindVMA(virtual_addr);
+    if (!vma_it->second.Overlaps(virtual_addr, total) || !HasPhysicalBacking(vma_it->second)) {
         return false;
     }
 
-    for (auto& vma : vmas_to_write) {
+    do {
+        const VirtualMemoryArea& vma = vma_it->second;
         auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;
         auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
         for (; phys_handle != vma.phys_areas.end(); phys_handle++) {
@@ -192,13 +420,37 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
-            memcpy(backing, data, copy_size);
+            if (backing_write_memo_ && size == total) {
+                // Recorded only when the whole write sits inside this chunk:
+                // a write starting in a hole of a sparse map wraps its size.
+                const VAddr chunk_base = vma.base + phys_handle->first;
+                const VAddr chunk_end = chunk_base + phys_handle->second.size;
+                auto& memo = tls_backing_write_memo;
+                if (virtual_addr >= chunk_base && virtual_addr + total <= chunk_end) {
+                    memo.entries[memo.next] =
+                        BackingChunkMemo{vma_generation, chunk_base, chunk_end,
+                                         impl.BackingBase() + phys_handle->second.base};
+                    memo.next = (memo.next + 1) % memo.entries.size();
+                } else {
+                    ++memo.multi;
+                }
+            }
+            CopyToBacking(backing, data, copy_size);
             data = static_cast<const u8*>(data) + copy_size;
             size -= copy_size;
         }
-    }
+        ++vma_it;
+    } while (size != 0 && vma_it->second.Overlaps(virtual_addr, total) &&
+             HasPhysicalBacking(vma_it->second));
 
     return true;
+}
+
+MemoryManager::BackingWriteStats MemoryManager::DrainBackingWriteStats() {
+    auto& memo = tls_backing_write_memo;
+    const BackingWriteStats out{memo.calls, memo.hits, memo.hit_bytes, memo.miss_bytes, memo.multi};
+    memo.calls = memo.hits = memo.hit_bytes = memo.miss_bytes = memo.multi = 0;
+    return out;
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
@@ -1006,6 +1258,16 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
 }
 
 s32 MemoryManager::UnmapMemoryImpl(VAddr virtual_addr, u64 size) {
+    // Queued stream-lane jobs hold backing pointers into this mapping. Wait out open push
+    // windows first - a drain snapshot taken now would miss a span already resolved but not
+    // yet queued - then drain. Bounded: the holder never takes this mutex between resolve and
+    // queue.
+    while (g_backing_push_windows.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    }
+    if (const auto drain = g_unmap_drain.load(std::memory_order_acquire)) {
+        drain();
+    }
     u64 unmapped_bytes = 0;
     do {
         auto it = FindVMA(virtual_addr + unmapped_bytes);
@@ -1531,6 +1793,19 @@ VAddr MemoryManager::SearchFree(VAddr virtual_addr, u64 size, u32 alignment) {
     return -1;
 }
 
+void MemoryManager::RefreshVmaBounds() {
+    // Any structural change to the map invalidates every cached lookup.
+    ++vma_generation;
+    if (vma_map.empty()) {
+        vma_span_begin = 0;
+        vma_span_end = 0;
+        return;
+    }
+    const auto last = std::prev(vma_map.end());
+    vma_span_begin = vma_map.begin()->first;
+    vma_span_end = last->first + last->second.size;
+}
+
 MemoryManager::VMAHandle MemoryManager::MergeAdjacent(VMAMap& handle_map, VMAHandle iter) {
     const auto next_vma = std::next(iter);
     if (next_vma != handle_map.end() && iter->second.CanMergeWith(next_vma->second)) {
@@ -1555,6 +1830,7 @@ MemoryManager::VMAHandle MemoryManager::MergeAdjacent(VMAMap& handle_map, VMAHan
         }
     }
 
+    RefreshVmaBounds();
     return iter;
 }
 
@@ -1578,6 +1854,9 @@ MemoryManager::PhysHandle MemoryManager::MergeAdjacent(PhysMap& handle_map, Phys
 }
 
 MemoryManager::VMAHandle MemoryManager::CarveVMA(VAddr virtual_addr, u64 size) {
+    // Bump here too: the whole-area case below returns without splitting, so
+    // Split/MergeAdjacent alone would miss a type or protection change.
+    ++vma_generation;
     auto vma_handle = FindVMA(virtual_addr);
 
     const VirtualMemoryArea& vma = vma_handle->second;
@@ -1670,7 +1949,9 @@ MemoryManager::VMAHandle MemoryManager::Split(VMAHandle vma_handle, u64 offset_i
         old_vma.phys_areas = old_vma_phys_areas;
     }
 
-    return vma_map.emplace_hint(std::next(vma_handle), new_vma.base, new_vma);
+    const auto inserted = vma_map.emplace_hint(std::next(vma_handle), new_vma.base, new_vma);
+    RefreshVmaBounds();
+    return inserted;
 }
 
 MemoryManager::PhysHandle MemoryManager::Split(PhysMap& map, PhysHandle phys_handle,

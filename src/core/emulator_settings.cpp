@@ -232,6 +232,58 @@ void EmulatorSettingsImpl::ClearGameSpecificOverrides() {
     ClearGroupOverrides(m_vulkan);
 }
 
+namespace {
+// The Qt launcher keeps the gyro toggles in its private "GR2Fork" section under camelCase names,
+// in both config.json and the per-game files. That section is treated as the canonical source
+// when present, and the emulator mirrors its own values back into it on save.
+constexpr std::pair<const char*, const char*> kLauncherGyroKeys[] = {
+    {"gyroSwapYawRoll", "gyro_swap_yaw_roll"},
+    {"gyroInvertYaw", "gyro_invert_yaw"},
+    {"gyroInvertX", "gyro_invert_x"},
+    {"gyroInvertRoll", "gyro_invert_roll"},
+};
+
+json TranslateLauncherGyroKeys(const json& root) {
+    json out = json::object();
+    if (!root.contains("GR2Fork") || !root.at("GR2Fork").is_object()) {
+        return out;
+    }
+    const json& section = root.at("GR2Fork");
+    for (const auto& [launcher_key, key] : kLauncherGyroKeys) {
+        if (section.contains(launcher_key) && section.at(launcher_key).is_boolean()) {
+            out[key] = section.at(launcher_key);
+        }
+    }
+    return out;
+}
+
+void MirrorGyroKeysForLauncher(json& root, const json& input) {
+    for (const auto& [launcher_key, key] : kLauncherGyroKeys) {
+        if (input.contains(key)) {
+            root["GR2Fork"][launcher_key] = input.at(key);
+        }
+    }
+}
+
+// Merges the freshly serialized sections over the file's current contents so keys and sections
+// unknown to this build (the launcher's) survive a save. A key that is null in fresh is removed.
+json MergeOverExisting(const std::filesystem::path& path, const json& fresh) {
+    json existing = json::object();
+    if (std::ifstream existingIn{path}; existingIn.good()) {
+        try {
+            existingIn >> existing;
+        } catch (...) {
+            existing = json::object();
+        }
+    }
+    if (!existing.is_object()) {
+        existing = json::object();
+    }
+    existing.merge_patch(fresh); // overwrites known keys, keeps unknown ones
+    return existing;
+}
+} // namespace
+
 bool EmulatorSettingsImpl::Save(const std::string& serial) {
     try {
         if (!serial.empty()) {
@@ -241,45 +293,73 @@ bool EmulatorSettingsImpl::Save(const std::string& serial) {
 
             json j = json::object();
 
+            // An override is compared against config.json as it is on disk, so each group is saved
+            // from a copy that takes its base values from the file.
+            const auto configPath =
+                Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "config.json";
+            json global = MergeOverExisting(configPath, json::object());
+            global["Input"].update(TranslateLauncherGyroKeys(global));
+            const auto withDiskBase = [&global](auto group, const char* section) {
+                json base = group;
+                base.update(global.value(section, json::object()));
+                base.get_to(group);
+                return group;
+            };
+
             json generalObj = json::object();
-            SaveGroupGameSpecific(m_general, generalObj);
+            SaveGroupGameSpecific(withDiskBase(m_general, "General"), generalObj);
 
             json networkObj = json::object();
-            SaveGroupGameSpecific(m_network, networkObj);
+            SaveGroupGameSpecific(withDiskBase(m_network, "Network"), networkObj);
             j["Network"] = networkObj;
 
+            json existing = MergeOverExisting(path, json::object());
+            if (existing["General"].is_object()) {
+                SyncLegacyNetworkKeys(existing["General"], generalObj, networkObj);
+            }
             j["General"] = generalObj;
 
             json logObj = json::object();
-            SaveGroupGameSpecific(m_log, logObj);
+            SaveGroupGameSpecific(withDiskBase(m_log, "Log"), logObj);
             j["Log"] = logObj;
 
             json debugObj = json::object();
-            SaveGroupGameSpecific(m_debug, debugObj);
+            SaveGroupGameSpecific(withDiskBase(m_debug, "Debug"), debugObj);
             j["Debug"] = debugObj;
 
             json inputObj = json::object();
-            SaveGroupGameSpecific(m_input, inputObj);
+            SaveGroupGameSpecific(withDiskBase(m_input, "Input"), inputObj);
             j["Input"] = inputObj;
 
             json audioObj = json::object();
-            SaveGroupGameSpecific(m_audio, audioObj);
+            SaveGroupGameSpecific(withDiskBase(m_audio, "Audio"), audioObj);
             j["Audio"] = audioObj;
 
             json gpuObj = json::object();
-            SaveGroupGameSpecific(m_gpu, gpuObj);
+            SaveGroupGameSpecific(withDiskBase(m_gpu, "GPU"), gpuObj);
             j["GPU"] = gpuObj;
 
             json vulkanObj = json::object();
-            SaveGroupGameSpecific(m_vulkan, vulkanObj);
+            SaveGroupGameSpecific(withDiskBase(m_vulkan, "Vulkan"), vulkanObj);
             j["Vulkan"] = vulkanObj;
+
+            // The launcher's copy of a gyro toggle is written or removed along with ours.
+            MirrorGyroKeysForLauncher(j, j["Input"]);
+            json merged = MergeOverExisting(path, j);
+            // redzone_patches replaces the legacy red-zone section, which Load folds into it.
+            merged.erase("WindowsGuestRedZoneProtection");
+            for (const auto& [section, values] : j.items()) {
+                if (merged[section].empty()) {
+                    merged.erase(section);
+                }
+            }
 
             std::ofstream out(path);
             if (!out) {
                 LOG_ERROR(Config, "Failed to open game config for writing: {}", path.string());
                 return false;
             }
-            out << std::setw(2) << j;
+            out << std::setw(2) << merged;
             return !out.fail();
 
         } else {
@@ -299,28 +379,12 @@ bool EmulatorSettingsImpl::Save(const std::string& serial) {
             j["GPU"] = m_gpu;
             j["Vulkan"] = m_vulkan;
 
-            // Read the existing file so we can preserve keys unknown to this build
-            json existing = json::object();
-            if (std::ifstream existingIn{path}; existingIn.good()) {
-                try {
-                    existingIn >> existing;
-                } catch (...) {
-                    existing = json::object();
-                }
-            }
-
-            // Merge: update each section's known keys, but leave unknown keys intact
-            for (auto& [section, val] : j.items()) {
-                if (existing.contains(section) && existing[section].is_object() && val.is_object())
-                    existing[section].update(val); // overwrites known keys, keeps unknown ones
-                else
-                    existing[section] = val;
-            }
-            if (existing["General"].is_object()) {
-                for (const auto& item : m_network.GetOverrideableFields()) {
-                    existing["General"].erase(item.key);
-                }
-            }
+            // Preserve keys unknown to this build and keep the launcher's copy of the gyro
+            // toggles in step with ours.
+            json existing = MergeOverExisting(path, j);
+            MirrorGyroKeysForLauncher(existing, existing["Input"]);
+            // Builds without the Network section read the network settings from General.
+            existing["General"].update(j["Network"]);
 
             std::ofstream out(path);
             if (!out) {
@@ -347,6 +411,15 @@ void EmulatorSettingsImpl::MigrateNetworkKeys(const json& general, const json& n
     }
     if (found) {
         m_network = current.get<NetworkSettings>();
+    }
+}
+
+void EmulatorSettingsImpl::SyncLegacyNetworkKeys(const json& old_general, json& general,
+                                                 const json& network) {
+    for (const auto& [key, value] : network.items()) {
+        if (old_general.contains(key)) {
+            general[key] = value;
+        }
     }
 }
 
@@ -385,6 +458,12 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 mergeGroup(m_audio, "Audio");
                 mergeGroup(m_gpu, "GPU");
                 mergeGroup(m_vulkan, "Vulkan");
+
+                if (const json launcher = TranslateLauncherGyroKeys(gj); !launcher.empty()) {
+                    json current = m_input;
+                    current.update(launcher);
+                    m_input = current.get<InputSettings>();
+                }
             } else {
                 if (std::filesystem::exists(Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
                                             "config.toml")) {
@@ -466,6 +545,8 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 ApplyGroupOverrides(m_debug, gj.at("Debug"), changed);
             if (gj.contains("Input"))
                 ApplyGroupOverrides(m_input, gj.at("Input"), changed);
+            if (const json launcher = TranslateLauncherGyroKeys(gj); !launcher.empty())
+                ApplyGroupOverrides(m_input, launcher, changed);
             if (gj.contains("Audio"))
                 ApplyGroupOverrides(m_audio, gj.at("Audio"), changed);
             if (gj.contains("GPU"))
@@ -476,10 +557,12 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
             // Backwards compat for red-zone setting
             if (gj.contains("WindowsGuestRedZoneProtection") &&
                 gj["WindowsGuestRedZoneProtection"].contains(
-                    "windows_guest_red_zone_protection_mode")) {
-                m_general.redzone_patches = static_cast<bool>(
+                    "windows_guest_red_zone_protection_mode") &&
+                !gj.contains(json::json_pointer("/General/redzone_patches"))) {
+                m_general.redzone_patches.set(
                     gj["WindowsGuestRedZoneProtection"]["windows_guest_red_zone_protection_mode"] ==
-                    "StaticPatching");
+                        "StaticPatching",
+                    true);
             }
 
             PrintChangedSummary(changed);
@@ -587,6 +670,10 @@ bool EmulatorSettingsImpl::TransferSettings() {
         setFromToml(s.use_special_pad, input, "useSpecialPad");
         setFromToml(s.special_pad_class, input, "specialPadClass");
         setFromToml(s.motion_controls_enabled, input, "isMotionControlsEnabled");
+        setFromToml(s.gyro_swap_yaw_roll, input, "gyroSwapYawRoll");
+        setFromToml(s.gyro_invert_yaw, input, "gyroInvertYaw");
+        setFromToml(s.gyro_invert_x, input, "gyroInvertX");
+        setFromToml(s.gyro_invert_roll, input, "gyroInvertRoll");
         setFromToml(s.use_unified_input_config, input, "useUnifiedInputConfig");
         setFromToml(s.background_controller_input, input, "backgroundControllerInput");
         setFromToml(s.ime_accessibility_enabled, input, "imeAccessibilityEnabled");
@@ -761,4 +848,61 @@ std::vector<std::string> EmulatorSettingsImpl::GetAllOverrideableKeys() const {
     addGroup(m_gpu.GetOverrideableFields());
     addGroup(m_vulkan.GetOverrideableFields());
     return keys;
+}
+
+json EmulatorSettingsImpl::GetGroupValues(std::string_view section) const {
+    return VisitGroup(*this, section, [this]<typename Group>(const Group& group) -> json {
+        if (m_configMode == ConfigMode::Clean) {
+            return Group{};
+        }
+        json values = group;
+        if (m_configMode == ConfigMode::Default) {
+            for (const auto& item : group.GetOverrideableFields()) {
+                values[item.key] = item.get_for_save(&group);
+            }
+        }
+        return values;
+    });
+}
+
+bool EmulatorSettingsImpl::SetGroupValues(std::string_view section, const json& values,
+                                          bool specific) {
+    try {
+        return VisitGroup(*this, section, [&](auto& group) {
+            json current = group;
+            // Only the overrideable fields take a per-game value.
+            json writable = current;
+            if (specific) {
+                writable = json::object();
+                SaveGroupGameSpecific(group, writable);
+            }
+            json accepted = json::object();
+            for (const auto& [key, value] : values.items()) {
+                if (!writable.contains(key)) {
+                    continue;
+                }
+                const json& old = current.at(key);
+                if (value.type() != old.type() && !(value.is_number() && old.is_number())) {
+                    LOG_ERROR(Config, "{}.{} takes a {}, not a {}", section, key, old.type_name(),
+                              value.type_name());
+                    return false;
+                }
+                accepted[key] = value;
+            }
+            if (specific) {
+                std::vector<std::string> changed;
+                ApplyGroupOverrides(group, accepted, changed);
+            } else {
+                // Converted into a copy so that a failed conversion leaves the group as it was.
+                current.update(accepted);
+                auto updated = group;
+                current.get_to(updated);
+                group = std::move(updated);
+            }
+            return accepted.size() == values.size();
+        });
+    } catch (const std::exception& e) {
+        LOG_ERROR(Config, "Error setting {} values: {}", section, e.what());
+        return false;
+    }
 }

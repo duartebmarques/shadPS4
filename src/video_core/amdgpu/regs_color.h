@@ -114,6 +114,62 @@ struct ColorBufferMask {
     }
 };
 
+// Draw-rate table built at compile time from the same MRT table and
+// RemapSwizzle, so the mapping stays defined in one place. comp_swap (2 bits)
+// and format (5 bits) make the index 0..127 by construction, so Swizzle() needs
+// no bounds check. Zero-component format codes keep the default entry: skipping
+// them keeps the builder off mrt_swizzles[...][components - 1 == 0xFFFFFFFF],
+// and operator bool() rejects code 0 while no color target carries the others.
+namespace detail {
+consteval std::array<CompMapping, 128> BuildColorSwizzleLut() {
+    // clang-format off
+    constexpr std::array<std::array<CompMapping, 4>, 4> mrt_swizzles{{
+        // Standard
+        std::array<CompMapping, 4>{{
+            {.r = CompSwizzle::Red, .g = CompSwizzle::Zero, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Red, .g = CompSwizzle::Green, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Red, .g = CompSwizzle::Green, .b = CompSwizzle::Blue, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Red, .g = CompSwizzle::Green, .b = CompSwizzle::Blue, .a = CompSwizzle::Alpha},
+        }},
+        // Alternate
+        std::array<CompMapping, 4>{{
+            {.r = CompSwizzle::Green, .g = CompSwizzle::Zero, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Red, .g = CompSwizzle::Alpha, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Red, .g = CompSwizzle::Green, .b = CompSwizzle::Alpha, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Blue, .g = CompSwizzle::Green, .b = CompSwizzle::Red, .a = CompSwizzle::Alpha},
+        }},
+        // StandardReverse
+        std::array<CompMapping, 4>{{
+            {.r = CompSwizzle::Blue, .g = CompSwizzle::Zero, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Green, .g = CompSwizzle::Red, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Blue, .g = CompSwizzle::Green, .b = CompSwizzle::Red, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Alpha, .g = CompSwizzle::Blue, .b = CompSwizzle::Green, .a = CompSwizzle::Red},
+        }},
+        // AlternateReverse
+        std::array<CompMapping, 4>{{
+            {.r = CompSwizzle::Alpha, .g = CompSwizzle::Zero, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Alpha, .g = CompSwizzle::Red, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Alpha, .g = CompSwizzle::Green, .b = CompSwizzle::Red, .a = CompSwizzle::Zero},
+            {.r = CompSwizzle::Alpha, .g = CompSwizzle::Red, .b = CompSwizzle::Green, .a = CompSwizzle::Blue},
+        }},
+    }};
+    // clang-format on
+    std::array<CompMapping, 128> lut{};
+    for (u32 swap = 0; swap < 4; ++swap) {
+        for (u32 fmt = 0; fmt < 32; ++fmt) {
+            const u32 components = static_cast<u32>(NUM_COMPONENTS[fmt]);
+            if (components == 0) {
+                continue;
+            }
+            lut[swap << 5 | fmt] =
+                RemapSwizzle(DataFormat(fmt), mrt_swizzles[swap][components - 1]);
+        }
+    }
+    return lut;
+}
+inline constexpr auto kColorSwizzleLut = BuildColorSwizzleLut();
+} // namespace detail
+
 struct ColorBuffer {
     enum class EndianSwap : u32 {
         None = 0,
@@ -260,42 +316,7 @@ struct ColorBuffer {
     }
 
     CompMapping Swizzle() const {
-        // clang-format off
-        static constexpr std::array<std::array<CompMapping, 4>, 4> mrt_swizzles{{
-            // Standard
-            std::array<CompMapping, 4>{{
-                {.r = CompSwizzle::Red, .g = CompSwizzle::Zero, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Red, .g = CompSwizzle::Green, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Red, .g = CompSwizzle::Green, .b = CompSwizzle::Blue, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Red, .g = CompSwizzle::Green, .b = CompSwizzle::Blue, .a = CompSwizzle::Alpha},
-            }},
-            // Alternate
-            std::array<CompMapping, 4>{{
-                {.r = CompSwizzle::Green, .g = CompSwizzle::Zero, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Red, .g = CompSwizzle::Alpha, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Red, .g = CompSwizzle::Green, .b = CompSwizzle::Alpha, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Blue, .g = CompSwizzle::Green, .b = CompSwizzle::Red, .a = CompSwizzle::Alpha},
-            }},
-            // StandardReverse
-            std::array<CompMapping, 4>{{
-                {.r = CompSwizzle::Blue, .g = CompSwizzle::Zero, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Green, .g = CompSwizzle::Red, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Blue, .g = CompSwizzle::Green, .b = CompSwizzle::Red, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Alpha, .g = CompSwizzle::Blue, .b = CompSwizzle::Green, .a = CompSwizzle::Red},
-            }},
-            // AlternateReverse
-            std::array<CompMapping, 4>{{
-                {.r = CompSwizzle::Alpha, .g = CompSwizzle::Zero, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Alpha, .g = CompSwizzle::Red, .b = CompSwizzle::Zero, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Alpha, .g = CompSwizzle::Green, .b = CompSwizzle::Red, .a = CompSwizzle::Zero},
-                {.r = CompSwizzle::Alpha, .g = CompSwizzle::Red, .b = CompSwizzle::Green, .a = CompSwizzle::Blue},
-            }},
-        }};
-        // clang-format on
-        const auto swap_idx = static_cast<u32>(info.comp_swap);
-        const auto components_idx = NumComponents(DataFormat(info.format)) - 1;
-        const auto mrt_swizzle = mrt_swizzles[swap_idx][components_idx];
-        return RemapSwizzle(DataFormat(info.format), mrt_swizzle);
+        return detail::kColorSwizzleLut[static_cast<u32>(info.comp_swap) << 5 | info.format];
     }
 
     NumberFormat GetFixedNumberFormat() const {

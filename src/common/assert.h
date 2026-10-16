@@ -16,23 +16,28 @@ void assert_fail_impl();
 
 #ifdef _MSC_VER
 #define SHAD_NO_INLINE __declspec(noinline)
+#define SHAD_COLD_NO_INLINE __declspec(noinline)
+#define SHAD_FORCE_INLINE __forceinline
 #else
-#define SHAD_NO_INLINE __attribute__((cold, noinline))
+#define SHAD_NO_INLINE __attribute__((noinline))
+#define SHAD_COLD_NO_INLINE __attribute__((cold, noinline))
+#define SHAD_FORCE_INLINE inline __attribute__((always_inline))
 #endif
 
 namespace Common::Detail {
 
 template <typename... Args>
-SHAD_NO_INLINE void AssertFail(const char* file, int line, const char* func,
-                               fmt::format_string<Args...> format, Args... args) {
+SHAD_COLD_NO_INLINE void AssertFail(const char* file, int line, const char* func,
+                                    fmt::format_string<Args...> format, Args... args) {
     Common::Log::VLog(Common::Log::Class::Debug, Common::Log::Level::Critical, file, line, func,
                       format, fmt::make_format_args(args...));
     assert_fail_impl();
 }
 
 template <typename... Args>
-[[noreturn]] SHAD_NO_INLINE void UnreachableFail(const char* file, int line, const char* func,
-                                                 fmt::format_string<Args...> format, Args... args) {
+[[noreturn]] SHAD_COLD_NO_INLINE void UnreachableFail(const char* file, int line, const char* func,
+                                                      fmt::format_string<Args...> format,
+                                                      Args... args) {
     Common::Log::VLog(Common::Log::Class::Debug, Common::Log::Level::Critical, file, line, func,
                       format, fmt::make_format_args(args...));
     unreachable_impl();
@@ -43,7 +48,7 @@ template <typename... Args>
 #define ASSERT(_a_)                                                                                \
     do {                                                                                           \
         if (!(_a_)) [[unlikely]] {                                                                 \
-            [&, shad_func_ = __func__]() SHAD_NO_INLINE {                                          \
+            [&, shad_func_ = __func__]() SHAD_COLD_NO_INLINE {                                     \
                 Common::Detail::AssertFail(__FILE__, __LINE__, __func__, "Assertion Failed!\n");   \
             }();                                                                                   \
         }                                                                                          \

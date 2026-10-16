@@ -117,6 +117,8 @@ private:
     const std::vector<std::string> hideCursorOptions = {"Never", "Idle", "Always"};
     const std::vector<std::string> trophySideOptions = {"left", "right", "top", "bottom"};
     const std::vector<std::string> readbacksModeOptions = {"Disabled", "Relaxed", "Precise"};
+    const std::vector<std::string> adaptiveSkipCachesOptions = {
+        "Disabled", "Adaptive", "Validate only (slower - for testing)"};
 
     //////////////// Setting Variables
     //////////////// Note:: Use int for all comboboxes as needed by ImGui
@@ -139,6 +141,10 @@ private:
 
     // Input tab
     bool motionControlsSetting;
+    bool gyroSwapYawRollSetting;
+    bool gyroInvertYawSetting;
+    bool gyroInvertXSetting;
+    bool gyroInvertRollSetting;
     bool backgroundControllerSetting;
     int cursorStateSetting;
     int cursorTimeoutSetting;
@@ -155,6 +161,7 @@ private:
 
     // Experimental tab
     int readbacksModeSetting;
+    int adaptiveSkipCachesSetting;
     bool readbackLinearImagesSetting;
     bool directMemoryAccessSetting;
     bool windowsGuestRedZoneProtectionModeSetting;

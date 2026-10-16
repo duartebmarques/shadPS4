@@ -371,6 +371,11 @@ void SaveDialogUi::Finish(ButtonId buttonId, Result r) {
         }
     }
     if (status) {
+        if (*status == Status::RUNNING && result) {
+            LOG_INFO(Lib_SaveDataDialog, "Save dialog finished: mode {} button {} result {} dir {}",
+                     static_cast<int>(result->mode), static_cast<int>(buttonId),
+                     static_cast<int>(r), result->dir_name);
+        }
         *status = Status::FINISHED;
     }
     RemoveLayer(this);

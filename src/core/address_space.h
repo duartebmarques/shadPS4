@@ -4,6 +4,8 @@
 #pragma once
 
 #include <memory>
+#include <span>
+#include <utility>
 #include <boost/icl/separate_interval_set.hpp>
 #include "common/arch.h"
 #include "common/enum.h"
@@ -97,6 +99,22 @@ public:
     /// Protects requested region.
     void Protect(VAddr virtual_addr, u64 size, MemoryPermission perms);
 
+    /// Guest direct memory in GPU-visible chunks (inplace_guest_memory 2, Linux): each chunk of
+    /// ChunkSize bytes of direct memory is a dma-buf mapped at the backing view and at the guest
+    /// addresses that map it. The allocator returns a dma-buf fd for [base, base + size) or -1;
+    /// release undoes an allocation the address space could not map.
+    static constexpr u64 ChunkSize = u64{256} << 20;
+    using ChunkAllocator = int (*)(PAddr base, u64 size, void* user);
+    using ChunkRelease = void (*)(PAddr base, void* user);
+    /// Installs the chunk allocator for direct memory below `direct_limit`. Must run before any
+    /// direct memory is mapped; chunks are then decided at the first mapping that touches them.
+    /// `in_use` lists direct memory ranges already mapped: their chunks stay in the memfd, as
+    /// moving them would detach the existing mappings from the backing.
+    void InstallChunks(u64 direct_limit, ChunkAllocator alloc, ChunkRelease release, void* user,
+                       std::span<const std::pair<PAddr, u64>> in_use);
+    /// Whether direct memory chunks are installed.
+    bool HasChunks() const;
+
     // Returns an interval set containing all usable regions.
     boost::icl::interval_set<VAddr> GetUsableRegions();
 
@@ -111,6 +129,20 @@ private:
     u8* user_base{};
     u64 user_size{};
     BackingPageTable backing_pages;
+};
+
+/// Observes protection changes for the stream mirror epoch machinery. The
+/// observer runs before the permission change takes effect; tracker_origin
+/// marks calls issued by the page manager's write-watch maintenance.
+using ProtectObserver = void (*)(void* user, VAddr virtual_addr, u64 size, bool write_granted,
+                                 bool tracker_origin);
+void SetProtectObserver(ProtectObserver observer, void* user);
+void NotifyProtectObserver(VAddr virtual_addr, u64 size, bool write_granted);
+
+/// Marks protection calls issued by the page tracker while in scope.
+struct TrackerProtectScope {
+    TrackerProtectScope();
+    ~TrackerProtectScope();
 };
 
 } // namespace Core

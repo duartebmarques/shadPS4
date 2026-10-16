@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <bit>
+#include <memory>
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
@@ -10,6 +13,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image_info.h"
+#include "video_core/texture_cache/photo_readback.h"
 #include "video_core/texture_cache/tile.h"
 
 namespace VideoCore {
@@ -126,8 +130,56 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     stencil_size = guest_size / (num_bits >> 3);
 }
 
-ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept {
-    const bool is_depth = desc.is_depth;
+namespace {
+
+// Keyed on the full 32-byte T# plus is_depth; Neo mode is fixed for the run, so
+// the ctor is a pure function of the key and a hit is exactly a construct.
+struct ImageInfoMemo {
+    static constexpr size_t NumEntries = 256; // direct mapped, power of two
+
+    struct Entry {
+        std::array<u64, 4> tsharp{};
+        ImageInfo info{};
+        bool valid{};
+        bool is_depth{};
+    };
+
+    std::array<Entry, NumEntries> entries{};
+
+    static size_t Index(const std::array<u64, 4>& raw) {
+        u64 key = raw[0] ^ (raw[1] * 0x9e3779b97f4a7c15ULL) ^ (raw[2] << 7) ^ (raw[3] << 13);
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33;
+        return static_cast<size_t>(key & (NumEntries - 1));
+    }
+};
+
+// Heap backed so only the pointer occupies thread-local storage.
+ImageInfoMemo& GetImageInfoMemo() {
+    static thread_local std::unique_ptr<ImageInfoMemo> memo;
+    if (!memo) {
+        memo = std::make_unique<ImageInfoMemo>();
+    }
+    return *memo;
+}
+
+} // Anonymous namespace
+
+ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept
+    : ImageInfo{sharp, desc.is_depth} {}
+
+// The shader-resource ctor consumes only is_depth from the resource; this
+// form is what ImageDesc's deferred build uses, since the resource itself is
+// out of scope by the time a staged binding first needs the info.
+ImageInfo::ImageInfo(const AmdGpu::Image& sharp, bool is_depth) noexcept {
+    const auto raw = std::bit_cast<std::array<u64, 4>>(sharp);
+    auto& entry = GetImageInfoMemo().entries[ImageInfoMemo::Index(raw)];
+    if (entry.valid && entry.tsharp == raw && entry.is_depth == is_depth) {
+        *this = entry.info;
+        return;
+    }
+
     const auto image = sharp;
     const auto data_fmt = image.GetDataFmt();
     tile_mode = image.GetTileMode();
@@ -150,6 +202,7 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
     pitch = image.Pitch();
     resources.levels = image.NumLevels();
     resources.layers = image.NumLayers();
+    resources.layers = PhotoReadback::ClampLayers(resources.layers);
     num_samples = image.NumSamples();
     num_bits = NumBitsPerBlock(data_fmt);
     guest_address = image.Address();
@@ -158,6 +211,11 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
         alt_tile = Libraries::Kernel::sceKernelIsNeoMode();
     }
     UpdateSize();
+
+    entry.tsharp = raw;
+    entry.is_depth = is_depth;
+    entry.info = *this;
+    entry.valid = true;
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {

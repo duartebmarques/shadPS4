@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
+#include <ctime>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <fmt/std.h>
@@ -147,15 +150,44 @@ void Setup(std::string_view shadps4_filename) {
     UpdateSinks();
 }
 
+// Moves the last run's log to previous/ (the newest 10 are kept), so a crash log survives the next
+// launch.
+static void KeepPreviousLog(const std::filesystem::path& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::exists(path, ec) || fs::file_size(path, ec) == 0) {
+        return;
+    }
+    const auto dir = path.parent_path() / "previous";
+    fs::create_directories(dir, ec);
+    const auto stem = path.stem().string();
+    fs::rename(path,
+               dir / fmt::format("{}-{}{}", stem, std::time(nullptr), path.extension().string()),
+               ec);
+    std::vector<fs::path> logs;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (entry.path().stem().string().starts_with(stem + "-")) {
+            logs.push_back(entry.path());
+        }
+    }
+    std::ranges::sort(logs);
+    for (size_t i = 0; i + 10 < logs.size(); ++i) {
+        fs::remove(logs[i], ec);
+    }
+}
+
 void Switch(std::string_view game_filename, bool append_log) {
     UpdateSinks();
     UpdateLogLevels(EmulatorSettings.GetLogFilter());
     UpdateLogFlushLevel(EmulatorSettings.GetLogFlushLevel());
 
     g_shad_file_sink->_size_limit = EmulatorSettings.GetLogSizeLimit();
-    g_shad_file_sink->session_file_helper_.open(
-        (GetUserPath(Common::FS::PathType::LogDir) / game_filename).string(),
-        !(append_log || EmulatorSettings.IsLogAppend()));
+    const auto path = GetUserPath(Common::FS::PathType::LogDir) / game_filename;
+    const bool truncate = !(append_log || EmulatorSettings.IsLogAppend());
+    if (truncate) {
+        KeepPreviousLog(path);
+    }
+    g_shad_file_sink->session_file_helper_.open(path.string(), truncate);
 }
 
 void Shutdown() {

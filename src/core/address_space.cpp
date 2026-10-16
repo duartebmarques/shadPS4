@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <map>
 #include <span>
 #include <vector>
@@ -21,6 +22,7 @@
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 #if defined(__APPLE__) && defined(ARCH_X86_64)
@@ -780,6 +782,12 @@ struct AddressSpace::Impl {
             phys_addr = -1;
         }
 #endif
+#ifdef __linux__
+        if (fd == -1 && phys_addr != -1 &&
+            MapChunked(virtual_addr, phys_addr, size, static_cast<int>(prot))) {
+            return reinterpret_cast<void*>(virtual_addr);
+        }
+#endif
         const int handle = phys_addr != -1 ? (fd == -1 ? backing_fd : fd) : -1;
         const off_t host_offset = phys_addr != -1 ? phys_addr : 0;
         const int flag = phys_addr != -1 ? MAP_SHARED : (MAP_ANONYMOUS | MAP_PRIVATE);
@@ -816,8 +824,86 @@ struct AddressSpace::Impl {
         }
 #endif
         int ret = mprotect(reinterpret_cast<void*>(virtual_addr), size, flags);
+#ifdef __linux__
+        if (ret != 0 && (flags & PROT_EXEC) != 0 && !chunk_fds.empty()) {
+            // Guest memory chunks (dma-buf) may not be executable; direct memory never runs code.
+            ret = mprotect(reinterpret_cast<void*>(virtual_addr), size, flags & ~PROT_EXEC);
+        }
+#endif
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
     }
+
+#ifdef __linux__
+    static constexpr int ChunkUndecided = -1;
+    static constexpr int ChunkInMemfd = -2;
+
+    /// Decides every undecided chunk touched by [phys, phys + size): a dma-buf from the
+    /// allocator mapped over the backing view, or the memfd as before.
+    void EnsureChunks(PAddr phys, u64 size) {
+        if (chunk_fds.empty() || phys >= chunk_limit) {
+            return;
+        }
+        const u64 end = std::min<u64>(phys + size, chunk_limit);
+        for (u64 index = phys / ChunkSize; index * ChunkSize < end; ++index) {
+            int& state = chunk_fds[index];
+            if (state != ChunkUndecided) {
+                continue;
+            }
+            const PAddr base = index * ChunkSize;
+            const u64 length = std::min<u64>(ChunkSize, chunk_limit - base);
+            const int fd = chunk_alloc(base, length, chunk_user);
+            if (fd < 0) {
+                state = ChunkInMemfd;
+                continue;
+            }
+            void* view = mmap(backing_base + base, length, PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_FIXED, fd, 0);
+            if (view == MAP_FAILED) {
+                LOG_ERROR(Kernel_Vmm, "Mapping guest memory chunk {:#x} failed: {}", base,
+                          strerror(errno));
+                chunk_release(base, chunk_user);
+                close(fd);
+                state = ChunkInMemfd;
+                continue;
+            }
+            // The view no longer shows the memfd here; drop any pages it held.
+            fallocate(backing_fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, base, length);
+            state = fd;
+        }
+    }
+
+    /// Maps [phys, phys + size) of direct memory at virtual_addr, piece by piece from the chunks
+    /// holding it. Returns false when no chunk is installed (the caller maps the memfd).
+    bool MapChunked(VAddr virtual_addr, PAddr phys_addr, u64 size, int prot) {
+        if (chunk_fds.empty() || phys_addr >= chunk_limit) {
+            return false;
+        }
+        EnsureChunks(phys_addr, size);
+        u64 done = 0;
+        while (done < size) {
+            const PAddr phys = phys_addr + done;
+            const u64 index = phys / ChunkSize;
+            const u64 piece = phys < chunk_limit
+                                  ? std::min<u64>(size - done, (index + 1) * ChunkSize - phys)
+                                  : size - done;
+            const int chunk_fd = phys < chunk_limit ? chunk_fds[index] : ChunkInMemfd;
+            void* ret = chunk_fd >= 0
+                            ? mmap(reinterpret_cast<void*>(virtual_addr + done), piece, prot,
+                                   MAP_FIXED | MAP_SHARED, chunk_fd, phys - index * ChunkSize)
+                            : mmap(reinterpret_cast<void*>(virtual_addr + done), piece, prot,
+                                   MAP_FIXED | MAP_SHARED, backing_fd, phys);
+            ASSERT_MSG(ret != MAP_FAILED, "mmap of guest memory chunk failed: {}", strerror(errno));
+            done += piece;
+        }
+        return true;
+    }
+
+    std::vector<int> chunk_fds;
+    u64 chunk_limit{};
+    ChunkAllocator chunk_alloc{};
+    ChunkRelease chunk_release{};
+    void* chunk_user{};
+#endif
 
     int backing_fd;
     u8* backing_base{};
@@ -882,10 +968,72 @@ VAddr AddressSpace::Unmap(VAddr virtual_addr, u64* size) {
     return impl->Unmap(virtual_addr, size);
 }
 
+static std::atomic<ProtectObserver> g_protect_observer{nullptr};
+static std::atomic<void*> g_protect_observer_user{nullptr};
+static thread_local bool g_tracker_origin_protect = false;
+
+void SetProtectObserver(ProtectObserver observer, void* user) {
+    g_protect_observer_user.store(user, std::memory_order_release);
+    g_protect_observer.store(observer, std::memory_order_release);
+}
+
+void NotifyProtectObserver(VAddr virtual_addr, u64 size, bool write_granted) {
+    if (const auto observer = g_protect_observer.load(std::memory_order_acquire)) {
+        observer(g_protect_observer_user.load(std::memory_order_acquire), virtual_addr, size,
+                 write_granted, g_tracker_origin_protect);
+    }
+}
+
+TrackerProtectScope::TrackerProtectScope() {
+    g_tracker_origin_protect = true;
+}
+
+TrackerProtectScope::~TrackerProtectScope() {
+    g_tracker_origin_protect = false;
+}
+
+void AddressSpace::InstallChunks(u64 direct_limit, ChunkAllocator alloc, ChunkRelease release,
+                                 void* user, std::span<const std::pair<PAddr, u64>> in_use) {
+#ifdef __linux__
+    impl->chunk_limit = direct_limit;
+    impl->chunk_alloc = alloc;
+    impl->chunk_release = release;
+    impl->chunk_user = user;
+    impl->chunk_fds.assign((direct_limit + ChunkSize - 1) / ChunkSize, Impl::ChunkUndecided);
+    u64 kept = 0;
+    for (const auto& [phys, size] : in_use) {
+        if (size == 0 || phys >= direct_limit) {
+            continue;
+        }
+        const u64 end = std::min<u64>(phys + size, direct_limit);
+        for (u64 index = phys / ChunkSize; index * ChunkSize < end; ++index) {
+            if (impl->chunk_fds[index] == Impl::ChunkUndecided) {
+                impl->chunk_fds[index] = Impl::ChunkInMemfd;
+                ++kept;
+            }
+        }
+    }
+    if (kept != 0) {
+        LOG_INFO(Kernel_Vmm, "{} chunks already mapped stay in the memfd", kept);
+    }
+    LOG_INFO(Kernel_Vmm, "Guest direct memory below {:#x} goes into GPU-visible chunks",
+             direct_limit);
+#endif
+}
+
+bool AddressSpace::HasChunks() const {
+#ifdef __linux__
+    return !impl->chunk_fds.empty();
+#else
+    return false;
+#endif
+}
+
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
     const bool read = True(perms & MemoryPermission::Read);
     const bool write = True(perms & MemoryPermission::Write);
     const bool execute = True(perms & MemoryPermission::Execute);
+    NotifyProtectObserver(virtual_addr, size, write);
     return impl->Protect(virtual_addr, size, read, write, execute);
 }
 

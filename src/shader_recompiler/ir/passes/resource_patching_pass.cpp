@@ -194,7 +194,8 @@ SharpFetch<T> ConstructSharpFetch(const SharpReference& sharp) {
             }
         }
     }
-    if (sharp_fetch.summary != Summary::Invalid) {
+    if (sharp_fetch.summary != Summary::Invalid &&
+        sharp_fetch.load_mask == (1u << sharp.num_dwords) - 1) {
         const u32 base = sharp_fetch.offsets[0];
         for (u32 i = 1; i < sharp.num_dwords; ++i) {
             if (sharp_fetch.offsets[i] - base != i) {

@@ -5,6 +5,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
@@ -225,6 +226,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     runtime.FlushBarriers();
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    // A layout without push constants: the compute dedup slots must not outlive this bind.
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPipelineGen(1);
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -265,6 +268,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
             .pBufferInfo = &params_buffer_info,
         },
     }};
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
@@ -316,6 +320,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.DownloadImage(&in_image, staging.buffer, buffer_copies);
     runtime.FlushBarriers();
 
+    // A layout without push constants: the compute dedup slots must not outlive this bind.
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPipelineGen(1);
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
@@ -357,6 +363,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
             .pBufferInfo = &params_buffer_info,
         },
     }};
+    VideoCore::Skipcache::Framework::Instance().BumpForeignPushGen(1);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;

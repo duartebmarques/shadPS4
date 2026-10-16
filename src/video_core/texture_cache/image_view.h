@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <array>
+#include <cstring>
+#include <type_traits>
+
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/resource.h"
@@ -27,6 +31,8 @@ namespace VideoCore {
 struct ImageViewInfo {
     ImageViewInfo() = default;
     ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept;
+    ImageViewInfo(const AmdGpu::Image& image, bool is_storage_, bool is_depth,
+                  bool is_array) noexcept;
     ImageViewInfo(const AmdGpu::ColorBuffer& col_buffer) noexcept;
     ImageViewInfo(const AmdGpu::DepthBuffer& depth_buffer, AmdGpu::DepthView view,
                   AmdGpu::DepthControl ctl);
@@ -37,8 +43,14 @@ struct ImageViewInfo {
     AmdGpu::CompMapping mapping{AmdGpu::IdentityMapping};
     u32 min_lod = 0;
     bool is_storage = false;
+    // Explicit tail: with every byte owned, the equality below may legally be
+    // one memcmp, which vectorizes where the memberwise walk did not.
+    std::array<u8, 3> reserved{};
 
-    bool operator==(const ImageViewInfo&) const = default;
+    bool operator==(const ImageViewInfo& other) const noexcept {
+        static_assert(std::has_unique_object_representations_v<ImageViewInfo>);
+        return std::memcmp(this, &other, sizeof(other)) == 0;
+    }
 };
 
 struct Image;

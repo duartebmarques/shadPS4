@@ -14,6 +14,7 @@
 #include "core/devtools/layer.h"
 #include "imgui/imgui_std.h"
 #include "settings_dialog_imgui.h"
+#include "video_core/skipcache/skipcache.h"
 
 CMRC_DECLARE(res);
 
@@ -67,6 +68,10 @@ void SettingsWindow::LoadSettings(std::string profile) {
 
     /////////// Input Tab
     motionControlsSetting = EmulatorSettings.IsMotionControlsEnabled();
+    gyroSwapYawRollSetting = EmulatorSettings.IsGyroSwapYawRoll();
+    gyroInvertYawSetting = EmulatorSettings.IsGyroInvertYaw();
+    gyroInvertXSetting = EmulatorSettings.IsGyroInvertX();
+    gyroInvertRollSetting = EmulatorSettings.IsGyroInvertRoll();
     backgroundControllerSetting = EmulatorSettings.IsBackgroundControllerInput();
     cursorStateSetting = EmulatorSettings.GetCursorState();
     cursorTimeoutSetting = EmulatorSettings.GetCursorHideTimeout();
@@ -85,6 +90,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     /////////// Experimental Tab
     if (isSpecific) {
         readbacksModeSetting = EmulatorSettings.GetReadbacksMode();
+        adaptiveSkipCachesSetting = EmulatorSettings.GetAdaptiveSkipCachesMode();
         readbackLinearImagesSetting = EmulatorSettings.IsReadbackLinearImagesEnabled();
         directMemoryAccessSetting = EmulatorSettings.IsDirectMemoryAccessEnabled();
         windowsGuestRedZoneProtectionModeSetting = EmulatorSettings.IsRedZonePatchingEnabled();
@@ -111,7 +117,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
 
     /////////// Graphics Tab
     bool isFullscreen = fullscreenModeSetting != 0;
-    EmulatorSettings.SetFullScreen(isFullscreen);
+    EmulatorSettings.SetFullScreen(isFullscreen, isSpecific);
     EmulatorSettings.SetFullScreenMode(fullscreenModeOptions.at(fullscreenModeSetting), isSpecific);
     EmulatorSettings.SetPresentMode(presentModeOptions.at(presentModeSetting), isSpecific);
     EmulatorSettings.SetWindowHeight(windowHeightSetting, isSpecific);
@@ -124,6 +130,10 @@ void SettingsWindow::SaveSettings(std::string profile) {
 
     /////////// Input Tab
     EmulatorSettings.SetMotionControlsEnabled(motionControlsSetting, isSpecific);
+    EmulatorSettings.SetGyroSwapYawRoll(gyroSwapYawRollSetting, isSpecific);
+    EmulatorSettings.SetGyroInvertYaw(gyroInvertYawSetting, isSpecific);
+    EmulatorSettings.SetGyroInvertX(gyroInvertXSetting, isSpecific);
+    EmulatorSettings.SetGyroInvertRoll(gyroInvertRollSetting, isSpecific);
     EmulatorSettings.SetBackgroundControllerInput(backgroundControllerSetting, isSpecific);
     EmulatorSettings.SetCursorState(cursorStateSetting, isSpecific);
     EmulatorSettings.SetCursorHideTimeout(cursorTimeoutSetting, isSpecific);
@@ -131,7 +141,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
     /////////// Trophy Tab
     EmulatorSettings.SetTrophyPopupDisabled(trophyPopupDisabledSetting, isSpecific);
     EmulatorSettings.SetTrophyNotificationSide(trophySideOptions.at(trophySideSetting), isSpecific);
-    EmulatorSettings.SetTrophyNotificationDuration(static_cast<double>(trophyDurationSetting));
+    EmulatorSettings.SetTrophyNotificationDuration(static_cast<double>(trophyDurationSetting),
+                                                   isSpecific);
 
     /////////// Log Tab
     EmulatorSettings.SetLogEnable(logEnableSetting, isSpecific);
@@ -141,6 +152,9 @@ void SettingsWindow::SaveSettings(std::string profile) {
     /////////// Experimental Tab
     if (isSpecific) {
         EmulatorSettings.SetReadbacksMode(readbacksModeSetting, true);
+        EmulatorSettings.SetAdaptiveSkipCachesMode(adaptiveSkipCachesSetting, true);
+        VideoCore::Skipcache::Framework::Instance().SetRequestedMode(
+            static_cast<VideoCore::Skipcache::Mode>(adaptiveSkipCachesSetting));
         EmulatorSettings.SetReadbackLinearImagesEnabled(readbackLinearImagesSetting, true);
         EmulatorSettings.SetDirectMemoryAccessEnabled(directMemoryAccessSetting, true);
         // Windows static guest red-zone protection
@@ -740,6 +754,11 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             ImGui::TableSetupColumn("Value");
 
             AddSettingCheckbox("Enable Motion Controls", motionControlsSetting);
+            AddSettingCheckbox("Gyro: Swap Yaw and Roll (handheld held upright)",
+                               gyroSwapYawRollSetting);
+            AddSettingCheckbox("Gyro: Invert Yaw", gyroInvertYawSetting);
+            AddSettingCheckbox("Gyro: Invert Pitch", gyroInvertXSetting);
+            AddSettingCheckbox("Gyro: Invert Roll", gyroInvertRollSetting);
             AddSettingCheckbox("Enable Background Controller Input", backgroundControllerSetting);
             AddSettingCombo("Hide Cursor", cursorStateSetting, hideCursorOptions);
 
@@ -785,6 +804,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingSliderInt("Additional DMem Allocation", extraDmemSetting, 0, 20000);
             AddSettingSliderInt("Vblank Frequency", vblankFrequencySetting, 30, 360);
             AddSettingCombo("Readbacks Mode", readbacksModeSetting, readbacksModeOptions);
+            AddSettingCombo("Adaptive Skip Caches (Experimental)", adaptiveSkipCachesSetting,
+                            adaptiveSkipCachesOptions);
             AddSettingCheckbox("Enable Readback Linear Images", readbackLinearImagesSetting);
             AddSettingCheckbox("Enable Direct Memory Access", directMemoryAccessSetting);
 #ifdef _WIN32

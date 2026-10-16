@@ -156,6 +156,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // the cached size so the first swapchain and the splashscreen use the real drawable size.
     SDL_GetWindowSizeInPixels(window, &width, &height);
 
+    // Under Steam Input the Steam Deck controls reach the game through Steam's virtual gamepad,
+    // which Steam silences while its overlay is open. SDL's raw Deck driver would bypass that and
+    // overwrite the controller settings Steam relies on, so leave the raw controller to Steam.
+    if (SDL_getenv("SteamVirtualGamepadInfo") ||
+        SDL_getenv("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD")) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAMDECK, "0");
+    }
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 
 #if defined(SDL_PLATFORM_WIN32)
@@ -184,6 +191,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
+
+    // Apply the mouse mode requested by mouse_default_mode in the input config.
+    const auto default_mouse_mode = Input::GetMouseMode();
+    if (default_mouse_mode == Input::MouseMode::Joystick ||
+        default_mouse_mode == Input::MouseMode::Gyro) {
+        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), true);
+    }
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -299,6 +313,9 @@ void WindowSDL::WaitEvent() {
                                        Input::ToggleMouseModeTo(Input::MouseMode::Touchpad));
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), false);
         break;
+    case SDL_EVENT_MOUSE_TO_TOUCHPAD_SWIPE:
+        Input::EnableTouchpadSwipe(!Input::IsTouchpadSwipeEnabled());
+        break;
     case SDL_EVENT_ADD_VIRTUAL_USER:
         for (int i = 0; i < 4; i++) {
             if (controllers[i]->user_id == -1) {
@@ -380,6 +397,19 @@ Uint32 wheelOffCallback(void* og_event, Uint32 timer_id, Uint32 interval) {
 
 void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
     using Libraries::Pad::OrbisPadButtonDataOffset;
+
+    // Touchpad swipe emulation intercepts left-button (touchscreen) presses on the first pad,
+    // independent of the mouse mode. Everything else passes through.
+    if (Input::IsTouchpadSwipeEnabled() &&
+        (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN || event->type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+        event->button.button == SDL_BUTTON_LEFT) {
+        if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            Input::TouchpadSwipeOnFingerDown(controllers[0], event->button.x, event->button.y);
+        } else {
+            Input::TouchpadSwipeOnFingerUp(controllers[0], event->button.x, event->button.y);
+        }
+        return;
+    }
 
     // get the event's id, if it's keyup or keydown
     const bool input_down = event->type == SDL_EVENT_KEY_DOWN ||

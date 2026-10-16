@@ -102,6 +102,11 @@ struct Info : InfoPersistent {
 
     std::span<const u32> user_data;
     std::vector<u32> flattened_ud_buf;
+    // Sharp reads go through this, not the vector. Aliasing the register block is safe only
+    // because every GetParams feeding GetProgram spans storage that outlives the process
+    // (liverpool->regs.*_program, mapped_queues[].cs_state); a GetParams over a stack copy of a
+    // ShaderProgram would leave this dangling.
+    const u32* flat_ud{};
     PersistentSrtInfo srt_info;
 
     AttributeFlags loads{};
@@ -142,17 +147,60 @@ struct Info : InfoPersistent {
         : InfoPersistent(stage_, l_stage_, params.hash), pgm_base{params.Base()},
           user_data{params.user_data} {}
 
+    /// Draw pipe (vk_draw_pipe.h): the per-draw fields below as the draw being recorded saw
+    /// them. The GPU command thread refreshes user_data, flat_ud and pgm_base when it selects
+    /// the next draw's pipeline while the recording thread may still record an earlier draw,
+    /// so that thread installs the selecting draw's copies here and reads them back through
+    /// UserData(), FlatUd() and PgmBase().
+    struct UdSnapshot {
+        const Info* info;
+        const u32* user_data;
+        const u32* flat;
+        VAddr pgm_base;
+    };
+    static constexpr u32 MaxUdSnapshots = 8;
+    static inline thread_local std::array<UdSnapshot, MaxUdSnapshots> ud_snapshots{};
+    static inline thread_local u32 num_ud_snapshots = 0;
+
+    const UdSnapshot* Snapshot() const noexcept {
+        for (u32 i = 0; i < num_ud_snapshots; ++i) {
+            if (ud_snapshots[i].info == this) {
+                return &ud_snapshots[i];
+            }
+        }
+        return nullptr;
+    }
+    std::span<const u32> UserData() const noexcept {
+        if (const auto* snapshot = Snapshot()) {
+            return {snapshot->user_data, NUM_USER_DATA_REGS};
+        }
+        return user_data;
+    }
+    const u32* FlatUd() const noexcept {
+        if (const auto* snapshot = Snapshot()) {
+            return snapshot->flat;
+        }
+        return flat_ud;
+    }
+    VAddr PgmBase() const noexcept {
+        if (const auto* snapshot = Snapshot()) {
+            return snapshot->pgm_base;
+        }
+        return pgm_base;
+    }
+
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+        return *reinterpret_cast<const T*>(FlatUd() + sharp_idx);
     }
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;
-        const u32* base = user_data.data();
+        const auto ud = UserData();
+        const u32* base = ud.data();
         if (ptr_index != IR::NumScalarRegs) {
-            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+            std::memcpy(&base, &ud[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
@@ -161,15 +209,40 @@ struct Info : InfoPersistent {
 
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + samplers.size();
+        bnd.unified += buffers.size() + samplers.size();
+        // Must advance as the SPIR-V backend and the pipeline layout do: a mip fallback image
+        // takes one binding per level.
+        for (const auto& image : images) {
+            bnd.unified += image.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex
+                               ? image.NumBindings(*this)
+                               : 1;
+        }
     }
 
     void RefreshFlatBuf() {
+        // The walker's first destination dword is NUM_USER_DATA_REGS, so with no walker the flat
+        // buffer is the 16 user-data registers unchanged.
+        if (!srt_info.walker_func) {
+            flat_ud = user_data.data();
+            return;
+        }
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
-        ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
-        std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
-        if (srt_info.walker_func) {
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+        std::memcpy(flattened_ud_buf.data(), user_data.data(), NUM_USER_DATA_REGS * sizeof(u32));
+        srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
+        flat_ud = flattened_ud_buf.data();
+    }
+
+    // Derives every descriptor's in-place read verdict. Runs once per Info: after
+    // TranslateProgram in CompileModule and after the preload's Deserialize.
+    void ResolveDirectReads() noexcept {
+        for (auto& d : buffers) {
+            d.ResolveDirectRead();
+        }
+        for (auto& d : images) {
+            d.ResolveDirectRead();
+        }
+        for (auto& d : samplers) {
+            d.ResolveDirectRead();
         }
     }
 

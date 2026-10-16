@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 
@@ -116,11 +117,51 @@ struct Image : public Common::LRUNode<> {
     }
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
+    vk::ImageView FindViewHandle(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
+    ImageViewId InsertView(const ImageViewInfo& view_info);
 
     using Barriers = SmallVector<vk::ImageMemoryBarrier2, 32>;
+    /// Records that the given query needed no barriers, valid until the
+    /// backing's state epoch changes.
+    void RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                           vk::PipelineStageFlags2 dst_stage,
+                           const std::optional<SubresourceRange>& subres_range);
+
+    /// Header fast path for GetBarriers' repeat no-op answer: the memo the
+    /// outlined body maintains proves an identical query under an unchanged
+    /// state epoch emits nothing. Probing it BEFORE the body's divergent
+    /// collapse is sound because every path that makes the collapse
+    /// applicable bumps state_epoch, which misses this memo.
+    static constexpr vk::PipelineStageFlags2 kShaderReadStages =
+        vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+    static constexpr u64 RangeKey(const std::optional<SubresourceRange>& r) {
+        return r ? (u64{r->base.level} | (u64{r->base.layer} << 16) |
+                    (u64{r->extent.levels} << 32) | (u64{r->extent.layers} << 48))
+                 : ~u64{0};
+    }
+    void BumpStateEpoch() {
+        backing_epoch = ++backing->state_epoch;
+    }
+    bool BarriersNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                      vk::PipelineStageFlags2 dst_stage,
+                      const std::optional<SubresourceRange>& subres_range) const {
+        const u64 range_key = RangeKey(subres_range);
+        return backing->noop_epoch == backing->state_epoch && backing->noop_layout == dst_layout &&
+               backing->noop_access == dst_mask && backing->noop_stage == dst_stage &&
+               backing->noop_range == range_key;
+    }
+
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
-                     std::optional<SubresourceRange> subres_range = {});
+                     std::optional<SubresourceRange> subres_range = {}) {
+        if (BarriersNoop(dst_layout, dst_mask, dst_stage, subres_range)) {
+            return;
+        }
+        GetBarriersSlow(out_barriers, dst_layout, dst_mask, dst_stage, subres_range);
+    }
+    void GetBarriersSlow(Barriers& out_barriers, vk::ImageLayout dst_layout,
+                         vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
+                         std::optional<SubresourceRange> subres_range);
 
 public:
     Vulkan::Runtime* runtime;
@@ -132,8 +173,44 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+
+    // Atomic fast state for the UpdateImage fast path: {dirty, tracked,
+    // last_touch_tick} in one u64, so the common clean-and-tracked call skips
+    // the touch, track and refresh pass.
+    static constexpr u64 kFastStateDirty = 1ULL << 0;
+    static constexpr u64 kFastStateTracked = 1ULL << 1;
+    static constexpr u64 kFastStateTouchShift = 2;
+    std::atomic<u64> fast_update_state{kFastStateDirty};
+
+    void MarkFastStateDirty() noexcept {
+        fast_update_state.fetch_or(kFastStateDirty, std::memory_order_release);
+    }
+    void UpdateFastState(u64 touch_tick, bool is_tracked) noexcept {
+        u64 state = touch_tick << kFastStateTouchShift;
+        if (is_tracked) {
+            state |= kFastStateTracked;
+        }
+        fast_update_state.store(state, std::memory_order_release);
+    }
+    u64 ReadFastState() const noexcept {
+        return fast_update_state.load(std::memory_order_acquire);
+    }
     ImageId depth_id{};
     u64 depth_uid{};
+    // Grouped with the depth link so a bind touches one or two record lines:
+    // the access stamps, the identity checks and the binding bits.
+    u64 image_uid{};
+    u64 tick_accessed_last{};
+    // The garbage collector period of the last access. ResolveOverlap must age
+    // by this, not by the scheduler tick: a tick is a flush, so
+    // NUM_FRAMES_BEFORE_REMOVAL ticks is about a frame and live targets were freed.
+    u64 gc_tick_accessed_last{};
+    struct {
+        u32 is_bound : 1;
+        u32 is_target : 1;
+        u32 needs_rebind : 1;
+        u32 force_general : 1;
+    } binding{};
 
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;
@@ -144,17 +221,51 @@ public:
     };
     struct BackingImage {
         UniqueImage image;
-        State state;
+        // The draw path's reads cluster below, aligned so the barrier-noop
+        // memo probe, the state compare and the descriptor write's layout pay
+        // for one line instead of three scattered ones.
+        alignas(64) State state;
+
+        // Negative-result memo for GetBarriers. Transitioning an image to a
+        // state it already holds is by far the common case (the same textures
+        // are re-bound every draw), but proving it costs a scan over every
+        // mip x layer. state_epoch changes whenever any tracked state does, so
+        // a memo recorded under the current epoch for the same query is exactly
+        // reproducible without the scan.
+        u64 state_epoch{1};
+        u64 noop_epoch{}; // 0 = no memo
+        vk::ImageLayout noop_layout{};
+        vk::AccessFlags2 noop_access{};
+        vk::PipelineStageFlags2 noop_stage{};
+        u64 noop_range{};
         std::vector<State> subresource_states;
-        SmallVector<ImageViewInfo, 2> image_view_infos;
+        // Count of subresource_states entries whose layout or access differ from
+        // `state`; GetBarriersSlow recounts it whenever `state` moves while the
+        // vector is alive. Zero means the vector is equivalent to empty. Stages
+        // are excluded (they do not affect the scan's skip condition);
+        // subres_stage_union carries them instead.
+        u32 subres_divergent{};
+        vk::PipelineStageFlags2 subres_stage_union{};
+        // The handle rides beside its key so a view hit ends here instead of
+        // chasing the id through the slot vector. image_view_ids stays, pushed in
+        // lockstep with view_records: FreeImage's deferred reclaim walks it, and an
+        // entry in one vector but not the other leaks the view for the process life.
+        struct ViewRecord {
+            ImageViewInfo info;
+            vk::ImageView handle{};
+        };
+        SmallVector<ViewRecord, 2> view_records;
         SmallVector<ImageViewId, 2> image_view_ids;
         u32 num_samples;
     };
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};
-    u64 image_uid{};
-    u64 lru_id{};
-    u64 tick_accessed_last{};
+    // Mirror of backing->state_epoch: every bump and backing switch writes it,
+    // so the bind path compares it on this line instead of the backing's.
+    u64 backing_epoch{};
+    // Mirror of backing->num_samples, off the backing's last cache line.
+    // Update wherever backing or its sample count changes.
+    u32 backing_num_samples{};
     u64 hash{};
 
     struct {
@@ -164,13 +275,6 @@ public:
         u32 depth_target : 1;
         u32 vo_surface : 1;
     } usage{};
-
-    struct {
-        u32 is_bound : 1;
-        u32 is_target : 1;
-        u32 needs_rebind : 1;
-        u32 force_general : 1;
-    } binding{};
 
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;

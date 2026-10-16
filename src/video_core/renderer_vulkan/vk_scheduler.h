@@ -3,7 +3,13 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <bit>
+#include <chrono>
 #include <condition_variable>
+#include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -39,6 +45,7 @@ struct RenderAttachment {
     };
 };
 static_assert(std::has_unique_object_representations_v<RenderAttachment>);
+static_assert(sizeof(RenderAttachment) == 32);
 
 struct RenderState {
     std::array<RenderAttachment, 8> color_attachments;
@@ -48,8 +55,32 @@ struct RenderState {
     u16 num_layers;
     u16 num_color_attachments;
 
+    // Four explicit word compares: the OR-of-XORs form keeps the compare
+    // inline, where an equality chain or a memcmp folds back into a bcmp call.
+    static bool AttachmentEqual(const RenderAttachment& a, const RenderAttachment& b) noexcept {
+        const auto wa = std::bit_cast<std::array<u64, 4>>(a);
+        const auto wb = std::bit_cast<std::array<u64, 4>>(b);
+        return ((wa[0] ^ wb[0]) | (wa[1] ^ wb[1]) | (wa[2] ^ wb[2]) | (wa[3] ^ wb[3])) == 0;
+    }
+
+    // Invariants: every producer zeroes the colour slots at and past
+    // num_color_attachments and no consumer reads them, so the tail needs no
+    // compare; num_color_attachments <= 8 because it is std::bit_width of the
+    // pipeline key's u32 mrt_mask, which is what bounds the loop safely.
     bool operator==(const RenderState& other) const noexcept {
-        return std::memcmp(this, &other, sizeof(RenderState)) == 0;
+        if (width != other.width || height != other.height || num_layers != other.num_layers ||
+            num_color_attachments != other.num_color_attachments) {
+            return false;
+        }
+        if (!AttachmentEqual(depth_stencil_attachment, other.depth_stencil_attachment)) {
+            return false;
+        }
+        for (u32 i = 0; i < num_color_attachments; ++i) {
+            if (!AttachmentEqual(color_attachments[i], other.color_attachments[i])) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 static_assert(std::has_unique_object_representations_v<RenderState>);
@@ -92,6 +123,17 @@ struct StencilOps {
                depth_fail_op == other.depth_fail_op && compare_op == other.compare_op;
     }
 };
+
+// Games can leave float dynamic-state registers non-finite; NaN != NaN makes a
+// value compare re-arm the dirty bit and re-emit the command on every draw.
+// Every T compared here is float-only and padding-free, so every byte is a
+// value byte.
+template <typename T>
+bool SameFloatBits(const T& a, const T& b) {
+    using Bits = std::array<u32, sizeof(T) / sizeof(u32)>;
+    return std::bit_cast<Bits>(a) == std::bit_cast<Bits>(b);
+}
+
 struct DynamicState {
     struct {
         bool viewports : 1;
@@ -164,16 +206,39 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
+    // Every re-arm of the dirty bits bumps this; a consumer that skipped a
+    // Commit must run once past it. GPU-command-thread confined like
+    // dirty_state.
+    u64 invalidate_gen{1};
+
+    /// Counts mask changes no pipeline declares dynamic; drained per 300 frames.
+    u64 color_write_mask_skips_{};
+
     /// Commits the dynamic state to the provided command buffer.
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+        ++invalidate_gen;
+    }
+
+    // Raw view of the dirty bitfield for skip-cache verification. Unused bits
+    // are stable between two reads of the same object, so they cannot forge a
+    // mismatch either way.
+    u32 DirtyBits() const {
+        u32 bits{};
+        static_assert(sizeof(dirty_state) <= sizeof(bits));
+        std::memcpy(&bits, &dirty_state, sizeof(dirty_state));
+        return bits;
+    }
+
+    u64 DrainColorWriteMaskSkips() {
+        return std::exchange(color_write_mask_skips_, u64{0});
     }
 
     void SetViewports(const Viewports& viewports_) {
-        if (!std::ranges::equal(viewports, viewports_)) {
+        if (!std::ranges::equal(viewports, viewports_, SameFloatBits<vk::Viewport>)) {
             viewports = viewports_;
             dirty_state.viewports = true;
         }
@@ -215,7 +280,7 @@ struct DynamicState {
     }
 
     void SetDepthBounds(const float min, const float max) {
-        if (depth_bounds_min != min || depth_bounds_max != max) {
+        if (!SameFloatBits(depth_bounds_min, min) || !SameFloatBits(depth_bounds_max, max)) {
             depth_bounds_min = min;
             depth_bounds_max = max;
             dirty_state.depth_bounds = true;
@@ -230,8 +295,8 @@ struct DynamicState {
     }
 
     void SetDepthBias(const float constant, const float clamp, const float slope) {
-        if (depth_bias_constant != constant || depth_bias_clamp != clamp ||
-            depth_bias_slope != slope) {
+        if (!SameFloatBits(depth_bias_constant, constant) ||
+            !SameFloatBits(depth_bias_clamp, clamp) || !SameFloatBits(depth_bias_slope, slope)) {
             depth_bias_constant = constant;
             depth_bias_clamp = clamp;
             depth_bias_slope = slope;
@@ -312,7 +377,7 @@ struct DynamicState {
     }
 
     void SetBlendConstants(const std::array<float, 4> blend_constants_) {
-        if (blend_constants != blend_constants_) {
+        if (!SameFloatBits(blend_constants, blend_constants_)) {
             blend_constants = blend_constants_;
             dirty_state.blend_constants = true;
         }
@@ -333,7 +398,7 @@ struct DynamicState {
     }
 
     void SetLineWidth(const float width) {
-        if (line_width != width) {
+        if (!SameFloatBits(line_width, width)) {
             line_width = width;
             dirty_state.line_width = true;
         }
@@ -365,6 +430,50 @@ public:
 
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
+
+    /// Where a blocking wait came from, so the cost can be attributed; one
+    /// counter pair per site, summed on the waiting thread.
+    enum class WaitSite : u8 {
+        Finish,
+        StreamRing,
+        FaultBuffer,
+        DownloadBuffer,
+        DownloadImage,
+        Count,
+    };
+    struct WaitStat {
+        u64 count{};
+        u64 ns{};
+    };
+    std::array<WaitStat, static_cast<size_t>(WaitSite::Count)>& WaitStats() {
+        return wait_stats_;
+    }
+    struct RenderScopeStats {
+        u64 calls;       // BeginRendering entries
+        u64 restarts;    // of those, the ones that really opened a pass
+        u64 interrupted; // entries that found no pass open: a dispatch or barrier closed it
+    };
+    /// GPU command thread: returns and resets the render scope census.
+    RenderScopeStats DrainRenderScopeStats() {
+        const RenderScopeStats out{rs_calls_, rs_restarts_, rs_interrupted_};
+        rs_calls_ = rs_restarts_ = rs_interrupted_ = 0;
+        return out;
+    }
+    /// GPU command thread: whether a dynamic rendering pass is open right now.
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
+
+    void RecordWait(WaitSite site, u64 ns) {
+        auto& w = wait_stats_[static_cast<size_t>(site)];
+        ++w.count;
+        w.ns += ns;
+    }
+
+    /// Waits for the given tick, attributing any blocking to a call site.
+    /// Returns the recorded wait duration in RDTSC ticks (converted by callers
+    /// via EstimateRDTSCFrequency), zero when the tick was already free.
+    u64 WaitTagged(u64 tick, WaitSite site);
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
@@ -419,9 +528,30 @@ public:
         if (work_semaphore.IsFree(tick)) {
             return true;
         }
+        if (tick_query_interval_ns_ != 0) {
+            const u64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (now - last_tick_query_.load(std::memory_order_relaxed) < tick_query_interval_ns_) {
+                return false;
+            }
+            last_tick_query_.store(now, std::memory_order_relaxed);
+        }
         work_semaphore.Refresh();
         return work_semaphore.IsFree(tick);
     }
+
+    /// A GPU timestamp and the session whose command buffer holds it.
+    struct GpuTimestamp {
+        u32 slot;
+        u64 session;
+    };
+
+    /// Records a GPU timestamp at the current point of the command stream, after all earlier
+    /// work. The first call starts timing every later session.
+    GpuTimestamp WriteGpuTimestamp();
+
+    /// GPU execution time, in nanoseconds, from the first timed session up to a timestamp whose
+    /// tick finished. Gaps where the GPU waited for the next submission do not count.
+    u64 ReadGpuBusyNs(const GpuTimestamp& timestamp);
 
     /// Returns the scheduler timeline semaphore.
     [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
@@ -433,19 +563,43 @@ public:
     void DeferOperation(Common::UniqueFunction<void>&& func) {
         std::unique_lock lk(pending_ops_mutex);
         pending_ops.emplace(std::move(func), CurrentTick());
+        pending_ops_count.fetch_add(1, std::memory_order_release);
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+        DeferPriorityOperationAt(CurrentTick(), std::move(func));
+    }
+
+    /// Defers an operation until the gpu has reached the given tick. The tick
+    /// must belong to an already submitted batch: the waiter thread never
+    /// flushes, so an unsubmitted tick would never signal.
+    void DeferPriorityOperationAt(u64 gpu_tick, Common::UniqueFunction<void>&& func) {
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
+            priority_pending_ops.emplace(std::move(func), gpu_tick);
         }
         priority_pending_ops_cv.notify_one();
     }
 
+    using SubmitHook = void (*)(void*);
+    /// Runs on the submitting thread before the queue submit; the rasterizer
+    /// arms its pending read watchers there.
+    void SetSubmitHook(SubmitHook hook, void* user) {
+        submit_hook_ = hook;
+        submit_hook_user_ = user;
+    }
+
+    /// Hands this scheduler's plain submits to the shared submit thread (async_submit).
+    void EnableAsyncSubmit();
+
+    /// Returns once the submit thread has passed every queued submit to the driver.
+    static void DrainSubmits();
+
     static std::mutex submit_mutex;
+    /// Guards the graphics queue; the submit thread takes it without submit_mutex.
+    static std::mutex queue_mutex;
 
 private:
     void EndSession();
@@ -455,6 +609,11 @@ private:
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
+    SubmitHook submit_hook_{};
+    void* submit_hook_user_{};
+    bool async_submit_{};
+    u64 tick_query_interval_ns_{};
+    std::atomic<u64> last_tick_query_{};
     const Instance& instance;
     Semaphore work_semaphore;
     CommandPool command_pool;
@@ -464,7 +623,26 @@ private:
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
+        u64 seq{};
+        u32 span_slot{UINT32_MAX};
     };
+    struct BusySpan {
+        u64 session;
+        u64 tick;
+        u32 slot;
+    };
+    void AccumulateBusy(u64 session_limit, u64 tick_limit);
+    static constexpr u32 TimestampSlots = 4096;
+    vk::QueryPool timestamp_pool{};
+    vk::QueryPool span_pool{};
+    u32 timestamp_next{};
+    u32 span_next{};
+    double timestamp_period{};
+    u64 session_seq{};
+    std::mutex busy_mutex;
+    std::deque<BusySpan> busy_spans;
+    u64 busy_ticks{};
+    u64 busy_prev_end{};
     std::vector<Session> sessions;
     std::condition_variable_any event_cv;
     struct PendingOp {
@@ -472,6 +650,11 @@ private:
         u64 gpu_tick;
     };
     std::queue<PendingOp> pending_ops;
+    std::atomic<u64> pending_ops_count{};
+    // Non-empty-queue poll throttle (pending_pop_throttle setting, latched at
+    // construction). GPU-command-thread confined like the polls it counts.
+    u32 pop_poll_throttle_{};
+    u32 pop_poll_counter_{};
     std::recursive_mutex pending_ops_mutex;
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
@@ -479,6 +662,10 @@ private:
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    std::array<WaitStat, static_cast<size_t>(WaitSite::Count)> wait_stats_{};
+    u64 rs_calls_{};
+    u64 rs_restarts_{};
+    u64 rs_interrupted_{};
     tracy::VkCtxScope* profiler_scope{};
 };
 

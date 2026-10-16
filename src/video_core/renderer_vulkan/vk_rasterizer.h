@@ -3,23 +3,27 @@
 
 #pragma once
 
+#include "common/assert.h"
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
-
-namespace AmdGpu {
-struct Liverpool;
-}
 
 namespace Core {
 class MemoryManager;
 }
 
 namespace Vulkan {
+
+// The assert body, outlined for the bind paths.
+SHAD_NO_INLINE void BindAssertFailed();
 
 class GraphicsPipeline;
 class Runtime;
@@ -44,6 +48,42 @@ public:
 
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
+    }
+
+    /// The register state draws and dispatches are recorded with: the recording thread's copy
+    /// with the draw pipe, else the command processor's.
+    [[nodiscard]] const AmdGpu::Regs& Regs() const noexcept {
+        return *record_regs;
+    }
+    [[nodiscard]] const AmdGpu::ComputeProgram& CsRegs() const noexcept {
+        return record_view ? record_view->cs : liverpool->GetCsRegs();
+    }
+    [[nodiscard]] u64 GfxStateStamp() const noexcept {
+        return record_view ? record_view->gfx_stamp : liverpool->GetGfxStateStamp();
+    }
+    [[nodiscard]] u64 DynStateStamp() const noexcept {
+        return record_view ? record_view->dyn_stamp : liverpool->GetDynStateStamp();
+    }
+    [[nodiscard]] u64 RtStateStamp() const noexcept {
+        return record_view ? record_view->rt_stamp : liverpool->GetRtStateStamp();
+    }
+    [[nodiscard]] const AmdGpu::CbDbExtent& CbExtent(u32 cb) const noexcept {
+        return record_view ? record_view->cb_extent[cb] : liverpool->last_cb_extent[cb];
+    }
+    [[nodiscard]] const AmdGpu::CbDbExtent& DbExtent() const noexcept {
+        return record_view ? record_view->db_extent : liverpool->last_db_extent;
+    }
+
+    /// The register state pipelines are selected with: the command thread's when the draw pipe
+    /// selects there (SHADPS4_PIPE_SELECT=1), else the recording state above.
+    [[nodiscard]] const AmdGpu::Regs& SelectRegs() const noexcept {
+        return pipe_select ? liverpool->regs : *record_regs;
+    }
+    [[nodiscard]] const AmdGpu::ComputeProgram& SelectCsRegs() const noexcept {
+        return pipe_select ? liverpool->GetCsRegs() : CsRegs();
+    }
+    [[nodiscard]] u64 SelectGfxStateStamp() const noexcept {
+        return pipe_select ? liverpool->GetGfxStateStamp() : GfxStateStamp();
     }
 
     void Draw(bool is_indexed, u32 index_offset = 0);
@@ -73,6 +113,9 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
+    /// WRITE_DATA into memory bound in place, recorded on the GPU. False: write on the CPU.
+    bool WriteDataOnGpu(VAddr address, const void* data, u32 size);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -80,9 +123,42 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     u64 Flush();
+    /// Tick of the batch being recorded: it completes after all work recorded so far.
+    u64 CurrentTick() const;
+    /// Runs `func` on the scheduler's completion thread once the GPU reached `tick`. The tick
+    /// must get submitted eventually (honest fences flush at guest submission ends and waits).
+    void DeferAfterTick(u64 tick, Common::UniqueFunction<void>&& func);
     void Finish();
     void OnSubmit();
+    /// A synchronizing guest packet; see the guest_sync_barriers setting.
+    void NoteGuestSync();
     void OnFence();
+
+    // Scopes a guest-copy hold to one packet run: the caller yields to guest
+    // threads between runs and the submit loop sleeps, so the hold must not
+    // outlive this object.
+    class PacketRunGuard {
+    public:
+        explicit PacketRunGuard(Rasterizer* r) : r_{r} {
+            if (r_) {
+                r_->BeginPacketRun();
+            }
+        }
+        ~PacketRunGuard() {
+            if (r_) {
+                r_->EndPacketRun();
+            }
+        }
+        PacketRunGuard(const PacketRunGuard&) = delete;
+        PacketRunGuard& operator=(const PacketRunGuard&) = delete;
+
+    private:
+        Rasterizer* r_;
+    };
+    void BeginPacketRun();
+    void EndPacketRun();
+    /// The command drain runs fault-download hops inline; none may run under the hold.
+    void DropCopyHoldForCommands();
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -101,15 +177,144 @@ public:
 #ifdef __linux__
     u32 GetGpuCommandProcessorThreadId();
 #endif
+    /// The GPU command thread or the draw pipe's recording thread (see Liverpool::OnGpuThread).
+    bool IsGpuSideThread() const {
+        return liverpool->OnGpuThread();
+    }
+
+    /// Draw pipe, GPU command thread: waits until the recording thread has recorded every
+    /// packet handed to it. A no-op on other threads and without the draw pipe.
+    void DrainDrawPipe(u32 reason = DrawPipe::ReasonRasterizer) {
+        if (draw_pipe && !draw_pipe->Idle() && AmdGpu::Liverpool::OnCommandThread()) {
+            draw_pipe->Drain(reason);
+        }
+    }
+
+    /// Draw pipe: the recording thread submits queued honest signals after the packets before
+    /// this call (directly here when it is idle).
+    void RequestPipeFlush(bool force = false);
+    /// Draw pipe: an interrupt signalled in order on the recording thread (the flip packet).
+    void QueueIrq(Platform::InterruptId irq);
+    /// Draw pipe: a WRITE_DATA or DMA_DATA packet run in order on the recording thread.
+    void QueuePm4(const void* packet, u32 size);
+    /// Draw pipe: an honest fence recorded in order after the packets before it.
+    void QueueFence(const std::optional<AmdGpu::Liverpool::FenceWrite>& write,
+                    std::optional<Platform::InterruptId> irq);
 
 private:
-    void PrepareRenderState(const GraphicsPipeline* pipeline);
-    RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    enum class PipeOp : u8 {
+        Draw,
+        DrawIndirect,
+        DispatchDirect,
+        DispatchIndirect,
+        GuestSync,
+        Fence,
+        Flush,
+        Pm4,
+        Submit,
+        Irq,
+    };
+    enum PipeFlags : u8 {
+        PipeReset = 1 << 0,    ///< CLEAR_STATE: defaults first
+        PipeFull = 1 << 1,     ///< the full register file follows the blocks
+        PipeVerify = 1 << 2,   ///< compare the copy with the full file before taking it
+        PipeSelected = 1 << 3, ///< the pipeline and its stages' user data follow the args
+    };
+    struct PipePacket {
+        PipeOp op;
+        u8 flags;
+        u16 num_blocks;
+        u32 pad;
+        u64 gfx_stamp;
+        u64 dyn_stamp;
+        u64 rt_stamp;
+        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;
+        AmdGpu::CbDbExtent db_extent;
+    };
+    struct PipeDraw {
+        bool is_indexed;
+        u32 index_offset;
+    };
+    struct PipeDrawIndirect {
+        bool is_indexed;
+        u16 vertex_sgpr_offset;
+        u16 instance_sgpr_offset;
+        u32 offset;
+        u32 size;
+        u32 max_count;
+        VAddr arg_address;
+        VAddr count_address;
+    };
+    /// A pipeline selected on the command thread, then one PipeStageUd per stage and the
+    /// stages' flattened user data.
+    struct PipeSelection {
+        const Pipeline* pipeline;
+        u32 num_stages;
+        u32 flat_words;
+    };
+    struct PipeStageUd {
+        const Shader::Info* info;
+        VAddr pgm_base;
+        u32 flat_words;
+        u32 pad;
+        std::array<u32, Shader::NUM_USER_DATA_REGS> user_data;
+    };
+    struct PipeFence {
+        AmdGpu::Liverpool::FenceWrite write;
+        bool has_write;
+        bool has_irq;
+        Platform::InterruptId irq;
+    };
+    struct PipeDispatch {
+        AmdGpu::ComputeProgram cs;
+        VAddr address;
+        u32 offset;
+        u32 size;
+    };
+    /// Stage A: hands the dirty register blocks and `args` to the recording thread.
+    void SendPipePacket(PipeOp op, const void* args, u32 args_size,
+                        const Pipeline* selected = nullptr);
+    /// Stage B: installs the selecting draw's user data (Shader::Info::UdSnapshot).
+    void InstallPipeSelection(const u8* data);
+    /// The pipeline the command thread selected for the packet being recorded, else select().
+    template <typename Select>
+    auto SelectedOr(Select&& select) {
+        using Result = decltype(select());
+        if (selected_pipeline) {
+            return static_cast<Result>(selected_pipeline);
+        }
+        if (pipe_select) {
+            NoteMissingSelection();
+            return Result{};
+        }
+        return select();
+    }
+    SHAD_NO_INLINE void NoteMissingSelection();
+    /// Stage B: applies a packet to the register copy and records it.
+    void RunPipePacket(const u8* data, u32 size);
+    void VerifyPipeRegs(const AmdGpu::Regs& expected);
+    void EmitDrawPipeTelemetry();
+    /// End of a guest frame: the census lines (command thread) and the cache ticks (where the
+    /// draws are recorded).
+    void LogPacketStats();
+    void RecordSubmit();
+
+    void RecordDraw(bool is_indexed, u32 index_offset);
+    void RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
+                            u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
+                            u16 instance_sgpr_offset);
+    void RecordDispatchDirect();
+    void RecordDispatchIndirect(VAddr address, u32 offset, u32 size);
+
+    // Returns whether the memo it consumed or refilled may certify the next
+    // draw's glue (draw_glue_memo); false whenever the glue is off.
+    bool PrepareRenderState(const GraphicsPipeline* pipeline);
+    const RenderState& BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    bool UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed);
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
     void UpdatePrimitiveState(bool is_indexed) const;
@@ -117,6 +322,7 @@ private:
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();
+    bool FilterDrawSlow();
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
@@ -131,8 +337,265 @@ private:
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
+    /// The three compute shortcuts, out of the graphics bind path's lines.
+    SHAD_NO_INLINE bool TakeComputeShortcut(const Pipeline* pipeline);
+    /// Builds a pipeline's descriptor write plan from the list this bind just emitted.
+    SHAD_NO_INLINE void BuildBindWritePlan(const Pipeline* pipeline);
+
+    /// The once-per-300-frames [SkipCache] telemetry block, out of OnSubmit's lines.
+    void EmitSkipcacheTelemetry(VideoCore::Skipcache::Framework& skipcache);
 
 private:
+    // BeginRendering skip cache (verify contract in skipcache.h). The snapshot
+    // is always clear-free: populate refuses any state carrying a clear flag,
+    // which subsumes the consumed-on-read CMASK and level-triggered
+    // register-clear traps. Guards are read-only and run BEFORE the slow path
+    // can consume meta.
+    struct BrAttachmentGuard {
+        VAddr meta_addr{}; // 0 = no metadata
+        VideoCore::ImageId image_id{};
+        u64 image_uid{};
+        const void* backing{};
+        vk::ImageLayout expected_layout{};
+        vk::AccessFlags2 expected_access{};
+        u32 base_level{}, base_layer{}, num_levels{}, num_layers{};
+    };
+    struct BeginRenderingCache {
+        bool valid{};
+        bool attachment_feedback_loop{};
+        bool has_db{};
+        u32 cb_count{};
+        const GraphicsPipeline* pipeline{}; // compared, never dereferenced
+        VideoCore::Skipcache::DrawToken token{};
+        u64 meta_gen{};
+        u64 layout_gen{};
+        RenderState state{}; // clear-free by populate refusal
+        std::array<BrAttachmentGuard, AmdGpu::NUM_COLOR_BUFFERS> cb_guard{};
+        BrAttachmentGuard db_guard{};
+    };
+    bool BrProbe(const VideoCore::Skipcache::DrawToken& token, const GraphicsPipeline* pipeline);
+    bool BrGuardAttachment(const BrAttachmentGuard& g, VideoCore::Skipcache::CacheCounters& ctr);
+    SHAD_FORCE_INLINE const RenderState& BrReplay(const GraphicsPipeline* pipeline);
+    void BrVerify(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token);
+    void BrPopulate(const RenderState& fresh, const VideoCore::Skipcache::DrawToken& token,
+                    const GraphicsPipeline* pipeline);
+    static void BrInvalidateThunk(void* self) {
+        static_cast<Rasterizer*>(self)->br_cache_.valid = false;
+    }
+    BeginRenderingCache br_cache_{};
+    bool br_readback_gate_{}; // readbackLinearImages snapshot: cache off when set
+    bool batch_copy_lock_{};  // settings snapshot, read at draw rate
+    // Interval flush: a readback fence otherwise waits on the whole body
+    // recorded since the last submit. Boot-latched; 0 = off.
+    u32 flush_draw_interval_{};
+    u32 draws_since_flush_{};
+    u64 flush_tick_{};
+    // Inside a run of draws writing readback-prone
+    // buffers, and the run's length; flushes it adds, for the log.
+    bool tracker_lock_spin_{};
+    bool prone_run_{};
+    u32 prone_run_draws_{};
+    u64 writer_flushes_{};
+    u64 interval_flushes_{};
+    // ring_drain_flush_draws: boot-latched, clamped to >= 32 and rounded up to
+    // the multiple of 32 that actually fires; 0 = off.
+    u32 ring_drain_flush_draws_{};
+    u64 drain_flushes_{};
+    u32 drain_reach_{};
+    u64 drain_polls_{};
+    u64 drain_busy_{};
+    u64 drain_draw_sum_{};
+    u32 drain_draw_max_{};
+    // Snapshot of the framework's FindImage counters at the last report; the
+    // per-window line prints the deltas (Forced mode never resets them).
+    VideoCore::Skipcache::CacheCounters findimg_last_{};
+    VideoCore::Skipcache::CacheCounters br_last_{};
+    VideoCore::Skipcache::CacheCounters rt_last_{};
+    // Moves of the register stamp the render target memo keys on: its miss floor.
+    u64 rt_stamp_last_{};
+    u64 rt_stamp_moves_{};
+    // The whole-register-file stamp's moves beside the keyed lane; the gap is the lane's win.
+    u64 rt_gfx_last_{};
+    u64 rt_gfx_moves_{};
+    // Last drained framework counters of the descriptor delta cache; the
+    // DESCDELTA line prints the window's miss lanes from the difference.
+    VideoCore::Skipcache::CacheCounters desc_last_{};
+    VideoCore::Skipcache::CacheCounters dynstate_last_{};
+    u64 dyn_stamp_last_{};
+    u64 gfx_stamp_last_{};
+    /// Flushes at the draw interval, or now when the prone-write run the
+    /// draw just recorded belongs to is due for its flush.
+    void MaybeIntervalFlush(bool prone_write);
+    bool bind_prefetch_{};
+    // One guest-copy shared hold per packet run (guest_copy_hold_segment).
+    // The hold may cover GPU waits, never a wait on a guest thread; every
+    // path that can block on one drops it first.
+    std::optional<Core::MemoryManager::GuestCopyScope> run_copy_hold_;
+    bool in_packet_run_{};
+    bool segment_copy_hold_{};
+    u64 hold_arms_{};
+    u64 hold_draws_covered_{};
+    u64 hold_drops_run_{};
+    u64 hold_drops_flush_{};
+    u64 hold_drops_wait_{};
+    u64 hold_drops_cmd_{};
+    u64 hold_compiles_{};
+    void ArmCopyHold();
+    void DropCopyHold(u64& counter);
+    static void PreCompileThunk(void* self) {
+        auto* r = static_cast<Rasterizer*>(self);
+        r->DropCopyHold(r->hold_compiles_);
+    }
+    u64 bindpf_img_{};
+    u64 bindpf_backing_{};
+    // bind_write_plan: the mode, this bind's verdicts, and the write list the
+    // pipeline is handed (the plan's on a hit, the rebuilt one otherwise).
+    u32 bind_write_plan_{};
+    bool plan_hit_{};
+    bool plan_rejected_{};
+    vk::WriteDescriptorSet* bind_writes_{};
+    u32 bind_write_n_{};
+    // The info array extents the bind filled, handed to the delta probe.
+    u32 bind_buffer_n_{};
+    u32 bind_image_n_{};
+    bool desc_delta_flat_{};
+    u64 bindplan_flat_{};
+    u64 bindplan_binds_{};
+    u64 bindplan_hits_{};
+    u64 bindplan_builds_{};
+    u64 bindplan_dyn_{};
+    u64 bindplan_defer_{};
+    u64 bindplan_mismatch_{};
+    bool bind_noop_{};
+    bool memo_first_{};
+    bool bind_lean_{};
+    u64 bindlean_primes_{};
+    u64 bindlean_full_{};
+    // findimg_slot_hint: the bound pipeline's hint cursor for BindTextures,
+    // both null when off. Every binding ordinal consumes one slot, rejected
+    // or not, so the ordinals stay stable from the first bind.
+    bool findimg_hint_{};
+    u16* image_hint_cur_{};
+    u16* image_hint_end_{};
+    void SkipImageHints(size_t n) {
+        image_hint_cur_ +=
+            std::min<size_t>(n, static_cast<size_t>(image_hint_end_ - image_hint_cur_));
+    }
+    void RejectImageBindings(u32 num_bindings) {
+        plan_rejected_ = true;
+        SkipImageHints(num_bindings);
+        for (u32 i = 0; i < num_bindings; ++i) {
+            image_bindings.emplace_back();
+        }
+        if (!plan_hit_) {
+            image_descriptor_array_sizes.push_back(num_bindings);
+        }
+    }
+    u64 bindnoop_hits_{};
+    u64 bindnoop_slow_{};
+    u64 tsc_hz_{}; // measured once at construction; the estimator sleeps ~101ms
+
+    // BindingSkip LEARNING probe state (observation snapshot, not a cache).
+    struct BindingSkipProbeState {
+        struct StageSnap {
+            u64 pgm_hash{};
+            std::array<u32, 16> user_data{};
+        };
+        const Pipeline* pipeline{};
+        u64 tick{};
+        u32 num_stages{};
+        std::array<StageSnap, 8> stages{};
+        bool valid{};
+    };
+    SHAD_NO_INLINE void BindingSkipProbeBody(const Pipeline* pipeline);
+    BindingSkipProbeState bs_probe_{};
+
+    // PrepareRenderState memo: with the CB/DB registers, extent hints and
+    // texture-cache structure unchanged, the render-target resolution from the
+    // previous draw replays: cb_descs/db_desc still hold the identically
+    // constructed (and identically rebased) descriptors, so only the image
+    // ids, is_target marks and bound_images entries need re-establishing.
+    struct PrepareRtMemo {
+        bool valid{};
+        u64 reg_stamp{};
+        u64 tex_gen{};
+        u64 pipe_gen{};
+        const GraphicsPipeline* pipeline{}; // compared, never dereferenced
+        u32 cb_count{};
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS> cb_id{};
+        // Debug-only audit snapshot (RtMemoProbe's NDEBUG block).
+        std::array<u64, AmdGpu::NUM_COLOR_BUFFERS> cb_uid{};
+        VideoCore::ImageId db_id{};
+        u64 db_uid{};
+    };
+    bool RtMemoProbe(const GraphicsPipeline* pipeline, u64 reg_stamp, u64 tex_gen, u64 pipe_gen);
+    SHAD_FORCE_INLINE void RtMemoReplay();
+    void RtMemoVerifyPopulate(bool would_hit, const GraphicsPipeline* pipeline, u64 reg_stamp,
+                              u64 tex_gen, u64 pipe_gen);
+    PrepareRtMemo rt_memo_{};
+
+    // UpdateDynamicState memo: every value the five updaters compute is a pure
+    // function of the stamped graphics registers, the pipeline write masks, the
+    // feedback-loop flag and immutable device caps, and each setter marks a
+    // dirty bit exactly when it writes one - so an unchanged key marks nothing
+    // and Commit emits nothing. dyn_gen covers the three Invalidate() sites,
+    // which re-arm every bit without changing a value.
+    struct DynStateMemo {
+        u64 reg_stamp{};
+        u64 dyn_gen{};
+        u64 pipe_gen{};
+        const GraphicsPipeline* pipeline{}; // compared, never dereferenced
+        u32 flags{}; // 0 invalid; bit0 valid, bit1 feedback loop, bit2 indexed
+        // The only pipeline field the updaters read; the stamp-lane keying
+        // compares it instead of the pipeline identity.
+        std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks{};
+    };
+    bool DynMemoProbe(VideoCore::Skipcache::CacheCounters& ctr, const GraphicsPipeline* pipeline,
+                      u32 flags, u64 reg_stamp, u64 dyn_gen, u64 pipe_gen);
+    DynStateMemo dyn_memo_{};
+    bool dyn_memo_enabled_{};
+    bool dyn_class_stamp_{};
+    // CPWRITE census, GPU command thread only: plain adds, drained per300f.
+    u64 cpwrite_seen_{};
+    u64 cpwrite_armed_{};
+    u64 cpwrite_backing_{};
+    u64 cpwrite_gpu_{};
+    u64 cpwrite_nofit_{};
+    u64 cpwrite_nobacking_{};
+
+    // Pipeline bind dedup: {handle, bind point} last issued on this cmdbuf.
+    void BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline handle);
+    std::array<vk::Pipeline, 2> last_bound_pipeline_{};
+    std::array<u64, 2> last_bound_pipeline_gen_{};
+    u64 last_bound_tick_{};
+
+    // Vertex input memo: the layout last set on this command buffer, so a draw with the same one
+    // skips setVertexInputEXT. Cleared at every session end; the foreign gen catches the blit
+    // helper and host passes, whose graphics pipelines replace the dynamic vertex input state.
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> vertex_input_attributes_;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> vertex_input_bindings_;
+    u64 vertex_input_tick_{};
+    u64 vertex_input_foreign_gen_{};
+    bool vertex_input_valid_{};
+    u64 vinput_calls_{};
+    u64 vinput_sets_{};
+
+    // vertex_layout_memo: the layout last built, and its key. The layout is a function of each
+    // attribute's format, stride and step-rate type plus the two step rates, whatever pipeline
+    // carries the fetch shader.
+    void ReadVertexLayout(const GraphicsPipeline* pipeline,
+                          VertexInputs<AmdGpu::Buffer>& guest_buffers);
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> layout_attributes_;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> layout_bindings_;
+    VertexInputs<u64> layout_keys_;
+    u32 layout_step0_{};
+    u32 layout_step1_{};
+    bool layout_valid_{};
+    bool vertex_layout_memo_{};
+    u64 vlayout_calls_{};
+    u64 vlayout_builds_{};
+    u64 filter_true_stamp_{};
+
     friend class VideoCore::BufferCache;
 
     const Instance& instance;
@@ -143,8 +606,27 @@ private:
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
+    /// The draw pipe's recording thread state: its register copy and the command processor
+    /// state of the packet it records. Null without the draw pipe.
+    struct RecordView {
+        AmdGpu::Regs regs;
+        AmdGpu::ComputeProgram cs;
+        u64 gfx_stamp;
+        u64 dyn_stamp;
+        u64 rt_stamp;
+        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;
+        AmdGpu::CbDbExtent db_extent;
+    };
+    std::unique_ptr<RecordView> record_view;
+    /// Draw pipe: pipelines are selected on the command thread and handed over.
+    bool pipe_select{};
+    /// Stage B: the pipeline the packet being recorded was selected with, or null.
+    const Pipeline* selected_pipeline{};
+    const AmdGpu::Regs* record_regs;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
+    // Generation for IsMapped's per-thread interval cache.
+    std::atomic<u64> mapped_ranges_gen_{0};
     PipelineCache pipeline_cache;
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
@@ -153,13 +635,10 @@ private:
         VideoCore::ImageId image_id;
         VideoCore::TextureCache::ImageDesc desc;
     };
-    std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
 
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
-    boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
-
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;
@@ -169,12 +648,143 @@ private:
     std::vector<BoundBuffer> bound_buffers;
     std::vector<VideoCore::ImageId> bound_images;
 
-    u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
-    Shader::PushData push_data;
+    // 120 bytes: unaligned it straddles three cache lines, so every draw's
+    // rebuild touches a third line for eight bytes of it.
+    alignas(64) Shader::PushData push_data{};
+    // push_vp_memo: the high-water mark of the previous draw's buffer-offset
+    // writes, pinned into push_data's second line so the prefix clear and the
+    // mark share the lines the build already writes. Every byte at or past
+    // the mark is zero, which the dedup's byte-identity needs.
+    u32 push_bo_hw_{Shader::NUM_BUFFERS};
+    u64 vp_push_stamp_{};
+    bool push_vp_memo_{};
+    SHAD_NO_INLINE void RefreshViewportPush();
 
+    static_assert(std::is_trivially_destructible_v<ImageBinding>);
+    // Objects built once; PrimeNext hands out the next one untouched for an
+    // in-place prime, emplace_back rebuilds one with construct_at.
+    struct ImageBindingList {
+        std::array<ImageBinding, Shader::NUM_IMAGES> slots{};
+        u32 n{};
+        void clear() noexcept {
+            n = 0;
+        }
+        ImageBinding& PrimeNext() {
+            if (n == slots.size()) [[unlikely]] {
+                BindAssertFailed();
+            }
+            return slots[n++];
+        }
+        template <typename... Args>
+        ImageBinding& emplace_back(Args&&... args) {
+            return *std::construct_at(&PrimeNext(), std::forward<Args>(args)...);
+        }
+        ImageBinding& operator[](size_t i) {
+            return slots[i];
+        }
+        ImageBinding* begin() {
+            return slots.data();
+        }
+        ImageBinding* end() {
+            return slots.data() + n;
+        }
+    };
+    ImageBindingList image_bindings;
+    // Constructed and destroyed two or three times per draw as a local.
+    boost::container::static_vector<u32, Shader::NUM_IMAGES> image_descriptor_array_sizes;
     bool attachment_feedback_loop{};
+
+    std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos{};
+    u32 buffer_info_n_{};
+
+    // Buffer bind scratch census: five stores per stage, none per binding.
+    u64 bindscratch_calls_{};
+    u64 bindscratch_binds_{};
+    u64 bindscratch_bindmax_{};
+    u64 bindscratch_infos_{};
+    u64 bindscratch_infomax_{};
+
+    // rt_state_stamp: the render-target memo and the render-scope cache key on
+    // the stamp's rt lane and on the pipeline key's mrt_mask (and colour sample
+    // counts) instead of the pipeline identity, and compare the depth_control
+    // and color_control bits their bodies read against these populate-time
+    // snapshots. draw_samples_target_ is the render-scope body's one
+    // non-register input: whether this draw binds a colour target as a texture.
+    u64 RtLaneStamp() const noexcept;
+    bool rt_state_stamp_{};
+    u32 rt_memo_mrt_mask_{};
+    u32 rt_memo_depth_bits_{};
+    u32 rt_memo_color_bits_{};
+    u32 br_mrt_mask_{};
+    u32 br_depth_bits_{};
+    u32 br_color_bits_{};
+    std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> br_color_samples_{};
+    bool draw_samples_target_{};
+    // push_vp_memo census: probes, stamp hits and the summed high-water marks.
+    u64 pushvp_probes_{};
+    u64 pushvp_hits_{};
+    u64 pushvp_bow_{};
+    // The attachment views the memo left in place, for the mode-3 audit.
+    std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS> rt_memo_cb_view_{};
+    VideoCore::ImageViewInfo rt_memo_db_view_{};
+    // BRRT census: the three ctl-bits veto inputs, and misses whose fresh
+    // state equalled the snapshot they replaced (with the pass still open).
+    u64 br_veto_depth_{}, br_veto_color_{}, br_veto_fbl_{}, br_same_state_{}, br_same_open_{};
+    // br_mem_fast_state latch and its census: moved-mem_gen probes
+    // re-certified from the attachment words.
+    bool br_mem_fast_state_{};
+    u64 br_mem_recert_{};
+    /// Valid until the next BeginRendering. Nothing between
+    /// Rasterizer::BeginRendering and scheduler.BeginRendering(state) writes
+    /// br_cache_.state or fresh_state_ (a flush inside the binds only clears
+    /// valid), so a reference to either survives the binds.
+    RenderState fresh_state_{};
+
+    // draw_glue_memo: one certificate over the three per-draw memos. Armed by
+    // a draw on which all three consumed or refilled their memo; the next
+    // draw with the same whole-file register stamp and pipeline, and the
+    // generations each memo keys on unchanged, replays all three without
+    // their probes. Every term is re-read live at the point the real probe
+    // would read it. Mode 3 is a shadow: the certificate is computed and
+    // compared against the real probes, which still run.
+    struct DrawGlueMemo {
+        u64 gfx_stamp{};
+        const GraphicsPipeline* pipeline{}; // compared, never dereferenced
+        bool armed{};
+    };
+    DrawGlueMemo glue_{};
+    u32 glue_mode_{};
+    bool glue_br_ok_{};
+    u64 glue_probes_{};
+    u64 glue_hits_{};
+    u64 glue_entry_miss_{};
+    u64 glue_bind_miss_{};
+    u64 glue_dyn_miss_{};
+    u64 glue_arms_{};
+    u64 glue_div_{};
     bool needs_barrier{};
+
+    // Draw pipe: every pipe_verify_every-th packet carries the full register file
+    // (SHADPS4_PIPE_VERIFY); the first one always does.
+    u32 pipe_verify_every_{};
+    u32 pipe_verify_count_{};
+    bool pipe_full_next_{true};
+    u64 pipe_flush_packets_{};
+    u64 pipe_flushes_{};
+    std::atomic<u64> pipe_verified_{};
+    std::atomic<u64> pipe_mismatches_{};
+    std::atomic<u64> pipe_apply_cycles_{};
+    u64 pipe_last_apply_{};
+    u64 pipe_blocks_same_{};
+    /// Command thread: the register file as the recording thread holds it.
+    std::unique_ptr<AmdGpu::Regs> pipe_sent_regs;
+    u64 pipe_blocks_{};
+    u64 pipe_last_packets_{};
+    u64 pipe_last_busy_{};
+    u64 pipe_last_tsc_{};
+    // Last: the recording thread stops before anything it uses goes.
+    std::unique_ptr<DrawPipe> draw_pipe;
 };
 
 } // namespace Vulkan

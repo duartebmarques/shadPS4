@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -8,6 +9,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -228,7 +230,8 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    // RADV already enables about 30; the guest memory extensions need room on top.
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -348,6 +351,14 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+#ifdef __linux__
+    // Guest memory in place (inplace_guest_memory 2): direct memory exported as dma-buf.
+    if (EmulatorSettings.GetInplaceGuestMemory() >= 2) {
+        const bool fd = add_extension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+        const bool dma_buf = fd && add_extension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        supports_guest_memory_export = fd && dma_buf;
+    }
+#endif
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -377,8 +388,20 @@ bool Instance::CreateDevice() {
         return false;
     }
 
+    // Under gamescope (Steam Deck Gaming Mode) the GPU-bound emulator starves the Steam overlays
+    // and the compositor of GPU time at equal priority, so they are slow to appear. A low priority
+    // queue yields to them only while they have work.
+    static constexpr vk::DeviceQueueGlobalPriorityCreateInfoKHR low_priority = {
+        .globalPriority = vk::QueueGlobalPriorityKHR::eLow,
+    };
+    const bool yield_to_compositor = std::getenv("GAMESCOPE_WAYLAND_DISPLAY") != nullptr &&
+                                     add_extension(VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME);
+    if (yield_to_compositor) {
+        LOG_INFO(Render_Vulkan, "Running under gamescope: low GPU queue priority");
+    }
     static constexpr std::array queue_priorities = {1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
+        .pNext = yield_to_compositor ? &low_priority : nullptr,
         .queueFamilyIndex = queue_family_index,
         .queueCount = static_cast<u32>(queue_priorities.size()),
         .pQueuePriorities = queue_priorities.data(),
@@ -628,6 +651,10 @@ bool Instance::CreateDevice() {
         }
     }
 
+    // A pipeline built under one value and drawn under the other would bind
+    // the wrong mask, so the choice is latched once here.
+    dynamic_color_write_mask_enabled =
+        IsDynamicColorWriteMaskSupported() && !EmulatorSettings.IsStaticColorWriteMask();
     CreateAllocator();
     return true;
 }
@@ -646,8 +673,13 @@ void Instance::CreateAllocator() {
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
     };
+    // 64 MiB blocks instead of VMA's 256 MiB: a block only goes back to the driver once all of it
+    // is free, so a few surviving images held large blocks in place. On integrated GPUs (Steam
+    // Deck) that memory is system RAM. Ported from bbport (deadinside28/bloodborne_pc).
+    VmaAllocatorCreateInfo allocator_info_sized = allocator_info;
+    allocator_info_sized.preferredLargeHeapBlockSize = 64ULL << 20;
 
-    const VkResult result = vmaCreateAllocator(&allocator_info, &allocator);
+    const VkResult result = vmaCreateAllocator(&allocator_info_sized, &allocator);
     if (result != VK_SUCCESS) {
         UNREACHABLE_MSG("Failed to initialize VMA with error {}",
                         vk::to_string(vk::Result{result}));
@@ -790,6 +822,21 @@ u64 Instance::GetDeviceMemoryUsage() const {
         total_usage += memory_budget_props.heapUsage[heap];
     }
     return total_usage;
+}
+
+void Instance::GetDeviceMemoryUsageAndBudget(u64& usage, u64& budget) const {
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &memory_budget_props,
+    };
+    physical_device.getMemoryProperties2(&props);
+
+    usage = 0;
+    budget = 0;
+    for (const size_t heap : valid_heaps) {
+        usage += memory_budget_props.heapUsage[heap];
+        budget += memory_budget_props.heapBudget[heap];
+    }
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

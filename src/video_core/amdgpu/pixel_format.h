@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <string_view>
 #include <fmt/format.h>
 #include "common/assert.h"
@@ -212,7 +213,8 @@ constexpr DataFormat RemapDataFormat(const DataFormat format) {
     }
 }
 
-constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFormat data_format) {
+constexpr NumberFormat RemapNumberFormatCases(const NumberFormat format,
+                                              const DataFormat data_format) {
     switch (format) {
     case NumberFormat::Unorm: {
         switch (data_format) {
@@ -260,7 +262,7 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     switch (format) {
     case DataFormat::Format1_5_5_5:
     case DataFormat::Format11_11_10: {
-        CompMapping result;
+        CompMapping result{};
         result.r = swizzle.b;
         result.g = swizzle.g;
         result.b = swizzle.r;
@@ -268,7 +270,7 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
         return result;
     }
     case DataFormat::Format10_10_10_2: {
-        CompMapping result;
+        CompMapping result{};
         result.r = swizzle.a;
         result.g = swizzle.b;
         result.b = swizzle.g;
@@ -277,7 +279,7 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     }
     case DataFormat::Format4_4_4_4: {
         // Remap to a more supported component order.
-        CompMapping result;
+        CompMapping result{};
         result.r = swizzle.g;
         result.g = swizzle.b;
         result.b = swizzle.a;
@@ -286,7 +288,7 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     }
     case DataFormat::Format5_6_5: {
         // Remap to a more supported component order.
-        CompMapping result;
+        CompMapping result{};
         result.r = swizzle.b;
         result.g = swizzle.g;
         result.b = swizzle.r;
@@ -316,8 +318,12 @@ constexpr CompMapping RemapSwizzle(const DataFormat format, const CompMapping sw
     }
 }
 
-constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
-                                               const DataFormat data_fmt) {
+// Sentinel for combinations the case body declares unreachable; the table
+// accessor turns it back into the crash so the diagnostic is preserved.
+inline constexpr u8 kInvalidNumberConversion = 0xFF;
+
+constexpr NumberConversion MapNumberConversionCases(const NumberFormat num_fmt,
+                                                    const DataFormat data_fmt) {
     switch (num_fmt) {
     case NumberFormat::Unorm: {
         switch (data_fmt) {
@@ -358,12 +364,48 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            return static_cast<NumberConversion>(kInvalidNumberConversion);
         }
     }
     default:
         return NumberConversion::None;
     }
+}
+
+// The two mappings above run per color target and per sharp at draw rate, and
+// the compiler lowers the nested switches to mispredicting jump tables. The
+// lookup tables are built at compile time by evaluating the case bodies, so
+// the mapping stays defined in one place.
+namespace detail {
+template <auto MapFn>
+consteval std::array<std::array<u8, 64>, 16> BuildFormatLut() {
+    std::array<std::array<u8, 64>, 16> lut{};
+    for (u32 nf = 0; nf < lut.size(); ++nf) {
+        for (u32 df = 0; df < lut[nf].size(); ++df) {
+            lut[nf][df] =
+                static_cast<u8>(MapFn(static_cast<NumberFormat>(nf), static_cast<DataFormat>(df)));
+        }
+    }
+    return lut;
+}
+inline constexpr auto kRemapNumberFormatLut = BuildFormatLut<RemapNumberFormatCases>();
+inline constexpr auto kMapNumberConversionLut = BuildFormatLut<MapNumberConversionCases>();
+} // namespace detail
+
+constexpr NumberFormat RemapNumberFormat(const NumberFormat format, const DataFormat data_format) {
+    return static_cast<NumberFormat>(
+        detail::kRemapNumberFormatLut[static_cast<u32>(format) & 15]
+                                     [static_cast<u32>(data_format) & 63]);
+}
+
+constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
+                                               const DataFormat data_fmt) {
+    const u8 conv = detail::kMapNumberConversionLut[static_cast<u32>(num_fmt) & 15]
+                                                   [static_cast<u32>(data_fmt) & 63];
+    if (conv == kInvalidNumberConversion) {
+        UNREACHABLE_MSG("num_fmt = {}, data_fmt = {}", u32(num_fmt), u32(data_fmt));
+    }
+    return static_cast<NumberConversion>(conv);
 }
 
 constexpr NumberClass GetNumberClass(const NumberFormat nfmt) {
@@ -399,7 +441,52 @@ std::string_view NameOf(NumberFormat fmt);
 
 constexpr u32 NUM_ENTRIES = 42;
 
-extern const std::array<s32, NUM_ENTRIES> NUM_COMPONENTS;
+// In the header so compile-time tables can be built from it; 0 marks a format
+// code the hardware does not define.
+inline constexpr std::array<s32, NUM_ENTRIES> NUM_COMPONENTS = {
+    0, //  0 FormatInvalid
+    1, //  1 Format8
+    1, //  2 Format16
+    2, //  3 Format8_8
+    1, //  4 Format32
+    2, //  5 Format16_16
+    3, //  6 Format10_11_11
+    3, //  7 Format11_11_10
+    4, //  8 Format10_10_10_2
+    4, //  9 Format2_10_10_10
+    4, // 10 Format8_8_8_8
+    2, // 11 Format32_32
+    4, // 12 Format16_16_16_16
+    3, // 13 Format32_32_32
+    4, // 14 Format32_32_32_32
+    0, // 15
+    3, // 16 Format5_6_5
+    4, // 17 Format1_5_5_5
+    4, // 18 Format5_5_5_1
+    4, // 19 Format4_4_4_4
+    2, // 20 Format8_24
+    2, // 21 Format24_8
+    2, // 22 FormatX24_8_32
+    0, // 23
+    0, // 24
+    0, // 25
+    0, // 26
+    0, // 27
+    0, // 28
+    0, // 29
+    0, // 30
+    0, // 31
+    3, // 32 FormatGB_GR
+    3, // 33 FormatBG_RG
+    4, // 34 Format5_9_9_9
+    4, // 35 FormatBc1
+    4, // 36 FormatBc2
+    4, // 37 FormatBc3
+    1, // 38 FormatBc4
+    2, // 39 FormatBc5
+    3, // 40 FormatBc6
+    4, // 41 FormatBc7
+};
 extern const std::array<s32, NUM_ENTRIES> BITS_PER_BLOCK;
 extern const std::array<s32, NUM_ENTRIES> BITS_PER_ELEMENT;
 

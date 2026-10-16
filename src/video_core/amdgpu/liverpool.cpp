@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstddef>
+#include <cstdlib>
+#include <optional>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -15,6 +18,8 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/buffer_cache/region_manager.h"
+#include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -51,22 +56,558 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
-static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
-    if (offset > span.size()) {
-        LOG_ERROR(
-            Lib_GnmDriver,
-            ": packet length exceeds remaining submission size. Packet dword count={}, remaining "
-            "submission dwords={}",
-            offset, span.size());
-        // Return empty subspan so check for next packet bails out
-        return {};
-    }
+static SHAD_NO_INLINE std::span<const u32> NextPacketOverflow(size_t offset, size_t remaining) {
+    LOG_ERROR(Lib_GnmDriver,
+              ": packet length exceeds remaining submission size. Packet dword count={}, remaining "
+              "submission dwords={}",
+              offset, remaining);
+    // Return empty subspan so check for next packet bails out
+    return {};
+}
 
+// The log machinery in the overflow branch kept this out of line at packet
+// rate; split so the common path inlines.
+static inline std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
+    if (offset > span.size()) [[unlikely]] {
+        return NextPacketOverflow(offset, span.size());
+    }
     return span.subspan(offset);
 }
 
-Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+// The messages are formatted here rather than in the parser loop: fmt binds its
+// arguments by reference, and an address-exposed local in a coroutine is pinned
+// to the frame and written through a spilled pointer on every packet.
+[[noreturn]] static SHAD_NO_INLINE void UnhandledPm4Type(const PM4Header* header) {
+    if (header->type == 0) {
+        UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
+                        header->type0.base.Value(), header->type0.NumWords());
+    }
+    UNREACHABLE_MSG("Wrong PM4 type {}", header->type.Value());
+}
+
+static void CountAcbDispatch(Liverpool::PacketStats& stats) {
+    ++stats.acb_dispatches;
+    stats.gfx_to_acb += stats.after_draw;
+    stats.after_draw = false;
+}
+
+[[noreturn]] static SHAD_NO_INLINE void UnknownPm4Opcode(u32 opcode, u32 count) {
+    UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}", opcode, count);
+}
+
+// Must be the first statement of every draw arm, above the rasterizer guard, so
+// the counts and the stamp flush are identical with and without a rasterizer.
+// There is no central opcode list any more: a new draw opcode needs its own
+// call here. Also closes the pending graphics-state stamp window.
+SHAD_FORCE_INLINE static void BeginDraw(Liverpool::PacketStats& stats, GfxStateStamp& stamp,
+                                        const PM4Header* header) {
+    ++stats.draws;
+    stats.after_draw = true;
+    if (header->type3.predicate.Value() == PM4Predicate::PredEnable) {
+        ++stats.predicated_draws;
+    }
+    stamp.FlushAtDraw();
+}
+
+// Every queued lane copy still reads guest memory that the fence tells the guest it may reuse,
+// so the lanes drain before anything guest-visible is written. Then the downloads and the sync
+// batch, so a fence sees them.
+static void FenceDrainAndDownload(Vulkan::Rasterizer* rasterizer) {
+    if (rasterizer) {
+        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonFence);
+    }
+    VideoCore::StreamCopyLane::Instance().DrainProducer();
+    if (rasterizer) {
+        rasterizer->NoteGuestSync();
+        rasterizer->OnFence();
+    }
+}
+
+// Packets that order the guest GPU's later work after its earlier work.
+static void NoteGuestSync(Vulkan::Rasterizer* rasterizer) {
+    if (rasterizer) {
+        rasterizer->NoteGuestSync();
+    }
+}
+
+// Draw pipe: whether a graphics packet waits for the recording thread to run dry first. Register
+// writes, draws and dispatches go through the pipe; sync notes are pipe packets too.
+static bool GfxPacketDrainsPipe(const PM4Header* header, PM4ItOpcode opcode, bool drain_all,
+                                bool pipe_fences) {
+    switch (opcode) {
+    case PM4ItOpcode::DrawIndex2:
+    case PM4ItOpcode::DrawIndexOffset2:
+    case PM4ItOpcode::DrawIndexAuto:
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndirectCountMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return false;
+    default:
+        break;
+    }
+    if (drain_all) {
+        return true;
+    }
+    switch (opcode) {
+    case PM4ItOpcode::Nop: {
+        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+        return !pipe_fences && nop->header.count.Value() != 0 &&
+               nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip;
+    }
+    case PM4ItOpcode::DmaData:
+        return !pipe_fences && reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo != 0x3022C;
+    case PM4ItOpcode::EventWriteEop:
+    case PM4ItOpcode::WriteData:
+        return !pipe_fences;
+    case PM4ItOpcode::EventWriteEos:
+        return !pipe_fences || reinterpret_cast<const PM4CmdEventWriteEos*>(header)->command ==
+                                   PM4CmdEventWriteEos::Command::GdsStore;
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::IncrementDeCounter:
+    case PM4ItOpcode::WaitOnCeCounter:
+    case PM4ItOpcode::PfpSyncMe:
+    case PM4ItOpcode::StrmoutBufferUpdate:
+    case PM4ItOpcode::GetLodStats:
+    case PM4ItOpcode::CopyData:
+    case PM4ItOpcode::Rewind:
+    case PM4ItOpcode::WaitRegMem:
+    case PM4ItOpcode::IndirectBuffer:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool ComputePacketDrainsPipe(const PM4Header* header, PM4ItOpcode opcode, bool drain_all,
+                                    bool pipe_fences) {
+    switch (opcode) {
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+        return false;
+    default:
+        break;
+    }
+    if (drain_all) {
+        return true;
+    }
+    switch (opcode) {
+    case PM4ItOpcode::DmaData:
+        return !pipe_fences && reinterpret_cast<const PM4DmaData*>(header)->dst_addr_lo != 0x3022C;
+    case PM4ItOpcode::WriteData:
+        return !pipe_fences;
+    case PM4ItOpcode::ReleaseMem:
+        return !pipe_fences || reinterpret_cast<const PM4CmdReleaseMem*>(header)->data_sel ==
+                                   DataSelect::GdsMemStore;
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::IndirectBuffer:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::Rewind:
+    case PM4ItOpcode::WaitRegMem:
+        return false;
+    default:
+        return true;
+    }
+}
+
+namespace {
+void WriteFenceLabel(const std::optional<Liverpool::FenceWrite>& write) {
+    if (write && write->cpu_write &&
+        !Core::Memory::Instance()->TryWriteLabel(write->address, write->value, write->num_bytes)) {
+        LOG_WARNING(Render, "Fence label {:#x} was unmapped before the GPU finished",
+                    write->address);
+    }
+}
+} // Anonymous namespace
+
+void Liverpool::QueueHonestSignal(std::optional<FenceWrite> write,
+                                  std::optional<Platform::InterruptId> irq, bool label_queued) {
+    const u64 tick = rasterizer->CurrentTick();
+    if (write && write->timestamp != DataSelect{}) {
+        // The guest GPU clock counts GPU execution: taken on the GPU after the work before it,
+        // without the gaps where the GPU waited for this thread to record more. The decode time
+        // would show the guest how long the command processor took, not the GPU.
+        const auto timestamp = rasterizer->GetScheduler().WriteGpuTimestamp();
+        write->timestamp_slot = timestamp.slot;
+        write->timestamp_session = timestamp.session;
+        if (timestamp_clock_base_ == 0) {
+            timestamp_clock_base_ = GetGpuClock64();
+            timestamp_perf_base_ = GetGpuPerfCounter();
+        }
+    }
+    if (write && !label_queued) {
+        std::scoped_lock lk{pending_labels_mutex_};
+        pending_labels_.push_back(*write);
+    }
+    honest_signal_tick_.store(tick, std::memory_order_release);
+    rasterizer->DeferAfterTick(tick, [this, write, irq] mutable {
+        if (write && write->timestamp != DataSelect{}) {
+            const u64 busy = rasterizer->GetScheduler().ReadGpuBusyNs(
+                                 {write->timestamp_slot, write->timestamp_session}) *
+                             guest_gpu_time_percent_ / 100;
+            const s64 freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
+            write->value =
+                write->timestamp == DataSelect::GpuClock64
+                    ? timestamp_clock_base_ + busy
+                    : timestamp_perf_base_ + static_cast<u64>(static_cast<unsigned __int128>(busy) *
+                                                              freq / 1'000'000'000);
+        }
+        WriteFenceLabel(write);
+        if (write) {
+            // Completion callbacks run in queue order, so this label is the oldest one.
+            std::scoped_lock lk{pending_labels_mutex_};
+            pending_labels_.pop_front();
+        }
+        if (irq) {
+            Platform::IrqC::Instance()->Signal(*irq);
+        }
+    });
+}
+
+void Liverpool::FlushHonestSignals() {
+    if (!honest_fences_ || !rasterizer) {
+        return;
+    }
+    if (draw_pipe) {
+        // The recording thread flushes after the packets before this point, without a drain.
+        rasterizer->RequestPipeFlush();
+        return;
+    }
+    if (HonestSignalsUnsubmitted()) {
+        rasterizer->Flush();
+    }
+}
+
+bool Liverpool::HonestSignalsUnsubmitted() const {
+    return honest_signal_tick_.load(std::memory_order_acquire) >= rasterizer->CurrentTick();
+}
+
+bool Liverpool::PipeTakesReservedCore() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_PIPE_PLACEMENT");
+        return (!env || std::atoi(env) != 0) && Common::GetExclusionStripMask() != 0;
+    }();
+    return enabled;
+}
+
+void Liverpool::RunPipePm4(const u32* packet) {
+    const auto* header = reinterpret_cast<const PM4Header*>(packet);
+    switch (header->type3.opcode) {
+    case PM4ItOpcode::WriteData:
+        FenceDrainAndDownload(rasterizer);
+        WriteData(reinterpret_cast<const PM4CmdWriteData*>(header),
+                  (header->type3.count.Value() - 2) * 4);
+        break;
+    case PM4ItOpcode::DmaData:
+        RunDmaData(reinterpret_cast<const PM4DmaData*>(header));
+        break;
+    default:
+        UNREACHABLE_MSG("Draw pipe PM4 opcode {:#x}", u32(header->type3.opcode.Value()));
+    }
+}
+
+void Liverpool::HonestFence(std::optional<FenceWrite> write,
+                            std::optional<Platform::InterruptId> irq) {
+    if (draw_pipe && pipe_fences_) {
+        // The label is pending from here, so a wait on it is met in stream order.
+        if (write) {
+            std::scoped_lock lk{pending_labels_mutex_};
+            pending_labels_.push_back(*write);
+        }
+        rasterizer->QueueFence(write, irq);
+        return;
+    }
+    FenceDrainAndDownload(rasterizer);
+    QueueHonestSignal(write, irq);
+}
+
+void Liverpool::RunPipeFence(std::optional<FenceWrite> write,
+                             std::optional<Platform::InterruptId> irq) {
+    QueueHonestSignal(write, irq, true);
+}
+
+bool Liverpool::PendingLabelSatisfies(const PM4CmdWaitRegMem* wait) {
+    if (wait->mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
+        return false;
+    }
+    const VAddr address = reinterpret_cast<VAddr>(wait->Address<u32*>());
+    std::scoped_lock lk{pending_labels_mutex_};
+    // The newest queued write to the polled dword decides the value the wait will see.
+    for (auto it = pending_labels_.rbegin(); it != pending_labels_.rend(); ++it) {
+        if (it->address == address) {
+            return wait->Compare(static_cast<u32>(it->value));
+        }
+        if (it->num_bytes == sizeof(u64) && it->address + sizeof(u32) == address) {
+            return wait->Compare(static_cast<u32>(it->value >> 32));
+        }
+    }
+    return false;
+}
+
+// user_data words stay outside the graphics state stamp by contract: engines
+// rewrite them every draw, so stamping them would advance the stamp per draw
+// and starve every stamp-keyed cache, and no cache reads user_data through
+// the stamp (the binding probe compares the words directly). The table turns
+// the six block-range compares into one load; a write that is zero-word, past
+// the table, or only partially overlapping a block takes the stamped path.
+namespace {
+constexpr u32 UdBlockWord(size_t program_offset) {
+    return static_cast<u32>((program_offset + offsetof(ShaderProgram, user_data)) / sizeof(u32)) -
+           Regs::ShRegWordOffset;
+}
+constexpr std::array<u32, 6> kUdBlockStarts = {
+    UdBlockWord(offsetof(Regs, ps_program)), UdBlockWord(offsetof(Regs, vs_program)),
+    UdBlockWord(offsetof(Regs, gs_program)), UdBlockWord(offsetof(Regs, es_program)),
+    UdBlockWord(offsetof(Regs, hs_program)), UdBlockWord(offsetof(Regs, ls_program)),
+};
+constexpr size_t kUdTableWords = 0x160;
+constexpr std::array<u8, kUdTableWords> kUdWindowRemaining = [] {
+    std::array<u8, kUdTableWords> table{};
+    for (const u32 start : kUdBlockStarts) {
+        for (u32 i = 0; i < NUM_USER_DATA; ++i) {
+            table[start + i] = static_cast<u8>(NUM_USER_DATA - i);
+        }
+    }
+    return table;
+}();
+consteval bool UdTableMatchesRanges() {
+    for (u32 off = 0; off < kUdTableWords + 32; ++off) {
+        for (u32 n = 1; n < 18; ++n) {
+            bool ref = false;
+            for (const u32 start : kUdBlockStarts) {
+                ref |= off >= start && off + n <= start + NUM_USER_DATA;
+            }
+            const bool got = off < kUdTableWords && n <= kUdWindowRemaining[off];
+            if (ref != got) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+static_assert(kUdBlockStarts[0] == 0x0C && kUdBlockStarts[5] + NUM_USER_DATA <= kUdTableWords);
+static_assert(UdTableMatchesRanges());
+} // namespace
+
+SHAD_FORCE_INLINE static bool IsGfxUserDataWrite(u32 reg_offset, u32 num_words) {
+    if (reg_offset >= kUdWindowRemaining.size()) [[unlikely]] {
+        return false;
+    }
+    return num_words != 0 && num_words <= kUdWindowRemaining[reg_offset];
+}
+
+// Only for blocks IsGfxUserDataWrite has already bounded to NUM_USER_DATA
+// words, so every real call lands on a fixed-size arm, tested smallest first
+// since most writes are one or two words. Every copy must stay a constant
+// size - a length-driven loop is turned back into a memcpy call. The final
+// arm is defensive: the table gate never selects it.
+static void StoreRegBlock(void* dst, const void* src, size_t bytes) {
+    auto* d = static_cast<u8*>(dst);
+    const auto* s = static_cast<const u8*>(src);
+    if (bytes <= 8) {
+        if (bytes >= 4) {
+            std::memcpy(d, s, 4);
+            std::memcpy(d + bytes - 4, s + bytes - 4, 4);
+        }
+    } else if (bytes <= 16) {
+        std::memcpy(d, s, 8);
+        std::memcpy(d + bytes - 8, s + bytes - 8, 8);
+    } else if (bytes <= 32) {
+        std::memcpy(d, s, 16);
+        std::memcpy(d + bytes - 16, s + bytes - 16, 16);
+    } else if (bytes <= 64) {
+        std::memcpy(d, s, 32);
+        std::memcpy(d + bytes - 32, s + bytes - 32, 32);
+    } else [[unlikely]] {
+        std::memcpy(d, s, bytes);
+    }
+}
+
+namespace {
+
+// The register blocks the dynamic-state updaters in vk_rasterizer.cpp read;
+// that file is the source of truth for this table. Every block is a context
+// or uconfig register, so shader and config writes never move the dyn lane.
+struct DynRegBlock {
+    u32 word;
+    u32 count;
+};
+#define DYN_REG_BLOCK(member)                                                                      \
+    DynRegBlock {                                                                                  \
+        static_cast<u32>(offsetof(Regs, member) / sizeof(u32)),                                    \
+            static_cast<u32>(sizeof(Regs::member) / (sizeof(u32)))                                 \
+    }
+constexpr std::array kDynRegBlocks = {
+    DYN_REG_BLOCK(window_scissor),
+    DYN_REG_BLOCK(screen_scissor),
+    DYN_REG_BLOCK(generic_scissor),
+    DYN_REG_BLOCK(window_offset),
+    DYN_REG_BLOCK(polygon_control),
+    DYN_REG_BLOCK(viewport_control),
+    DYN_REG_BLOCK(viewports),
+    DYN_REG_BLOCK(viewport_depths),
+    DYN_REG_BLOCK(viewport_scissors),
+    DYN_REG_BLOCK(clipper_control),
+    DYN_REG_BLOCK(mode_control),
+    DYN_REG_BLOCK(depth_buffer),
+    DYN_REG_BLOCK(depth_control),
+    DYN_REG_BLOCK(depth_render_control),
+    DYN_REG_BLOCK(depth_bounds_min),
+    DYN_REG_BLOCK(depth_bounds_max),
+    DYN_REG_BLOCK(poly_offset),
+    DYN_REG_BLOCK(stencil_control),
+    DYN_REG_BLOCK(stencil_ref_front),
+    DYN_REG_BLOCK(stencil_ref_back),
+    DYN_REG_BLOCK(enable_primitive_restart),
+    DYN_REG_BLOCK(primitive_restart_index),
+    DYN_REG_BLOCK(primitive_type),
+    DYN_REG_BLOCK(line_control),
+    DYN_REG_BLOCK(blend_constants),
+};
+
+// The register blocks the render-target memo and the render-scope cache read.
+// depth_control and color_control are left out on purpose: those consumers
+// compare the bits they read themselves, so a change elsewhere in the two
+// words moves neither cache.
+constexpr std::array kRtRegBlocks = {
+    DYN_REG_BLOCK(color_buffers),         DYN_REG_BLOCK(color_target_mask),
+    DYN_REG_BLOCK(depth_buffer),          DYN_REG_BLOCK(depth_view),
+    DYN_REG_BLOCK(depth_htile_data_base), DYN_REG_BLOCK(depth_render_control),
+    DYN_REG_BLOCK(depth_clear),           DYN_REG_BLOCK(stencil_clear),
+};
+#undef DYN_REG_BLOCK
+consteval bool RegBlocksInRange(const auto& blocks) {
+    for (const auto& block : blocks) {
+        if (block.word < Regs::ContextRegWordOffset || block.word + block.count > Regs::NumRegs) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(RegBlocksInRange(kDynRegBlocks));
+static_assert(RegBlocksInRange(kRtRegBlocks));
+
+} // namespace
+
+SHAD_FORCE_INLINE static void CpWriteOrCopy(Vulkan::Rasterizer* rasterizer, void* dst,
+                                            const void* src, u64 size) {
+    // A CP write lands in guest memory at parse time. On hardware every earlier draw has read
+    // its inputs by then; here those reads may still be queued on the copy lanes or the draw
+    // pipe, and the write may also be a label the guest polls before reusing buffers. Drain first.
+    if (rasterizer) {
+        rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::DumpConstRam));
+    }
+    VideoCore::StreamCopyLane::Instance().DrainProducer();
+    if (!rasterizer || !rasterizer->TryCpWriteBacking(std::bit_cast<VAddr>(dst), src, size)) {
+        std::memcpy(dst, src, size);
+    }
+}
+
+void Liverpool::WriteData(const PM4CmdWriteData* write_data, u32 data_size) {
+    const VAddr address = write_data->Address<u64>();
+    if (honest_fences_ && rasterizer &&
+        rasterizer->WriteDataOnGpu(address, write_data->data, data_size)) {
+        if (data_size <= sizeof(u64)) {
+            // The CP may poll it next: met in stream order, like a queued label.
+            u64 value = 0;
+            std::memcpy(&value, write_data->data, data_size);
+            QueueHonestSignal(FenceWrite{address, value, data_size, false}, std::nullopt);
+        }
+        return;
+    }
+    CpWriteOrCopy(rasterizer, write_data->Address<void*>(), write_data->data, data_size);
+}
+
+void Liverpool::RunDmaData(const PM4DmaData* dma_data) {
+    ASSERT(dma_data->command.das == 0);
+    if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
+        rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data, true);
+    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+               dma_data->dst_sel == DmaDataDst::Gds) {
+        rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
+                               dma_data->NumBytes(), true, false);
+    } else if (dma_data->src_sel == DmaDataSrc::Data &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(), dma_data->data,
+                               false);
+    } else if (dma_data->src_sel == DmaDataSrc::Gds &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
+                               dma_data->NumBytes(), false, true);
+    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>(),
+                               dma_data->NumBytes(), false, false);
+    } else {
+        UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
+                        u32(dma_data->dst_sel));
+    }
+    if (honest_fences_) {
+        // In place, the DMA may run on the GPU: a later wait on its result flushes.
+        honest_signal_tick_.store(rasterizer->CurrentTick(), std::memory_order_release);
+    }
+}
+
+Liverpool::Liverpool() {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
+    // Stamp dormancy is decided before the process thread can observe work;
+    // when the adaptive skip caches are disabled the register funnel is a
+    // plain memcpy with zero compares.
+    gfx_stamp.active =
+        EmulatorSettings.GetAdaptiveSkipCachesMode() != AdaptiveSkipCachesMode::SkipCachesDisabled;
+    for (const auto& block : kDynRegBlocks) {
+        for (u32 w = block.word - Regs::ContextRegWordOffset, end = w + block.count; w < end; ++w) {
+            dyn_reg_mask_[w >> 6] |= u64{1} << (w & 63);
+        }
+    }
+    gfx_stamp.dyn_mask = dyn_reg_mask_.data();
+    gfx_stamp.dyn_mask_base = Regs::ContextRegWordOffset;
+    gfx_stamp.dyn_mask_words = static_cast<u32>(dyn_reg_mask_.size() * 64);
+    gfx_stamp.classify =
+        gfx_stamp.active && EmulatorSettings.IsDynStateStamp() && EmulatorSettings.IsDynStateMemo();
+    for (const auto& block : kRtRegBlocks) {
+        for (u32 w = block.word - Regs::ContextRegWordOffset, end = w + block.count; w < end; ++w) {
+            rt_reg_mask_[w >> 6] |= u64{1} << (w & 63);
+        }
+    }
+    gfx_stamp.rt_mask = rt_reg_mask_.data();
+    gfx_stamp.classify_rt = gfx_stamp.active && EmulatorSettings.IsRtStateStamp();
+    occlude_all_ = EmulatorSettings.IsOccludeAll();
+    honest_fences_ = EmulatorSettings.GetInplaceGuestMemory() >= 1;
+    guest_gpu_time_percent_ = std::max(EmulatorSettings.GetGuestGpuTimePercent(), 1u);
+    if (const char* env = std::getenv("SHADPS4_PIPE_CONSERVATIVE")) {
+        pipe_drain_all_ = std::atoi(env) != 0;
+    }
+    const char* fences_env = std::getenv("SHADPS4_PIPE_FENCES");
+    pipe_fences_ =
+        honest_fences_ && (!fences_env || std::atoi(fences_env) != 0) && !pipe_drain_all_;
+    reg_run_ = EmulatorSettings.IsParserRegRun();
+    Common::SetCoreReservationEnabled(EmulatorSettings.IsGpuThreadCoreReserve());
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -75,7 +616,11 @@ Liverpool::~Liverpool() {
     process_thread.join();
 }
 
-void Liverpool::ProcessCommands() {
+void Liverpool::DrainCommands() {
+    // Commands run on the caches and the scheduler, which the recording thread owns meanwhile.
+    if (rasterizer) {
+        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
+    }
     // Process incoming commands with high priority
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
@@ -92,9 +637,20 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    gpu_side_thread = true;
+    command_thread = true;
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
+    // gpu_thread_core_reserve: own a physical core, strip it from every other thread, and keep
+    // stripping, since Windows threads do not inherit their creator's affinity.
+    if (const u64 mask = Common::GetReservedCoreMask()) {
+        Common::SetCurrentThreadAffinityMask(mask);
+        Common::ExcludeReservedCoresFromAllOtherThreads();
+        Common::StartPeriodicAffinityRewalk();
+    }
+    // The only thread that spins on a contended tracker region lock.
+    VideoCore::RegionLock::gpu_spin_rounds = EmulatorSettings.GetTrackerLockSpinRounds();
 
     while (!stoken.stop_requested()) {
         {
@@ -104,6 +660,13 @@ void Liverpool::Process(std::stop_token stoken) {
         }
         if (stoken.stop_requested()) {
             break;
+        }
+
+        if (draw_pipe && !command_thread_moved_) {
+            command_thread_moved_ = true;
+            if (PipeTakesReservedCore()) {
+                Common::SetCurrentThreadAffinityMask(~Common::GetExclusionStripMask());
+            }
         }
 
         VideoCore::StartCapture();
@@ -129,26 +692,55 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
+                if (rasterizer && num_submits == 1 && !(draw_pipe && pipe_fences_)) {
+                    // The guest sees the GPU idle once the last submission is decoded.
+                    rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+                }
+                // A guest submission ended: its queued honest signals may now be waited on.
+                FlushHonestSignals();
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
 
-                --num_submits;
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
+                // The only submit_cv waiters on this edge block until the
+                // queue drains (num_submits == 0); waking them per popped
+                // submit burned a futex broadcast each. The lock is still
+                // held for the notify so the wakeup cannot be lost.
+                if (--num_submits == 0) {
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
             }
         }
 
+        // With fences on the draw pipe the frame end and the idle signal are pipe packets.
+        const bool pipe_ordered = draw_pipe && pipe_fences_;
+        if (rasterizer && !pipe_ordered) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
+        }
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
-                rasterizer->Flush();
+                if (pipe_ordered) {
+                    rasterizer->RequestPipeFlush(true);
+                } else {
+                    rasterizer->Flush();
+                }
             }
             submit_done = false;
         }
 
-        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        if (honest_fences_ && rasterizer) {
+            if (pipe_ordered) {
+                HonestFence(std::nullopt, Platform::InterruptId::GpuIdle);
+            } else {
+                QueueHonestSignal(std::nullopt, Platform::InterruptId::GpuIdle);
+            }
+            FlushHonestSignals();
+        } else {
+            Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        }
     }
 }
 
@@ -180,8 +772,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
-            memcpy(dump_const->Address<void*>(),
-                   cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            const u32 size = dump_const->Size();
+            const void* const dump_src = cblock.constants_heap.data() + dump_const->Offset();
+            CpWriteOrCopy(rasterizer, dump_const->Address<void*>(), dump_src, size);
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -219,6 +812,768 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+void Liverpool::SetContextRegExtentTail(u32 reg_addr, const PM4Header* header, const u32* payload) {
+    // Mark only on a real change: the extent hint is the stamp's only non-register input.
+    const auto store_extent = [this](u32& slot, u32 value) {
+        if (slot != value) {
+            slot = value;
+            gfx_stamp.MarkDirty();
+        }
+    };
+
+    switch (reg_addr) {
+    case ContextRegs::CbColor0Base:
+    case ContextRegs::CbColor1Base:
+    case ContextRegs::CbColor2Base:
+    case ContextRegs::CbColor3Base:
+    case ContextRegs::CbColor4Base:
+    case ContextRegs::CbColor5Base:
+    case ContextRegs::CbColor6Base:
+    case ContextRegs::CbColor7Base: {
+        const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
+                                (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
+        ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+        const auto nop_offset = header->type3.count;
+        u32 hint = 0;
+        if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
+            ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                       "NOP hint is missing in CB setup sequence");
+            hint = payload[nop_offset + 1];
+        }
+        store_extent(last_cb_extent[col_buf_id].raw, hint);
+        break;
+    }
+    case ContextRegs::CbColor0Cmask:
+    case ContextRegs::CbColor1Cmask:
+    case ContextRegs::CbColor2Cmask:
+    case ContextRegs::CbColor3Cmask:
+    case ContextRegs::CbColor4Cmask:
+    case ContextRegs::CbColor5Cmask:
+    case ContextRegs::CbColor6Cmask:
+    case ContextRegs::CbColor7Cmask: {
+        const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Cmask) /
+                                (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
+        ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+        const auto nop_offset = header->type3.count;
+        if (nop_offset == 0x04) {
+            ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                       "NOP hint is missing in CB setup sequence");
+            store_extent(last_cb_extent[col_buf_id].raw, payload[nop_offset + 1]);
+        }
+        break;
+    }
+    case ContextRegs::DbZInfo: {
+        u32 hint = 0;
+        if (header->type3.count == 8) {
+            ASSERT_MSG(payload[20] == 0xc0001000, "NOP hint is missing in DB setup sequence");
+            hint = payload[21];
+        }
+        store_extent(last_db_extent.raw, hint);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+SHAD_FORCE_INLINE void Liverpool::SetContextRegHot(const PM4Header* header, u32 count) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
+    const auto* payload = reinterpret_cast<const u32*>(header + 2);
+
+    gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32), reg_addr);
+    MarkPipeDirty(reg_addr, count - 1);
+
+    // In the case of HW, render target memory has alignment as color block operates on
+    // tiles. There is no information of actual resource extents stored in CB context
+    // regs, so any deduction of it from slices/pitch will lead to a larger surface
+    // created. The same applies to the depth targets. Fortunately, the guest always
+    // sends a trailing NOP packet right after the context regs setup, so we can use the
+    // heuristic below and extract the hint to determine actual resource dims. The
+    // per-register bodies carry asserts, so they live in the outlined tail; the switch
+    // itself stays here and costs nothing on the default path.
+    switch (reg_addr) {
+    case ContextRegs::CbColor0Base:
+    case ContextRegs::CbColor1Base:
+    case ContextRegs::CbColor2Base:
+    case ContextRegs::CbColor3Base:
+    case ContextRegs::CbColor4Base:
+    case ContextRegs::CbColor5Base:
+    case ContextRegs::CbColor6Base:
+    case ContextRegs::CbColor7Base:
+    case ContextRegs::CbColor0Cmask:
+    case ContextRegs::CbColor1Cmask:
+    case ContextRegs::CbColor2Cmask:
+    case ContextRegs::CbColor3Cmask:
+    case ContextRegs::CbColor4Cmask:
+    case ContextRegs::CbColor5Cmask:
+    case ContextRegs::CbColor6Cmask:
+    case ContextRegs::CbColor7Cmask:
+    case ContextRegs::DbZInfo:
+        SetContextRegExtentTail(reg_addr, header, payload);
+        break;
+    default:
+        break;
+    }
+}
+
+SHAD_NO_INLINE void Liverpool::SetShRegCompute(const PM4Header* header, u32 count) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto set_size = (count - 1) * sizeof(u32);
+    ASSERT(set_size <= sizeof(ComputeProgram));
+    auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
+                 (set_data->reg_offset - 0x200);
+    std::memcpy(addr, header + 2, set_size);
+}
+
+SHAD_FORCE_INLINE void Liverpool::SetShRegHot(const PM4Header* header, u32 count) {
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto set_size = (count - 1) * sizeof(u32);
+
+    if (set_data->reg_offset >= 0x200 &&
+        set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
+        SetShRegCompute(header, count);
+        return;
+    }
+    const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
+    if (IsGfxUserDataWrite(static_cast<u32>(set_data->reg_offset), set_size / sizeof(u32))) {
+        StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
+    } else {
+        gfx_stamp.WriteRegs(&regs.reg_array[word], header + 2, set_size, word);
+    }
+    MarkPipeDirty(word, static_cast<u32>(set_size / sizeof(u32)));
+}
+
+SHAD_NO_INLINE std::span<const u32> Liverpool::RunRegisterRun(std::span<const u32> dcb) {
+    // Own frame: the caller's register budget is spent, so this loop keeps
+    // its cursor pair and count in registers. The poll after each packet
+    // keeps "a command waits at most one packet" without the caller's poll.
+    u32 run = 0;
+    const u32* p = dcb.data();
+    size_t rem = dcb.size();
+    while (true) {
+        const auto* h = reinterpret_cast<const PM4Header*>(p);
+        const u32 raw = h->raw;
+        const u32 masked = raw & 0xC000FF00u;
+        const bool is_pad = (raw >> 30) == 2;
+        // An empty NOP is a no-op in the dispatch too: its arm returns
+        // before the payload is read and the exit advances two words.
+        const bool is_nop0 = (raw & 0xFFFFFF00u) == 0xC0001000u;
+        const u32 words = is_pad ? 0 : h->type3.NumWords();
+        if (words + 1 > rem) {
+            break;
+        }
+        if (masked == 0xC0007600u) {
+            SetShRegHot(h, words);
+        } else if (masked == 0xC0006900u) {
+            SetContextRegHot(h, words);
+        } else if (!is_pad && !is_nop0) {
+            ++run_stats.break_opcode[(raw >> 8) & 0xFFu];
+            break;
+        }
+        p += words + 1;
+        rem -= words + 1;
+        ++run;
+        if (rem == 0 || num_commands.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            break;
+        }
+    }
+    if (run != 0) {
+        run_stats.run_packets += run;
+        ++run_stats.runs;
+    }
+    return std::span<const u32>{p, rem};
+}
+
+std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Task& ce_task,
+                                                   uintptr_t base_addr) {
+    const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
+    const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
+    // Cached only for the length of one run segment: every dump entry a submit
+    // can match is registered before that submit is queued, so a segment that
+    // starts with none pending cannot be handed one it could have matched.
+    const bool dumping_regs = DebugState.DumpingCurrentReg();
+    // The label is formatted only when markers are on: the payload is deferred
+    // into a lambda, so the markers-off path stays a direct call.
+    const auto marked = [&](std::string_view name, const void* addr, auto&& body) {
+        if (host_markers_enabled) {
+            rasterizer->ScopeMarkerBegin(fmt::format("gfx:{}:{}", addr, name));
+            body();
+            rasterizer->ScopeMarkerEnd();
+        } else {
+            body();
+        }
+    };
+    Vulkan::Rasterizer::PacketRunGuard run{draw_pipe ? nullptr : rasterizer};
+
+    while (!dcb.empty()) {
+        // One poll, one load: the drain re-tests the same counter, and the copy
+        // hold is dropped only when there is a command to drop it for. A
+        // command landing after the load is seen on the next packet, so the
+        // drop and the drain always happen together.
+        if (num_commands.load(std::memory_order_relaxed) != 0) [[unlikely]] {
+            if (rasterizer) {
+                rasterizer->DropCopyHoldForCommands();
+            }
+            DrainCommands();
+        }
+
+        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
+        if (header->type != 3) [[unlikely]] {
+            // Type-2 packets are used for padding purposes.
+            if (header->type != 2) {
+                UnhandledPm4Type(header);
+            }
+            ++run_stats.outer_packets;
+            dcb = NextPacket(dcb, 1);
+            continue;
+        }
+
+        const u32 count = header->type3.NumWords();
+        const PM4ItOpcode opcode = header->type3.opcode;
+        // The header load-use stall dominates this loop, so two lines in
+        // flight cover the next headers and payload.
+        __builtin_prefetch(dcb.data() + 64, 0, 3);
+        __builtin_prefetch(dcb.data() + 128, 0, 3);
+        // The mask drops predicate and shader_type, which both handlers ignore,
+        // so this route is bit-identical to the switch arms below. A register
+        // packet also opens a run that consumes every register write, pad and
+        // empty NOP behind it; a run that consumed nothing is a truncated first
+        // packet, reported through NextPacket.
+        const u32 hdr_masked = header->raw & 0xC000FF00u;
+        if (hdr_masked == 0xC0007600u || hdr_masked == 0xC0006900u) {
+            if (reg_run_) {
+                const auto rest = RunRegisterRun(dcb);
+                if (rest.size() != dcb.size()) {
+                    dcb = rest;
+                    continue;
+                }
+            }
+            if (hdr_masked == 0xC0007600u) {
+                SetShRegHot(header, count);
+            } else {
+                SetContextRegHot(header, count);
+            }
+            dcb = NextPacket(dcb, count + 1);
+            continue;
+        }
+        ++run_stats.outer_packets;
+        if (draw_pipe && GfxPacketDrainsPipe(header, opcode, pipe_drain_all_, pipe_fences_)) {
+            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+        }
+        switch (opcode) {
+        case PM4ItOpcode::Nop: {
+            const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+            if (nop->header.count.Value() == 0) {
+                break;
+            }
+
+            switch (nop->data_block[0]) {
+            case PM4CmdNop::PayloadType::PatchedFlip: {
+                // There is no evidence that GPU CP drives flip events by parsing
+                // special NOP packets. For convenience lets assume that it does.
+                if (draw_pipe && pipe_fences_) {
+                    // The flip handler prepares the frame from the caches, in stream order.
+                    rasterizer->QueueIrq(Platform::InterruptId::GfxFlip);
+                    break;
+                }
+                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                break;
+            }
+            case PM4CmdNop::PayloadType::DebugMarkerPush: {
+                if (guest_markers_enabled) {
+                    const auto marker_sz = nop->header.count.Value() * 2;
+                    const std::string_view label{reinterpret_cast<const char*>(&nop->data_block[1]),
+                                                 marker_sz};
+                    rasterizer->ScopeMarkerBegin(label, true);
+                }
+                break;
+            }
+            case PM4CmdNop::PayloadType::DebugColorMarkerPush: {
+                if (guest_markers_enabled) {
+                    const auto marker_sz = nop->header.count.Value() * 2;
+                    const std::string_view label{reinterpret_cast<const char*>(&nop->data_block[1]),
+                                                 marker_sz};
+                    const u32 color = *reinterpret_cast<const u32*>(
+                        reinterpret_cast<const u8*>(&nop->data_block[1]) + marker_sz);
+                    rasterizer->ScopedMarkerInsertColor(label, color, true);
+                }
+                break;
+            }
+            case PM4CmdNop::PayloadType::DebugMarkerPop: {
+                if (guest_markers_enabled) {
+                    rasterizer->ScopeMarkerEnd(true);
+                }
+                break;
+            }
+            default:
+                break;
+            }
+            break;
+        }
+        case PM4ItOpcode::ContextControl: {
+            break;
+        }
+        case PM4ItOpcode::ClearState: {
+            regs.SetDefaults();
+            gfx_stamp.MarkDirty();
+            pipe_reset = true;
+            break;
+        }
+        case PM4ItOpcode::SetConfigReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
+            const auto* payload = reinterpret_cast<const u32*>(header + 2);
+            gfx_stamp.WriteRegs(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32),
+                                reg_addr);
+            MarkPipeDirty(reg_addr, count - 1);
+            break;
+        }
+        case PM4ItOpcode::SetContextReg: {
+            SetContextRegHot(header, count);
+            break;
+        }
+        case PM4ItOpcode::SetShReg: {
+            SetShRegHot(header, count);
+            break;
+        }
+        case PM4ItOpcode::SetUconfigReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            gfx_stamp.WriteRegs(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
+                                header + 2, (count - 1) * sizeof(u32),
+                                Regs::UconfigRegWordOffset + set_data->reg_offset);
+            MarkPipeDirty(Regs::UconfigRegWordOffset + set_data->reg_offset, count - 1);
+            break;
+        }
+        case PM4ItOpcode::SetPredication: {
+            ++packet_stats.set_predication;
+            LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+            break;
+        }
+        case PM4ItOpcode::IndexType: {
+            const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
+            if (regs.index_buffer_type.raw != index_type->raw) {
+                regs.index_buffer_type.raw = index_type->raw;
+                gfx_stamp.MarkDirty();
+                MarkPipeDirtyField(regs.index_buffer_type);
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndex2: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
+            regs.max_index_size = draw_index->max_size;
+            regs.index_base_address.base_addr_lo = draw_index->index_base_lo;
+            regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
+            regs.num_indices = draw_index->index_count;
+            regs.draw_initiator = draw_index->draw_initiator;
+            MarkPipeDirtyField(regs.max_index_size);
+            MarkPipeDirtyField(regs.index_base_address);
+            MarkPipeDirtyField(regs.num_indices);
+            MarkPipeDirtyField(regs.draw_initiator);
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndex2", header, [&] { rasterizer->Draw(true); });
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexOffset2: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_index_off = reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header);
+            regs.max_index_size = draw_index_off->max_size;
+            regs.num_indices = draw_index_off->index_count;
+            regs.draw_initiator = draw_index_off->draw_initiator;
+            MarkPipeDirtyField(regs.max_index_size);
+            MarkPipeDirtyField(regs.num_indices);
+            MarkPipeDirtyField(regs.draw_initiator);
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndexOffset2", header,
+                       [&] { rasterizer->Draw(true, draw_index_off->index_offset); });
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexAuto: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
+            regs.num_indices = draw_index->index_count;
+            regs.draw_initiator = draw_index->draw_initiator;
+            MarkPipeDirtyField(regs.num_indices);
+            MarkPipeDirtyField(regs.draw_initiator);
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndexAuto", header, [&] { rasterizer->Draw(false); });
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndirect: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirect*>(header);
+            const auto offset = draw_indirect->data_offset;
+            const auto stride = sizeof(DrawIndirectArgs);
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndirect", header, [&] {
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0,
+                                             draw_indirect->base_vtx_loc,
+                                             draw_indirect->start_inst_loc);
+                });
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndirectMulti: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirectMulti*>(header);
+            const auto offset = draw_indirect->data_offset;
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndirectMulti", header, [&] {
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset,
+                                             draw_indirect->stride, draw_indirect->count, 0,
+                                             draw_indirect->base_vtx_loc,
+                                             draw_indirect->start_inst_loc);
+                });
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndirectCountMulti: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_indirect =
+                reinterpret_cast<const PM4CmdDrawIndirectCountMulti*>(header);
+            const auto offset = draw_indirect->data_offset;
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndirectCountMulti", header, [&] {
+                    rasterizer->DrawIndirect(false, indirect_args_addr, offset,
+                                             draw_indirect->stride, draw_indirect->count,
+                                             draw_indirect->count_addr, draw_indirect->base_vtx_loc,
+                                             draw_indirect->start_inst_loc);
+                });
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexIndirect: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_index_indirect =
+                reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
+            const auto offset = draw_index_indirect->data_offset;
+            const auto stride = sizeof(DrawIndexedIndirectArgs);
+            regs.max_index_size = index_buffer_num_indices;
+            MarkPipeDirtyField(regs.max_index_size);
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndexIndirect", header, [&] {
+                    rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0,
+                                             draw_index_indirect->base_vtx_loc,
+                                             draw_index_indirect->start_inst_loc);
+                });
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexIndirectMulti: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_index_indirect =
+                reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
+            const auto offset = draw_index_indirect->data_offset;
+            regs.max_index_size = index_buffer_num_indices;
+            MarkPipeDirtyField(regs.max_index_size);
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndexIndirectMulti", header, [&] {
+                    rasterizer->DrawIndirect(
+                        true, indirect_args_addr, offset, draw_index_indirect->stride,
+                        draw_index_indirect->count, 0, draw_index_indirect->base_vtx_loc,
+                        draw_index_indirect->start_inst_loc);
+                });
+            }
+            break;
+        }
+        case PM4ItOpcode::DrawIndexIndirectCountMulti: {
+            BeginDraw(packet_stats, gfx_stamp, header);
+            const auto* draw_index_indirect =
+                reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
+            const auto offset = draw_index_indirect->data_offset;
+            regs.max_index_size = index_buffer_num_indices;
+            MarkPipeDirtyField(regs.max_index_size);
+            if (dumping_regs) {
+                DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
+            }
+            if (rasterizer) {
+                marked("DrawIndexIndirectCountMulti", header, [&] {
+                    rasterizer->DrawIndirect(
+                        true, indirect_args_addr, offset, draw_index_indirect->stride,
+                        draw_index_indirect->count,
+                        draw_index_indirect->count_indirect_enable.Value()
+                            ? draw_index_indirect->count_addr
+                            : 0,
+                        draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc);
+                });
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchDirect: {
+            ++packet_stats.dispatches;
+            gfx_stamp.FlushAtDraw();
+            const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+            auto& cs_program = GetCsRegs();
+            cs_program.dim_x = dispatch_direct->dim_x;
+            cs_program.dim_y = dispatch_direct->dim_y;
+            cs_program.dim_z = dispatch_direct->dim_z;
+            cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
+            if (dumping_regs) {
+                DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
+                                               cs_program);
+            }
+            if (rasterizer && (cs_program.dispatch_initiator & 1)) {
+                marked("DispatchDirect", header, [&] { rasterizer->DispatchDirect(); });
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchIndirect: {
+            gfx_stamp.FlushAtDraw();
+            const auto* dispatch_indirect = reinterpret_cast<const PM4CmdDispatchIndirect*>(header);
+            auto& cs_program = GetCsRegs();
+            const auto offset = dispatch_indirect->data_offset;
+            const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
+            if (dumping_regs) {
+                DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
+                                               cs_program);
+            }
+            if (rasterizer && (cs_program.dispatch_initiator & 1)) {
+                marked("DispatchIndirect", header,
+                       [&] { rasterizer->DispatchIndirect(indirect_args_addr, offset, size); });
+            }
+            break;
+        }
+        case PM4ItOpcode::NumInstances: {
+            const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
+            regs.num_instances.num_instances = num_instances->num_instances;
+            MarkPipeDirtyField(regs.num_instances);
+            break;
+        }
+        case PM4ItOpcode::IndexBase: {
+            const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
+            regs.index_base_address.base_addr_lo = index_base->addr_lo;
+            regs.index_base_address.base_addr_hi = index_base->addr_hi;
+            MarkPipeDirtyField(regs.index_base_address);
+            break;
+        }
+        case PM4ItOpcode::IndexBufferSize: {
+            const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
+            index_buffer_num_indices = index_size->num_indices;
+            break;
+        }
+        case PM4ItOpcode::SetBase: {
+            const auto* set_base = reinterpret_cast<const PM4CmdSetBase*>(header);
+            ASSERT(set_base->base_index == PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable);
+            indirect_args_addr = set_base->Address<u64>();
+            break;
+        }
+        case PM4ItOpcode::EventWrite: {
+            NoteGuestSync(rasterizer);
+            const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
+                      magic_enum::enum_name(event->event_type.Value()),
+                      magic_enum::enum_name(event->event_index.Value()));
+            if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
+                // TODO: handle proper synchronization, for now signal that update is done
+                // immediately
+                regs.cp_strmout_cntl.offset_update_done = 1;
+                MarkPipeDirtyField(regs.cp_strmout_cntl);
+            } else if (event->event_index.Value() == EventIndex::ZpassDone) {
+                if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                    if (rasterizer) {
+                        rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::EventWrite));
+                    }
+                    ++packet_stats.occlusion_events;
+                    static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
+                    static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+                    u64* results = event->Address<u64*>();
+                    for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                        *results = pixel_counter | OcclusionCounterValidMask;
+                    }
+                    if (!occlude_all_) {
+                        pixel_counter += OcclusionCounterStep;
+                    }
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::EventWriteEos: {
+            const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+            if (honest_fences_ && rasterizer &&
+                event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
+                std::optional<FenceWrite> write;
+                event_eos->SignalFence([&write](void* address, u64 data, u32 num_bytes) {
+                    write = FenceWrite{reinterpret_cast<VAddr>(address), data, num_bytes};
+                });
+                HonestFence(write, std::nullopt);
+                break;
+            }
+            FenceDrainAndDownload(rasterizer);
+            if (honest_fences_ && rasterizer) {
+                // GdsStore reads the GDS after a full GPU wait anyway; label after that wait too.
+                rasterizer->Finish();
+            }
+            event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+                auto* memory = Core::Memory::Instance();
+                ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+            });
+            if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+                ASSERT(event_eos->size == 1);
+                if (rasterizer) {
+                    rasterizer->Finish();
+                    const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
+                    *event_eos->Address() = value;
+                }
+            }
+            break;
+        }
+        case PM4ItOpcode::EventWriteEop: {
+            const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+            if (honest_fences_ && rasterizer) {
+                std::optional<FenceWrite> write;
+                bool irq = false;
+                event_eop->SignalFence(
+                    [&write](void* address, u64 data, u32 num_bytes) {
+                        write = FenceWrite{reinterpret_cast<VAddr>(address), data, num_bytes};
+                    },
+                    [&irq] { irq = true; });
+                const auto data_sel = event_eop->data_sel.Value();
+                if (write &&
+                    (data_sel == DataSelect::GpuClock64 || data_sel == DataSelect::PerfCounter)) {
+                    write->timestamp = data_sel;
+                }
+                HonestFence(write,
+                            irq ? std::optional{Platform::InterruptId::GfxEop} : std::nullopt);
+                break;
+            }
+            FenceDrainAndDownload(rasterizer);
+            event_eop->SignalFence(
+                [](void* address, u64 data, u32 num_bytes) {
+                    auto* memory = Core::Memory::Instance();
+                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                },
+                [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+            break;
+        }
+        case PM4ItOpcode::DmaData: {
+            const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
+            if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
+                break;
+            }
+            if (draw_pipe && pipe_fences_) {
+                rasterizer->QueuePm4(header, (count + 1) * sizeof(u32));
+                break;
+            }
+            RunDmaData(dma_data);
+            break;
+        }
+        case PM4ItOpcode::WriteData: {
+            const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+            ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
+            const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            if (!write_data->wr_one_addr.Value()) {
+                if (draw_pipe && pipe_fences_) {
+                    rasterizer->QueuePm4(header, (header->type3.NumWords() + 1) * sizeof(u32));
+                    break;
+                }
+                FenceDrainAndDownload(rasterizer);
+                WriteData(write_data, data_size);
+            } else {
+                UNREACHABLE();
+            }
+            break;
+        }
+        case PM4ItOpcode::CopyData: {
+            const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
+            LOG_WARNING(Render,
+                        "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
+                        "count_sel = {}, wr_confirm = {}, engine_sel = {}",
+                        u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
+                        copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
+                        u32(copy_data->engine_sel.Value()));
+            break;
+        }
+        // The only graphics opcodes whose handling can suspend the parser. They
+        // are returned unconsumed; the coroutine owns them, and the packet-run
+        // guard has already armed this run's marks. A GPU command thread read
+        // of guest memory that is neither bit-guarded nor behind one of those
+        // points sees pre-execution bytes for at most one run.
+        case PM4ItOpcode::MemSemaphore:
+        case PM4ItOpcode::Rewind:
+        case PM4ItOpcode::WaitRegMem:
+        case PM4ItOpcode::IndirectBuffer:
+            return dcb;
+        case PM4ItOpcode::AcquireMem: {
+            NoteGuestSync(rasterizer);
+            break;
+        }
+        case PM4ItOpcode::IncrementDeCounter: {
+            ++cblock.de_count;
+            break;
+        }
+        case PM4ItOpcode::WaitOnCeCounter: {
+            while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                RESUME_GFX(ce_task);
+            }
+            break;
+        }
+        case PM4ItOpcode::PfpSyncMe: {
+            break;
+        }
+        case PM4ItOpcode::StrmoutBufferUpdate: {
+            const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
+            LOG_WARNING(Render_Vulkan,
+                        "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
+                        "source_select = {}, buffer_select = {}",
+                        strmout->update_memory.Value(),
+                        magic_enum::enum_name(strmout->source_select.Value()),
+                        strmout->buffer_select.Value());
+            break;
+        }
+        case PM4ItOpcode::GetLodStats: {
+            LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
+            break;
+        }
+        case PM4ItOpcode::CondExec: {
+            const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
+            if (cond_exec->command.Value() != 0) {
+                LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
+            }
+            const auto skip = *cond_exec->Address() == false;
+            if (skip) {
+                dcb = NextPacket(dcb, count + 1 + cond_exec->exec_count.Value());
+                continue;
+            }
+            break;
+        }
+        default:
+            UnknownPm4Opcode(static_cast<u32>(opcode), count);
+        }
+        dcb = NextPacket(dcb, count + 1);
+    }
+    return dcb;
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
@@ -235,647 +1590,93 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
-    while (!dcb.empty()) {
-        ProcessCommands();
-
-        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
-        const u32 type = header->type;
-
-        switch (type) {
-        default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
-        case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
-        case 2:
-            // Type-2 packet are used for padding purposes
-            dcb = NextPacket(dcb, 1);
-            continue;
-        case 3:
-            const u32 count = header->type3.NumWords();
-            const PM4ItOpcode opcode = header->type3.opcode;
-            switch (opcode) {
-            case PM4ItOpcode::Nop: {
-                const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
-                if (nop->header.count.Value() == 0) {
-                    break;
-                }
-
-                switch (nop->data_block[0]) {
-                case PM4CmdNop::PayloadType::PatchedFlip: {
-                    // There is no evidence that GPU CP drives flip events by parsing
-                    // special NOP packets. For convenience lets assume that it does.
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
-                    break;
-                }
-                case PM4CmdNop::PayloadType::DebugMarkerPush: {
-                    if (guest_markers_enabled) {
-                        const auto marker_sz = nop->header.count.Value() * 2;
-                        const std::string_view label{
-                            reinterpret_cast<const char*>(&nop->data_block[1]), marker_sz};
-                        rasterizer->ScopeMarkerBegin(label, true);
-                    }
-                    break;
-                }
-                case PM4CmdNop::PayloadType::DebugColorMarkerPush: {
-                    if (guest_markers_enabled) {
-                        const auto marker_sz = nop->header.count.Value() * 2;
-                        const std::string_view label{
-                            reinterpret_cast<const char*>(&nop->data_block[1]), marker_sz};
-                        const u32 color = *reinterpret_cast<const u32*>(
-                            reinterpret_cast<const u8*>(&nop->data_block[1]) + marker_sz);
-                        rasterizer->ScopedMarkerInsertColor(label, color, true);
-                    }
-                    break;
-                }
-                case PM4CmdNop::PayloadType::DebugMarkerPop: {
-                    if (guest_markers_enabled) {
-                        rasterizer->ScopeMarkerEnd(true);
-                    }
-                    break;
-                }
-                default:
-                    break;
-                }
-                break;
-            }
-            case PM4ItOpcode::ContextControl: {
-                break;
-            }
-            case PM4ItOpcode::ClearState: {
-                regs.SetDefaults();
-                break;
-            }
-            case PM4ItOpcode::SetConfigReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
-                const auto* payload = reinterpret_cast<const u32*>(header + 2);
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-                break;
-            }
-            case PM4ItOpcode::SetContextReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
-                const auto* payload = reinterpret_cast<const u32*>(header + 2);
-
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-
-                // In the case of HW, render target memory has alignment as color block operates on
-                // tiles. There is no information of actual resource extents stored in CB context
-                // regs, so any deduction of it from slices/pitch will lead to a larger surface
-                // created. The same applies to the depth targets. Fortunately, the guest always
-                // sends a trailing NOP packet right after the context regs setup, so we can use the
-                // heuristic below and extract the hint to determine actual resource dims.
-
-                switch (reg_addr) {
-                case ContextRegs::CbColor0Base:
-                case ContextRegs::CbColor1Base:
-                case ContextRegs::CbColor2Base:
-                case ContextRegs::CbColor3Base:
-                case ContextRegs::CbColor4Base:
-                case ContextRegs::CbColor5Base:
-                case ContextRegs::CbColor6Base:
-                case ContextRegs::CbColor7Base: {
-                    const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
-                                            (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
-                    ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                    const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                    } else {
-                        last_cb_extent[col_buf_id].raw = 0;
-                    }
-                    break;
-                }
-                case ContextRegs::CbColor0Cmask:
-                case ContextRegs::CbColor1Cmask:
-                case ContextRegs::CbColor2Cmask:
-                case ContextRegs::CbColor3Cmask:
-                case ContextRegs::CbColor4Cmask:
-                case ContextRegs::CbColor5Cmask:
-                case ContextRegs::CbColor6Cmask:
-                case ContextRegs::CbColor7Cmask: {
-                    const auto col_buf_id =
-                        (reg_addr - ContextRegs::CbColor0Cmask) /
-                        (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
-                    ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                    const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x04) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                    }
-                    break;
-                }
-                case ContextRegs::DbZInfo: {
-                    if (header->type3.count == 8) {
-                        ASSERT_MSG(payload[20] == 0xc0001000,
-                                   "NOP hint is missing in DB setup sequence");
-                        last_db_extent.raw = payload[21];
-                    } else {
-                        last_db_extent.raw = 0;
-                    }
-                    break;
-                }
-                default:
-                    break;
-                }
-                break;
-            }
-            case PM4ItOpcode::SetShReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto set_size = (count - 1) * sizeof(u32);
-
-                if (set_data->reg_offset >= 0x200 &&
-                    set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                    ASSERT(set_size <= sizeof(ComputeProgram));
-                    auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
-                                 (set_data->reg_offset - 0x200);
-                    std::memcpy(addr, header + 2, set_size);
-                } else {
-                    std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                                header + 2, set_size);
-                }
-                break;
-            }
-            case PM4ItOpcode::SetUconfigReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                            header + 2, (count - 1) * sizeof(u32));
-                break;
-            }
-            case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
-                break;
-            }
-            case PM4ItOpcode::IndexType: {
-                const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
-                regs.index_buffer_type.raw = index_type->raw;
-                break;
-            }
-            case PM4ItOpcode::DrawIndex2: {
-                const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndex2*>(header);
-                regs.max_index_size = draw_index->max_size;
-                regs.index_base_address.base_addr_lo = draw_index->index_base_lo;
-                regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
-                regs.num_indices = draw_index->index_count;
-                regs.draw_initiator = draw_index->draw_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker("gfx:{}:DrawIndex2", fmt::make_format_args(cmd_address),
-                                        [&] { rasterizer->Draw(true); });
-                break;
-            }
-            case PM4ItOpcode::DrawIndexOffset2: {
-                const auto* draw_index_off =
-                    reinterpret_cast<const PM4CmdDrawIndexOffset2*>(header);
-                regs.max_index_size = draw_index_off->max_size;
-                regs.num_indices = draw_index_off->index_count;
-                regs.draw_initiator = draw_index_off->draw_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndexOffset2", fmt::make_format_args(cmd_address),
-                    [&] { rasterizer->Draw(true, draw_index_off->index_offset); });
-                break;
-            }
-            case PM4ItOpcode::DrawIndexAuto: {
-                const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
-                regs.num_indices = draw_index->index_count;
-                regs.draw_initiator = draw_index->draw_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto", fmt::make_format_args(cmd_address),
-                                        [&] { rasterizer->Draw(false); });
-                break;
-            }
-            case PM4ItOpcode::DrawIndirect: {
-                const auto* draw_indirect = reinterpret_cast<const PM4CmdDrawIndirect*>(header);
-                const auto offset = draw_indirect->data_offset;
-                const auto stride = sizeof(DrawIndirectArgs);
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndirect", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0,
-                                                 draw_indirect->base_vtx_loc,
-                                                 draw_indirect->start_inst_loc);
-                    });
-                break;
-            }
-            case PM4ItOpcode::DrawIndirectCountMulti: {
-                const auto* draw_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndirectCountMulti*>(header);
-                const auto offset = draw_indirect->data_offset;
-                const auto stride = sizeof(DrawIndirectArgs);
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndirectCountMulti", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(
-                            false, indirect_args_addr, offset, draw_indirect->stride,
-                            draw_indirect->count, draw_indirect->count_addr,
-                            draw_indirect->base_vtx_loc, draw_indirect->start_inst_loc);
-                    });
-                break;
-            }
-            case PM4ItOpcode::DrawIndirectMulti: {
-                const auto* draw_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndirectMulti*>(header);
-                const auto offset = draw_indirect->data_offset;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndirectMulti", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                                 draw_indirect->stride, draw_indirect->count, 0,
-                                                 draw_indirect->base_vtx_loc,
-                                                 draw_indirect->start_inst_loc);
-                    });
-                break;
-            }
-            case PM4ItOpcode::DrawIndexIndirect: {
-                const auto* draw_index_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndexIndirect*>(header);
-                const auto offset = draw_index_indirect->data_offset;
-                const auto stride = sizeof(DrawIndexedIndirectArgs);
-                regs.max_index_size = index_buffer_num_indices;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndexIndirect", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0,
-                                                 draw_index_indirect->base_vtx_loc,
-                                                 draw_index_indirect->start_inst_loc);
-                    });
-                break;
-            }
-            case PM4ItOpcode::DrawIndexIndirectMulti: {
-                const auto* draw_index_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndexIndirectMulti*>(header);
-                const auto offset = draw_index_indirect->data_offset;
-                regs.max_index_size = index_buffer_num_indices;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndexIndirectMulti", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(
-                            true, indirect_args_addr, offset, draw_index_indirect->stride,
-                            draw_index_indirect->count, 0, draw_index_indirect->base_vtx_loc,
-                            draw_index_indirect->start_inst_loc);
-                    });
-                break;
-            }
-            case PM4ItOpcode::DrawIndexIndirectCountMulti: {
-                const auto* draw_index_indirect =
-                    reinterpret_cast<const PM4CmdDrawIndexIndirectCountMulti*>(header);
-                const auto offset = draw_index_indirect->data_offset;
-                regs.max_index_size = index_buffer_num_indices;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
-                }
-                if (!rasterizer) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndexIndirectCountMulti", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(
-                            true, indirect_args_addr, offset, draw_index_indirect->stride,
-                            draw_index_indirect->count,
-                            draw_index_indirect->count_indirect_enable.Value()
-                                ? draw_index_indirect->count_addr
-                                : 0,
-                            draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc);
-                    });
-                break;
-            }
-            case PM4ItOpcode::DispatchDirect: {
-                const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
-                auto& cs_program = GetCsRegs();
-                cs_program.dim_x = dispatch_direct->dim_x;
-                cs_program.dim_y = dispatch_direct->dim_y;
-                cs_program.dim_z = dispatch_direct->dim_z;
-                cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
-                                                   cs_program);
-                }
-                if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker("gfx:{}:DispatchDirect", fmt::make_format_args(cmd_address),
-                                        [&] { rasterizer->DispatchDirect(); });
-                break;
-            }
-            case PM4ItOpcode::DispatchIndirect: {
-                const auto* dispatch_indirect =
-                    reinterpret_cast<const PM4CmdDispatchIndirect*>(header);
-                auto& cs_program = GetCsRegs();
-                const auto offset = dispatch_indirect->data_offset;
-                const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
-                                                   cs_program);
-                }
-                if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
-                    break;
-                }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DispatchIndirect", fmt::make_format_args(cmd_address),
-                    [&] { rasterizer->DispatchIndirect(indirect_args_addr, offset, size); });
-                break;
-            }
-            case PM4ItOpcode::NumInstances: {
-                const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
-                regs.num_instances.num_instances = num_instances->num_instances;
-                break;
-            }
-            case PM4ItOpcode::IndexBase: {
-                const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
-                regs.index_base_address.base_addr_lo = index_base->addr_lo;
-                regs.index_base_address.base_addr_hi = index_base->addr_hi;
-                break;
-            }
-            case PM4ItOpcode::IndexBufferSize: {
-                const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
-                index_buffer_num_indices = index_size->num_indices;
-                break;
-            }
-            case PM4ItOpcode::SetBase: {
-                const auto* set_base = reinterpret_cast<const PM4CmdSetBase*>(header);
-                ASSERT(set_base->base_index == PM4CmdSetBase::BaseIndex::DrawIndexIndirPatchTable);
-                indirect_args_addr = set_base->Address<u64>();
-                break;
-            }
-            case PM4ItOpcode::EventWrite: {
-                const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
-                LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
-                          magic_enum::enum_name(event->event_type.Value()),
-                          magic_enum::enum_name(event->event_index.Value()));
-                if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
-                    // TODO: handle proper synchronization, for now signal that update is done
-                    // immediately
-                    regs.cp_strmout_cntl.offset_update_done = 1;
-                } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-                    if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                        static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
-                        }
-                        pixel_counter += OcclusionCounterStep;
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::EventWriteEos: {
-                const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-                if (rasterizer) {
-                    rasterizer->OnFence();
-                }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                });
-                if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
-                    ASSERT(event_eos->size == 1);
-                    if (rasterizer) {
-                        rasterizer->Finish();
-                        const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
-                        *event_eos->Address() = value;
-                    }
-                }
-                break;
-            }
-            case PM4ItOpcode::EventWriteEop: {
-                const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (rasterizer) {
-                    rasterizer->OnFence();
-                }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                break;
-            }
-            case PM4ItOpcode::DmaData: {
-                const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
-                if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
-                    break;
-                }
-                ASSERT(dma_data->command.das == 0);
-                if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
-                                           dma_data->data, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                           dma_data->NumBytes(), true, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Data &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                           dma_data->data, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Gds &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                           dma_data->NumBytes(), false, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
-                                           dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
-                                           false, false);
-                } else {
-                    UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
-                                    u32(dma_data->dst_sel));
-                }
-                break;
-            }
-            case PM4ItOpcode::WriteData: {
-                const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-                ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-                const u32 data_size = (header->type3.count.Value() - 2) * 4;
-                u64* address = write_data->Address<u64*>();
-                if (!write_data->wr_one_addr.Value()) {
-                    if (rasterizer) {
-                        rasterizer->OnFence();
-                    }
-                    std::memcpy(address, write_data->data, data_size);
-                } else {
-                    UNREACHABLE();
-                }
-                break;
-            }
-            case PM4ItOpcode::CopyData: {
-                const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
-                LOG_WARNING(Render,
-                            "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
-                            "count_sel = {}, wr_confirm = {}, engine_sel = {}",
-                            u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
-                            copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
-                            u32(copy_data->engine_sel.Value()));
-                break;
-            }
-            case PM4ItOpcode::MemSemaphore: {
-                const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
-                if (mem_semaphore->IsSignaling()) {
-                    mem_semaphore->Signal();
-                } else {
-                    while (!mem_semaphore->Signaled()) {
-                        YIELD_GFX();
-                    }
-                    mem_semaphore->Decrement();
-                }
-                break;
-            }
-            case PM4ItOpcode::AcquireMem: {
-                // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
-                break;
-            }
-            case PM4ItOpcode::Rewind: {
-                if (!rasterizer) {
-                    break;
-                }
-                const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
-                while (!rewind->Valid()) {
-                    YIELD_GFX();
-                }
-                break;
-            }
-            case PM4ItOpcode::WaitRegMem: {
-                const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
-                // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-                // Optimization: VO label waits are special because the emulator
-                // will write to the label when presentation is finished. So if
-                // there are no other submits to yield to we can sleep the thread
-                // instead and allow other tasks to run.
-                const u64* wait_addr = wait_reg_mem->Address<u64*>();
-                if (vo_port->IsVoLabel(wait_addr) &&
-                    num_submits == mapped_queues[GfxQueueId].submits.size()) {
-                    vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
-                    break;
-                }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
-                }
-                break;
-            }
-            case PM4ItOpcode::IndirectBuffer: {
-                const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-                auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
-                RESUME_GFX(task);
-
-                while (!task.handle.done()) {
-                    YIELD_GFX();
-                    RESUME_GFX(task);
-                }
-                task.handle.destroy();
-                break;
-            }
-            case PM4ItOpcode::IncrementDeCounter: {
-                ++cblock.de_count;
-                break;
-            }
-            case PM4ItOpcode::WaitOnCeCounter: {
-                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
-                    RESUME_GFX(ce_task);
-                }
-                break;
-            }
-            case PM4ItOpcode::PfpSyncMe: {
-                break;
-            }
-            case PM4ItOpcode::StrmoutBufferUpdate: {
-                const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
-                LOG_WARNING(Render_Vulkan,
-                            "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
-                            "source_select = {}, buffer_select = {}",
-                            strmout->update_memory.Value(),
-                            magic_enum::enum_name(strmout->source_select.Value()),
-                            strmout->buffer_select.Value());
-                break;
-            }
-            case PM4ItOpcode::GetLodStats: {
-                LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
-                break;
-            }
-            case PM4ItOpcode::CondExec: {
-                const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
-                if (cond_exec->command.Value() != 0) {
-                    LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
-                }
-                const auto skip = *cond_exec->Address() == false;
-                if (skip) {
-                    dcb = NextPacket(dcb,
-                                     header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
-                    continue;
-                }
-                break;
-            }
-            default:
-                UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                                static_cast<u32>(opcode), count);
-            }
-            dcb = NextPacket(dcb, header->type3.NumWords() + 1);
+    while (true) {
+        dcb = RunGraphicsPackets(dcb, ce_task, base_addr);
+        if (dcb.empty()) {
             break;
         }
+
+        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::MemSemaphore: {
+            if (rasterizer) {
+                rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::MemSemaphore));
+            }
+            NoteGuestSync(rasterizer);
+            const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            if (mem_semaphore->IsSignaling()) {
+                mem_semaphore->Signal();
+            } else {
+                while (!mem_semaphore->Signaled()) {
+                    YIELD_GFX();
+                }
+                mem_semaphore->Decrement();
+            }
+            break;
+        }
+        case PM4ItOpcode::Rewind: {
+            if (!rasterizer) {
+                break;
+            }
+            const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            while (!rewind->Valid()) {
+                YIELD_GFX();
+            }
+            break;
+        }
+        case PM4ItOpcode::WaitRegMem: {
+            NoteGuestSync(rasterizer);
+            const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+            // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            // Optimization: VO label waits are special because the emulator
+            // will write to the label when presentation is finished. So if
+            // there are no other submits to yield to we can sleep the thread
+            // instead and allow other tasks to run.
+            const u64* wait_addr = wait_reg_mem->Address<u64*>();
+            if (vo_port->IsVoLabel(wait_addr) &&
+                num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                // The flip that frees the label is prepared at its flip packet, in stream order
+                // before this wait: the recording thread goes on while this thread sleeps.
+                FlushHonestSignals();
+                vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                break;
+            }
+            if (honest_fences_ && !wait_reg_mem->Test(regs.reg_array) &&
+                PendingLabelSatisfies(wait_reg_mem)) {
+                // Met in stream order by a label the GPU writes after earlier work.
+                ++packet_stats.waits_pending;
+                break;
+            }
+            packet_stats.waits += !wait_reg_mem->Test(regs.reg_array);
+            while (!wait_reg_mem->Test(regs.reg_array)) {
+                if (draw_pipe && honest_fences_ && PendingLabelSatisfies(wait_reg_mem)) {
+                    // Another queue has queued the label meanwhile.
+                    ++packet_stats.waits_pending_late;
+                    break;
+                }
+                ++packet_stats.wait_spins;
+                FlushHonestSignals();
+                YIELD_GFX();
+            }
+            break;
+        }
+        case PM4ItOpcode::IndirectBuffer: {
+            const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            auto task = ProcessGraphics(
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+            RESUME_GFX(task);
+
+            while (!task.handle.done()) {
+                YIELD_GFX();
+                RESUME_GFX(task);
+            }
+            task.handle.destroy();
+            break;
+        }
+        default:
+            UNREACHABLE_MSG("Unstoppable PM4 opcode {:#x}", u32(header->type3.opcode.Value()));
+        }
+        dcb = NextPacket(dcb, header->type3.NumWords() + 1);
     }
 
     if (ce_task.handle) {
@@ -944,6 +1745,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        if (draw_pipe && ComputePacketDrainsPipe(header, opcode, pipe_drain_all_, pipe_fences_)) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonComputeOpcode +
+                                      static_cast<u32>(opcode));
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -968,6 +1773,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
             if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                 break;
+            }
+            if (draw_pipe && pipe_fences_) {
+                // A patch of a later dispatch in this ring is resolved here, at decode.
+                const VAddr dst_addr = dma_data->DstAddress<VAddr>();
+                const auto* patched =
+                    reinterpret_cast<const PM4Header*>(dst_addr - sizeof(PM4Header));
+                const bool is_patch =
+                    (dma_data->src_sel == DmaDataSrc::Memory ||
+                     dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                    (dma_data->dst_sel == DmaDataDst::Memory ||
+                     dma_data->dst_sel == DmaDataDst::MemoryUsingL2) &&
+                    dst_addr >= base_addr && dst_addr < base_addr + acb_size &&
+                    dma_data->NumBytes() == sizeof(PM4CmdDispatchIndirect::GroupDimensions) &&
+                    patched->type == 3 && patched->type3.opcode == PM4ItOpcode::DispatchDirect;
+                if (!is_patch) {
+                    rasterizer->QueuePm4(header, (header->type3.NumWords() + 1) * sizeof(u32));
+                    break;
+                }
             }
             ASSERT(dma_data->command.das == 0);
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
@@ -1008,9 +1831,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
                                 u32(dma_data->dst_sel));
             }
+            if (honest_fences_) {
+                // In place, the DMA may run on the GPU: a later wait on its result flushes.
+                honest_signal_tick_.store(rasterizer->CurrentTick(), std::memory_order_release);
+            }
             break;
         }
         case PM4ItOpcode::AcquireMem: {
+            NoteGuestSync(rasterizer);
             break;
         }
         case PM4ItOpcode::Rewind: {
@@ -1034,8 +1862,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                              (set_data->reg_offset - 0x200);
                 std::memcpy(addr, header + 2, set_size);
             } else {
-                std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                            header + 2, set_size);
+                const u32 word = Regs::ShRegWordOffset + set_data->reg_offset;
+                if (IsGfxUserDataWrite(static_cast<u32>(set_data->reg_offset),
+                                       set_size / sizeof(u32))) {
+                    StoreRegBlock(&regs.reg_array[word], header + 2, set_size);
+                } else {
+                    gfx_stamp.WriteRegsImmediate(&regs.reg_array[word], header + 2, set_size, word);
+                }
+                MarkPipeDirty(word, static_cast<u32>(set_size / sizeof(u32)));
             }
             break;
         }
@@ -1046,6 +1880,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::DispatchDirect: {
+            CountAcbDispatch(packet_stats);
             const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
@@ -1072,6 +1907,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::DispatchIndirect: {
+            CountAcbDispatch(packet_stats);
             const auto* dispatch_indirect =
                 reinterpret_cast<const PM4CmdDispatchIndirectMec*>(header);
             auto& cs_program = GetCsRegs();
@@ -1095,16 +1931,19 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
-                if (rasterizer) {
-                    rasterizer->OnFence();
+                if (draw_pipe && pipe_fences_) {
+                    rasterizer->QueuePm4(header, (header->type3.NumWords() + 1) * sizeof(u32));
+                    break;
                 }
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                FenceDrainAndDownload(rasterizer);
+                WriteData(write_data, data_size);
             } else {
                 UNREACHABLE();
             }
             break;
         }
         case PM4ItOpcode::MemSemaphore: {
+            NoteGuestSync(rasterizer);
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
@@ -1117,17 +1956,82 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::WaitRegMem: {
+            NoteGuestSync(rasterizer);
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            if (honest_fences_ && !wait_reg_mem->Test(regs.reg_array) &&
+                PendingLabelSatisfies(wait_reg_mem)) {
+                ++packet_stats.acb_waits_pending;
+                break;
+            }
+            packet_stats.acb_waits += !wait_reg_mem->Test(regs.reg_array);
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                if (draw_pipe && honest_fences_ && PendingLabelSatisfies(wait_reg_mem)) {
+                    ++packet_stats.acb_waits_pending_late;
+                    break;
+                }
+                ++packet_stats.acb_wait_spins;
+                FlushHonestSignals();
                 YIELD_ASC(vqid);
             }
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            if (rasterizer) {
-                rasterizer->OnFence();
+            // The compute queue has no packet-run guard, so its dispatch
+            // marks reach a drain here, at its waits and at every submit.
+            if (!honest_fences_ || !rasterizer ||
+                release_mem->data_sel.Value() == DataSelect::GdsMemStore) {
+                FenceDrainAndDownload(rasterizer);
+            }
+            if (honest_fences_ && rasterizer) {
+                std::optional<FenceWrite> write;
+                const VAddr address = release_mem->Address<VAddr>();
+                switch (release_mem->data_sel.Value()) {
+                case DataSelect::Data32Low:
+                    write = FenceWrite{address, release_mem->DataDWord(), sizeof(u32)};
+                    break;
+                case DataSelect::Data64:
+                    write = FenceWrite{address, release_mem->DataQWord(), sizeof(u64)};
+                    break;
+                case DataSelect::GpuClock64:
+                    write = FenceWrite{address, GetGpuClock64(), sizeof(u64)};
+                    write->timestamp = DataSelect::GpuClock64;
+                    break;
+                case DataSelect::PerfCounter:
+                    write = FenceWrite{address, GetGpuPerfCounter(), sizeof(u64)};
+                    write->timestamp = DataSelect::PerfCounter;
+                    break;
+                case DataSelect::GdsMemStore:
+                    // Recorded on the GPU in stream order; only the interrupt waits below.
+                    rasterizer->CopyBuffer(address, release_mem->gds_index,
+                                           release_mem->num_dw * sizeof(u32), false, true);
+                    break;
+                default:
+                    UNREACHABLE();
+                }
+                bool irq = false;
+                switch (release_mem->int_sel.Value()) {
+                case InterruptSelect::None:
+                    break;
+                case InterruptSelect::IrqUndocumented:
+                case InterruptSelect::IrqWhenWriteConfirm:
+                    irq = true;
+                    break;
+                default:
+                    UNREACHABLE();
+                }
+                const auto irq_id =
+                    irq ? std::optional{static_cast<Platform::InterruptId>(queue.pipe_id)}
+                        : std::nullopt;
+                if (release_mem->data_sel.Value() == DataSelect::GdsMemStore &&
+                    !(draw_pipe && pipe_fences_)) {
+                    // Drained above, before the copy.
+                    QueueHonestSignal(write, irq_id);
+                } else {
+                    HonestFence(write, irq_id);
+                }
+                break;
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
@@ -1139,7 +2043,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::EventWrite: {
-            // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            NoteGuestSync(rasterizer);
             break;
         }
         default:

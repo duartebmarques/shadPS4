@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <mutex>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -109,8 +110,16 @@ struct PageManager::Impl {
 
     void EnsurePages(VAddr begin, VAddr end) {
         end = std::min(end, VAddr{1} << ADDRESS_BITS) - 1;
+        // The reserve is inclusive of the end page; an empty range, or one wholly past the table
+        // (a POSIX unmap reports the range merged with adjacent free space), reserves nothing.
+        if (begin > end) {
+            return;
+        }
         const size_t start_page = begin >> PM_PAGE_BITS;
         const size_t end_page = end >> PM_PAGE_BITS;
+        // Guest mapping and the fallback in UpdatePageWatchers can both reserve, and the page
+        // table pools are not thread safe.
+        std::scoped_lock lk{reserve_mutex};
         cached_pages.reserve(start_page, end_page);
         locks.reserve(start_page, end_page);
     }
@@ -276,6 +285,7 @@ struct PageManager::Impl {
         static constexpr bool NULL_CHECK = false;
     };
     Common::MultiLevelPageTable<MutexTraits> locks;
+    std::mutex reserve_mutex;
 };
 
 #ifdef __linux__
@@ -434,8 +444,7 @@ struct SignalImpl : public PageManager::Impl {
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
-        const auto is_gpu_thread =
-            std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (Common::IsWriteError(context)) {
             return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
         } else {
@@ -448,13 +457,9 @@ struct SignalImpl : public PageManager::Impl {
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
 #ifdef __linux__
     if (EmulatorSettings.IsUserfaultfdTracking()) {
-        try {
-            impl = std::make_unique<UffdImpl>(rasterizer_);
-            LOG_INFO(Config, "Memory tracking method: userfaultfd");
-            return;
-        } catch (const std::runtime_error& e) {
-            // if uffd is unsupported, falls back to SignalImpl
-        }
+        // Write-protect faults only: the readback path needs the read faults the
+        // signal implementation delivers, so this fork keeps signals.
+        LOG_WARNING(Config, "userfaultfd tracking is not used: readbacks need read faults");
     }
     LOG_INFO(Config, "Memory tracking method: signals");
 #endif

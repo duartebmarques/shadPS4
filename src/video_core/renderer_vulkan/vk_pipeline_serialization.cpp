@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <boost/container/small_vector.hpp>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -12,12 +13,75 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 9u;
-static constexpr u32 ShaderMetaVersion = 6u;
+static constexpr u32 ShaderBinaryVersion = 19u;
+static constexpr u32 ShaderMetaVersion = 12u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
 namespace Vulkan {
+
+// True when every descriptor the SPIR-V declares sits on a binding the pipeline layout gives a
+// stage starting at the given binding, with at least as many descriptors.
+static bool SpirvFitsLayout(std::span<const u32> spv, const Shader::Info& info, u32 binding) {
+    boost::container::small_vector<std::pair<u32, u32>, 32> layout;
+    for (size_t i = 0; i < info.buffers.size(); ++i) {
+        layout.emplace_back(binding++, 1u);
+    }
+    for (const auto& image : info.images) {
+        const u32 count = image.NumBindings(info);
+        layout.emplace_back(binding, count);
+        binding += count;
+    }
+    for (size_t i = 0; i < info.samplers.size(); ++i) {
+        layout.emplace_back(binding++, 1u);
+    }
+
+    constexpr u32 OpTypeArray = 28;
+    constexpr u32 OpTypePointer = 32;
+    constexpr u32 OpConstant = 43;
+    constexpr u32 OpVariable = 59;
+    constexpr u32 OpDecorate = 71;
+    constexpr u32 DecorationBinding = 33;
+    if (spv.size() < 5) {
+        return false;
+    }
+    const u32 bound = spv[3];
+    std::vector<u32> type_of(bound), array_len(bound), constant(bound);
+    boost::container::small_vector<std::pair<u32, u32>, 32> decorated;
+    for (size_t i = 5; i < spv.size();) {
+        const u32 op = spv[i] & 0xffff;
+        const u32 len = spv[i] >> 16;
+        if (len == 0 || i + len > spv.size()) {
+            return false;
+        }
+        const auto w = spv.subspan(i, len);
+        const auto set = [&](std::vector<u32>& table, u32 id, u32 value) {
+            if (id < bound) {
+                table[id] = value;
+            }
+        };
+        if (op == OpDecorate && len >= 4 && w[2] == DecorationBinding) {
+            decorated.emplace_back(w[1], w[3]);
+        } else if ((op == OpVariable || op == OpConstant) && len >= 4) {
+            set(op == OpVariable ? type_of : constant, w[2], op == OpVariable ? w[1] : w[3]);
+        } else if (op == OpTypePointer && len >= 4) {
+            set(type_of, w[1], w[3]);
+        } else if (op == OpTypeArray && len >= 4) {
+            set(array_len, w[1], w[3]);
+        }
+        i += len;
+    }
+    for (const auto [var, var_binding] : decorated) {
+        const u32 pointee = var < bound && type_of[var] < bound ? type_of[type_of[var]] : 0;
+        const u32 len_id = pointee < bound ? array_len[pointee] : 0;
+        const u32 count = len_id != 0 && len_id < bound ? constant[len_id] : 1;
+        const auto it = std::ranges::find(layout, var_binding, &std::pair<u32, u32>::first);
+        if (it == layout.end() || count > it->second) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -138,6 +202,9 @@ bool ComputePipeline::SerializationSupport::Deserialize(Serialization::Archive& 
 }
 
 bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
+    // A failed load leaves its stages behind.
+    infos.fill(nullptr);
+    modules.fill(nullptr);
     compute_key.Deserialize(ar);
 
     ComputePipeline::SerializationSupport sdata{};
@@ -152,16 +219,19 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
-    if (!LoadPipelineStage(meta_ar, 0)) {
+    // Compute stages carry no fetch shader; the loaded value is discarded.
+    Shader::Gcn::FetchShaderData fetch_data{};
+    Shader::Backend::Bindings binding{};
+    if (!LoadPipelineStage(meta_ar, 0, fetch_data, binding)) {
         return false;
     }
 
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *infos[0], modules[0], sdata, true);
+    it.value() = std::make_unique<ComputePipeline>(
+        instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
+        *pipeline_cache, compute_key, *infos[0], modules[0], sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -206,11 +276,18 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    // A failed load leaves its stages behind; a pipeline without them must not inherit them.
+    infos.fill(nullptr);
+    modules.fill(nullptr);
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
+    // Set by the one stage that owns a fetch shader, as at runtime; a key with no such stage
+    // yields empty fetch data.
+    Shader::Gcn::FetchShaderData fetch_data{};
+    Shader::Backend::Bindings binding{};
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
         if (!hash) {
@@ -226,32 +303,58 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
         Serialization::Archive meta_ar{std::move(meta_blob)};
 
-        if (!LoadPipelineStage(meta_ar, stage_idx)) {
+        if (!LoadPipelineStage(meta_ar, stage_idx, fetch_data, binding)) {
             return false;
         }
+    }
+    if (const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+        vs_info && vs_info->has_fetch_shader && fetch_data.Empty()) {
+        // Never preload a pipeline that would draw without vertex input; it compiles at runtime
+        // from the live fetch shader instead.
+        LOG_WARNING(Render_Vulkan,
+                    "Skipping preload of a pipeline: vertex shader {:#x} has a fetch shader but "
+                    "the cache carries no fetch data for it",
+                    vs_info->pgm_hash);
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        return false;
     }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
     it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+        instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile, graphics_key,
+        *pipeline_cache, infos, runtime_infos, fetch_data.Empty() ? nullptr : &fetch_data, modules,
+        sdata, true);
 
     infos.fill(nullptr);
     modules.fill(nullptr);
-    fetch_shader = nullptr;
 
     return true;
 }
 
-bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
+bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                                      Shader::Gcn::FetchShaderData& fetch_out,
+                                      Shader::Backend::Bindings& binding) {
     auto program = std::make_unique<Program>();
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
     if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
         return false;
+    }
+    // As Publish does at runtime: only the stage that owns a fetch shader (the logical vertex
+    // stage) sets the pipeline's fetch data. Stages after it in load order, geometry above all,
+    // carry none and must not clear it.
+    if (!spec.fetch_shader_data.Empty()) {
+        fetch_out = spec.fetch_shader_data;
+    }
+    NoteSharpVerdicts(program->info);
+    if (spec_fp_cache) {
+        // Signatures are not serialized; without recomputing here the (sig, sig2) resolve
+        // would treat every preloaded permutation as unknown and compile a duplicate.
+        spec.ComputeSig();
     }
 
     std::vector<u32> spv{};
@@ -261,6 +364,27 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (spv.empty()) {
         return false;
     }
+    if (!SpirvFitsLayout(spv, program->info, spec.start.unified)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Cached permutation {} of {}_{:x} uses descriptors its info lacks, skipping "
+                    "preload",
+                    perm_idx, program->info.hw_stage, program->info.pgm_hash);
+        return false;
+    }
+    // The layout numbers the stages' bindings in sequence. A key whose stages were compiled
+    // against other neighbours is stale: its permutations are still valid and kept, so this
+    // session does not hand their indices to new ones, but the pipeline compiles at runtime.
+    const bool chained = !spec.HasBindings() || spec.start == binding;
+    if (!chained) {
+        const auto level =
+            num_unchained_pipelines++ ? Common::Log::Level::Debug : Common::Log::Level::Warning;
+        LOG_GENERIC(Render_Vulkan, level,
+                    "Cached pipeline pairs permutation {} of {}_{:x} (start {}/{}) with stages "
+                    "ending at {}/{}, skipping preload",
+                    perm_idx, program->info.hw_stage, program->info.pgm_hash, spec.start.unified,
+                    spec.start.buffer, binding.unified, binding.buffer);
+    }
+    program->info.AddBindings(binding);
 
     // Permutation hash depends on shader variation index. To prevent collisions, we need insert it
     // at the exact position rather than append
@@ -272,31 +396,23 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
-        if (it != it_pgm.value()->modules.end()) {
-            // A matching permutation is valid only at its original index. A different index means
-            // the store holds entries from more than one cache generation, so this pipeline is
-            // left to compile at runtime.
-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
-            if (perm_idx != idx) {
-                LOG_WARNING(Render_Vulkan,
-                            "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
-                            "preload",
-                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
-                return false;
-            }
-            module = it->module;
-        } else {
-            module = CompileSPV(spv, instance.GetDevice());
-        }
+        // The permutation joins the cached program; its spec must point at that program's info,
+        // not at the temporary one this load built.
+        spec.info = &it_pgm.value()->info;
+        // The same specialization can sit at several indices: a session that had not loaded one
+        // stores the next under a free index. Each index keeps the module of its own SPIR-V.
+        const auto& permuts = it_pgm.value()->modules;
+        module = perm_idx < permuts.size() && permuts[perm_idx].spec == spec
+                     ? permuts[perm_idx].module
+                     : CompileSPV(spv, instance.GetDevice());
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    if (!chained) {
+        return false;
+    }
 
     infos[stage] = &it_pgm.value()->info;
     modules[stage] = module;
-    if (auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
-        fetch_shader = &fetch;
-    }
 
     return true;
 }
@@ -369,6 +485,10 @@ void PipelineCache::WarmUp() {
         });
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    if (num_unchained_pipelines) {
+        LOG_WARNING(Render, "{} cached pipelines pair stages compiled for other neighbours",
+                    num_unchained_pipelines);
+    }
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
@@ -389,7 +509,8 @@ void Info::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer info{ar};
 
     info.Write(this, sizeof(InfoPersistent));
-    info.Write(flattened_ud_buf);
+    info.Write(size_t{srt_info.flattened_bufsize_dw});
+    info.Write(flat_ud, srt_info.flattened_bufsize_dw * sizeof(u32));
     srt_info.Serialize(ar);
 }
 
@@ -398,6 +519,9 @@ bool Info::Deserialize(Serialization::Archive& ar) {
 
     info.Read(this, sizeof(Shader::InfoPersistent));
     info.Read(flattened_ud_buf);
+    // Preload builds descriptor layouts from these sharps before any draw refreshes them.
+    flat_ud = flattened_ud_buf.data();
+    ResolveDirectReads();
 
     return srt_info.Deserialize(ar);
 }

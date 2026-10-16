@@ -2462,6 +2462,48 @@ static void PatchUncoveredCpuInstructions(u64 segment_addr, const AddressRanges&
     }
 }
 
+/// Applies every CPU patch between covered_ranges and after the last one in place, without
+/// relocating any. Where the FS segment is valid host memory an FS read does not trap, so one
+/// left alone here could not be patched later.
+static void PatchUncoveredInstructions(u64 segment_addr, u64 segment_size,
+                                       const AddressRanges& covered_ranges,
+                                       RedZonePatchResult& result) {
+    auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
+    if (module == nullptr) {
+        return;
+    }
+    std::unique_lock lock{module->mutex};
+
+    const auto patch_gap = [&](uintptr_t gap_start, uintptr_t gap_end) {
+        uintptr_t address = gap_start;
+        while (address < gap_end) {
+            // Bounded by the gap, so a decode never reaches into the code of a function.
+            const auto decoded = DecodeCodeInstruction(address, gap_end);
+            if (decoded.instruction.length == 0) {
+                ++address;
+                continue;
+            }
+            if (FindMatchingPatch(decoded) != nullptr) {
+                if (TryPatch(reinterpret_cast<u8*>(address), module).first) {
+                    ++result.uncovered_inplace_cpu_patch_instruction_count;
+                } else if (!IsInPlaceMemoryPatch(decoded.instruction.mnemonic)) {
+                    ++result.uncovered_unsupported_cpu_patch_instruction_count;
+                }
+            }
+            address += decoded.instruction.length;
+        }
+    };
+
+    uintptr_t cursor = segment_addr;
+    for (const auto& [range_start, range_end] : covered_ranges) {
+        if (range_start > cursor) {
+            patch_gap(cursor, range_start);
+        }
+        cursor = std::max(cursor, range_end);
+    }
+    patch_gap(cursor, segment_addr + segment_size);
+}
+
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
                                                   std::span<const uintptr_t> function_starts) {
     return PatchSegmentStatically(segment_addr, segment_size, function_starts, true, nullptr);
@@ -2473,7 +2515,11 @@ RedZonePatchResult PatchCpuInstructionsStatically(u64 segment_addr, u64 segment_
     auto result =
         PatchSegmentStatically(segment_addr, segment_size, function_starts, false, &covered_ranges);
     // The EH frame search table does not list every function of every module.
+#if defined(_WIN32) || defined(__APPLE__)
     PatchUncoveredCpuInstructions(segment_addr, covered_ranges, result);
+#else
+    PatchUncoveredInstructions(segment_addr, segment_size, covered_ranges, result);
+#endif
     return result;
 }
 
@@ -2545,9 +2591,9 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
 }
 
 void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
-#if !defined(_WIN32) && !defined(__APPLE__)
-    // Linux and others have an FS segment pointing to valid memory, so continue to do full
-    // ahead-of-time patching for now until a better solution is worked out.
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__linux__)
+    // Platforms without static patching whose FS segment points to valid memory do full
+    // ahead-of-time patching here. Linux gets the same patches from the static pass.
     if (!Patches.empty()) {
         TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
     }

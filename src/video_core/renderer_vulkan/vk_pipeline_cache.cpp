@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+#include <cstring>
+#include <limits>
 #include <ranges>
+#include <xxhash.h>
 
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -17,14 +21,510 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/skipcache/skipcache.h"
 
 namespace Vulkan {
+
+namespace Skipcache = VideoCore::Skipcache;
 
 using Shader::HwStage;
 using Shader::Output;
 using Shader::SwStage;
+
+namespace {
+
+// Hash only the header plus the stage-active union member: RuntimeInfo::operator== switches on
+// stage and compares just that member, so header+active is a superset of what equality reads and
+// can only over-discriminate, and hashing the whole struct would run past XXH3's midsize cutoff
+// into hashLong for union bytes equality never reads. Lengths come from sizeof only: MSVC packs
+// FragmentRuntimeInfo's bitfields differently, so literals would be wrong there.
+u64 RuntimeInfoProxyHash(const Shader::RuntimeInfo& ri) noexcept {
+    // Not offsetof: the union members inherit, making RuntimeInfo
+    // non-standard-layout, where offsetof is only conditionally supported.
+    // The pointer differences fold to the same constants.
+    const auto off = [&ri](const void* p) {
+        return static_cast<size_t>(reinterpret_cast<const char*>(p) -
+                                   reinterpret_cast<const char*>(&ri));
+    };
+    const size_t sw_off = off(&ri.sw);
+    const size_t hw_off = off(&ri.hw);
+    // Exactly the bytes HasSameSwInfo and HasSameHwInfo read: a stage whose
+    // switch falls to the default compares no union bytes at all, so hashing
+    // them would only turn a repeat into a miss on whatever garbage the union
+    // happened to hold.
+    size_t sw_active = 0;
+    switch (ri.sw_stage) {
+    case Shader::SwStage::Vertex:
+        sw_active = sizeof(Shader::SwVertexRuntimeInfo);
+        break;
+    case Shader::SwStage::TessellationControl:
+        sw_active = sizeof(Shader::SwTessControlRuntimeInfo);
+        break;
+    case Shader::SwStage::TessellationEval:
+        sw_active = sizeof(Shader::SwTessEvalRuntimeInfo);
+        break;
+    default:
+        break;
+    }
+    size_t hw_active = 0;
+    switch (ri.hw_stage) {
+    case Shader::HwStage::Local:
+        hw_active = sizeof(Shader::HwLocalRuntimeInfo);
+        break;
+    case Shader::HwStage::Export:
+        hw_active = sizeof(Shader::HwExportRuntimeInfo);
+        break;
+    case Shader::HwStage::Geometry:
+        hw_active = sizeof(Shader::HwGeometryRuntimeInfo);
+        break;
+    case Shader::HwStage::Vertex:
+        hw_active = sizeof(Shader::HwVertexRuntimeInfo);
+        break;
+    case Shader::HwStage::Fragment:
+        hw_active = sizeof(Shader::HwFragmentRuntimeInfo);
+        break;
+    case Shader::HwStage::Compute:
+        hw_active = sizeof(Shader::HwComputeRuntimeInfo);
+        break;
+    default:
+        break;
+    }
+    const auto* base = reinterpret_cast<const u8*>(&ri);
+    // The header hash covers both stages, so equal active bytes under
+    // different stages (and therefore different lengths) cannot collide.
+    const u64 h_header = XXH3_64bits(base, sw_off);
+    const u64 h_sw = XXH3_64bits(base + sw_off, sw_active);
+    const u64 h_hw = XXH3_64bits(base + hw_off, hw_active);
+    return h_header ^ (h_sw * 0x9E3779B97F4A7C15ull) ^ (h_hw * 0xC2B2AE3D27D4EB4Full);
+}
+
+// Sharp bit masks for the canonical key, derived from the fields
+// StageSpecialization::Rebuild reads by setting them on a zeroed sharp.
+struct SpecSharpMasks {
+    std::array<u64, 2> buffer;
+    u64 attrib;
+    std::array<u64, 2> image;
+    u64 fmask;
+    u64 sampler;
+};
+
+// Gather image and buffer reads outside the in-place arm this window: slow
+// ones assembled through Fetch, const buffers keyed as zero without
+// assembling. Drained by DumpSharpReadStats.
+u64 sharp_gather_slow_reads = 0;
+u64 sharp_gather_slow_buffers = 0;
+u64 sharp_gather_const_buffers = 0;
+
+const SpecSharpMasks kSpecSharpMasks = [] {
+    // Not const: a constant here would be diagnosed as a truncating store.
+    u64 ones = ~u64{0};
+    SpecSharpMasks m{};
+    AmdGpu::Buffer b{};
+    b.stride = ones;
+    b.swizzle_enable = ones;
+    b.dst_sel_x = ones;
+    b.dst_sel_y = ones;
+    b.dst_sel_z = ones;
+    b.dst_sel_w = ones;
+    b.num_format = ones;
+    b.data_format = ones;
+    b.element_size = ones;
+    b.index_stride = ones;
+    m.buffer = std::bit_cast<std::array<u64, 2>>(b);
+    AmdGpu::Buffer a{};
+    a.dst_sel_x = ones;
+    a.dst_sel_y = ones;
+    a.dst_sel_z = ones;
+    a.dst_sel_w = ones;
+    a.num_format = ones;
+    a.data_format = ones;
+    m.attrib = std::bit_cast<std::array<u64, 2>>(a)[1];
+    AmdGpu::Image i{};
+    i.data_format = ones;
+    i.num_format = ones;
+    i.dst_sel_x = ones;
+    i.dst_sel_y = ones;
+    i.dst_sel_z = ones;
+    i.dst_sel_w = ones;
+    i.base_level = ones;
+    i.last_level = ones;
+    i.type = ones;
+    const auto iw = std::bit_cast<std::array<u64, 4>>(i);
+    m.image = {iw[0], iw[1]};
+    AmdGpu::Image f{};
+    f.width = ones;
+    f.height = ones;
+    m.fmask = std::bit_cast<std::array<u64, 4>>(f)[1];
+    AmdGpu::Sampler smp{};
+    smp.force_unnormalized.Assign(1);
+    smp.force_degamma.Assign(1);
+    m.sampler = smp.raw0;
+    return m;
+}();
+
+// Worst case: the bindings word + ri hash + every descriptor list + fetch address +
+// 32 attributes, each list followed by its validity word. 32 attributes is an assumption, not
+// a cap enforced here (the attribute list is a guest-parsed vector).
+static_assert(sizeof(Shader::Backend::Bindings) == 8,
+              "the unaligned bindings write must match the aligned word");
+constexpr size_t SpecKeyMaxBytes = 8 + 8 + Shader::NUM_BUFFERS * 16 + Shader::NUM_IMAGES * 16 +
+                                   Shader::NUM_FMASKS * 8 + Shader::NUM_SAMPLERS * 8 + 5 * 8 + 8 +
+                                   32 * 8;
+static_assert(SpecKeyMaxBytes <= 4096, "the key scratch member must hold a whole key");
+static_assert(Shader::NUM_BUFFERS <= 64 && Shader::NUM_IMAGES <= 64 && Shader::NUM_FMASKS <= 64 &&
+                  Shader::NUM_SAMPLERS <= 64,
+              "the per-section validity word holds one bit per descriptor");
+
+// Copies src over dst and returns the OR of every differing word, so a slot
+// compare and its refill are one pass. n is a multiple of 4.
+SHAD_FORCE_INLINE u64 FoldWords(u8* __restrict dst, const u8* __restrict src, size_t n) noexcept {
+    u64 diff = 0;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        u64 a, b;
+        std::memcpy(&a, src + i, 8);
+        std::memcpy(&b, dst + i, 8);
+        diff |= a ^ b;
+        std::memcpy(dst + i, &a, 8);
+    }
+    if (i < n) {
+        u32 a, b;
+        std::memcpy(&a, src + i, 4);
+        std::memcpy(&b, dst + i, 4);
+        diff |= a ^ b;
+        std::memcpy(dst + i, &a, 4);
+    }
+    return diff;
+}
+
+// Packs the canonical key; an invalid sharp contributes only its cleared
+// validity bit, as the specialization skips it. The vertex attribute layout
+// comes from a stored permutation's fetch data; returns 0 while none carries
+// it, which sends the call to the full resolve.
+// The fused form writes the key over the compare slot it is compared with
+// and folds the differing-word OR into the same pass; buf is then a heap
+// member, so it is declared free of aliases with the sharps it reads.
+template <bool Fold>
+size_t GatherSpecKeyImpl(const Shader::Info& info, const Program& program, u64 ri_fp_hash,
+                         const Shader::Backend::Bindings& start, u8* __restrict buf, bool aligned,
+                         u64* diff_out) noexcept {
+    const auto& m = kSpecSharpMasks;
+    size_t len = 0;
+    [[maybe_unused]] u64 diff = 0;
+    const auto put = [&](const void* p, size_t n) noexcept {
+        if constexpr (Fold) {
+            diff |= FoldWords(buf + len, static_cast<const u8*>(p), n);
+        } else {
+            std::memcpy(buf + len, p, n);
+        }
+        len += n;
+    };
+    if (aligned) {
+        // Every key word starts on an 8-byte boundary, so the fold's loads
+        // forward from the gather's stores.
+        const u64 w0 = u64{start.unified} | (u64{start.buffer} << 32);
+        put(&w0, sizeof(w0));
+    } else {
+        put(&start, sizeof(start));
+    }
+    put(&ri_fp_hash, sizeof(ri_fp_hash));
+    u64 valid = 0;
+    u32 n = 0;
+    for (const auto& d : info.buffers) {
+        u64 w0;
+        u64 w1;
+        if (d.sharp_fetch.direct) [[likely]] {
+            // In place and word by word: a 16-byte copy into a temporary is
+            // stored as one vector and reloaded as two scalars, and the upper
+            // reload cannot forward from that store. The type bits are the
+            // Valid() test GetSharp makes; its Null() carries no records, so
+            // an invalid sharp keys as zero words on both paths.
+            const u32* src = info.flat_ud + d.sharp_fetch.offsets[0];
+            std::memcpy(&w0, src, sizeof(w0));
+            std::memcpy(&w1, src + 2, sizeof(w1));
+            if ((w1 >> 62) != 0) [[unlikely]] {
+                w1 = 0;
+            }
+        } else if (d.sharp_fetch.load_mask == 0 && d.post_op == Shader::SharpFetchPostOp::None &&
+                   (d.sharp_fetch.immediates[0] | d.sharp_fetch.immediates[1] |
+                    d.sharp_fetch.immediates[2] | d.sharp_fetch.immediates[3]) == 0) {
+            // No dword is loaded and none is set, so num_records is 0 whether
+            // the sharp assembles as zero or as Null; keep is 0 and the words
+            // fold as zero.
+            ++sharp_gather_const_buffers;
+            w0 = 0;
+            w1 = 0;
+        } else {
+            ++sharp_gather_slow_buffers;
+            const auto w = std::bit_cast<std::array<u64, 2>>(d.GetSharp(info));
+            w0 = w[0];
+            w1 = w[1];
+        }
+        const u64 keep = (w1 & 0xFFFFFFFFu) != 0 ? ~u64{0} : 0;
+        valid |= (keep & 1) << n++;
+        const std::array<u64, 2> w{w0 & m.buffer[0] & keep, w1 & m.buffer[1] & keep};
+        put(&w, sizeof(w));
+    }
+    put(&valid, sizeof(valid));
+    valid = 0;
+    n = 0;
+    AmdGpu::Image image_scratch{};
+    for (const auto& d : info.images) {
+        if (!d.sharp_fetch.direct) [[unlikely]] {
+            ++sharp_gather_slow_reads;
+        }
+        const AmdGpu::Image& s = d.GetSharpRef(info, image_scratch);
+        const u64 keep = s.base_address != 0 ? ~u64{0} : 0;
+        valid |= (keep & 1) << n++;
+        const auto iw = std::bit_cast<std::array<u64, 4>>(s);
+        const std::array<u64, 2> w{iw[0] & m.image[0] & keep, iw[1] & m.image[1] & keep};
+        put(&w, sizeof(w));
+    }
+    put(&valid, sizeof(valid));
+    valid = 0;
+    n = 0;
+    for (const auto& d : info.fmasks) {
+        const AmdGpu::Image s = d.GetSharp(info);
+        const u64 keep = s.base_address != 0 ? ~u64{0} : 0;
+        valid |= (keep & 1) << n++;
+        const u64 w = std::bit_cast<std::array<u64, 4>>(s)[1] & m.fmask & keep;
+        put(&w, sizeof(w));
+    }
+    put(&valid, sizeof(valid));
+    valid = 0;
+    n = 0;
+    for (const auto& d : info.samplers) {
+        u64 raw0;
+        u64 raw1;
+        if (d.sharp_fetch.direct) [[likely]] {
+            const u32* src = info.flat_ud + d.sharp_fetch.offsets[0];
+            std::memcpy(&raw0, src, sizeof(raw0));
+            std::memcpy(&raw1, src + 2, sizeof(raw1));
+        } else {
+            const AmdGpu::Sampler s = d.GetSharp(info);
+            raw0 = s.raw0;
+            raw1 = s.raw1;
+        }
+        const u64 keep = (raw0 | raw1) != 0 ? ~u64{0} : 0;
+        valid |= (keep & 1) << n++;
+        const u64 w = raw0 & m.sampler & keep;
+        put(&w, sizeof(w));
+    }
+    put(&valid, sizeof(valid));
+    if (info.hw_stage == Shader::HwStage::Vertex && info.has_fetch_shader) {
+        if (program.fetch_mask == 0) {
+            if constexpr (Fold) {
+                *diff_out = diff;
+            }
+            return 0;
+        }
+        const auto& fetch =
+            program.modules[std::countr_zero(program.fetch_mask)].spec.fetch_shader_data;
+        u64 fetch_addr = 0;
+        std::memcpy(&fetch_addr, &info.user_data[info.fetch_shader_sgpr_base], sizeof(fetch_addr));
+        put(&fetch_addr, sizeof(fetch_addr));
+        valid = 0;
+        n = 0;
+        for (const auto& a : fetch.attributes) {
+            const AmdGpu::Buffer s = a.GetSharp(info);
+            const u64 keep = s.num_records != 0 ? ~u64{0} : 0;
+            valid |= (keep & 1) << n++;
+            const u64 w = std::bit_cast<std::array<u64, 2>>(s)[1] & m.attrib & keep;
+            put(&w, sizeof(w));
+        }
+        put(&valid, sizeof(valid));
+    }
+    if constexpr (Fold) {
+        *diff_out = diff;
+    }
+    return len;
+}
+
+SHAD_NO_INLINE size_t GatherSpecKey(const Shader::Info& info, const Program& program,
+                                    u64 ri_fp_hash, const Shader::Backend::Bindings& start, u8* buf,
+                                    bool aligned) noexcept {
+    return GatherSpecKeyImpl<false>(info, program, ri_fp_hash, start, buf, aligned, nullptr);
+}
+
+// The slot compare and its refill in one pass.
+SHAD_NO_INLINE u64 FoldKeyIntoSlot(u8* __restrict dst, const u8* __restrict src,
+                                   size_t len) noexcept {
+    return FoldWords(dst, src, len);
+}
+
+// One past the highest flat-buffer dword this sharp can read. A direct read takes N consecutive
+// dwords from offsets[0]; otherwise Fetch reads the offsets[i] dwords (a SingleLoad run is exactly
+// those) and bails on UNKNOWN.
+template <typename Sf>
+u32 SharpFetchTopDw(const Sf& sf) noexcept {
+    if (sf.direct) {
+        return u32{sf.offsets[0]} + static_cast<u32>(Sf::N);
+    }
+    u32 top = 0;
+    for (u32 i = 0; i < Sf::N; ++i) {
+        if (sf.offsets[i] == Shader::UNKNOWN_LOCATION) {
+            continue;
+        }
+        const u32 end = u32{sf.offsets[i]} + 1;
+        top = end > top ? end : top;
+    }
+    return top;
+}
+
+// One past the highest flat-buffer dword any descriptor section of the specialization key can
+// read for this program. The passes place every offset inside the flat window by construction
+// (flatten_extended_userdata_pass sets flattened_bufsize_dw from the last destination), but
+// nothing asserts it, and the gather-input memo turns a stray read into a wrong permutation
+// rather than a garbage key - so the memo only arms when this bound is inside the record.
+u32 ComputeSharpTopDw(const Shader::Info& info) noexcept {
+    u32 top = 0;
+    const auto raise = [&](u32 v) noexcept { top = v > top ? v : top; };
+    for (const auto& d : info.buffers) {
+        raise(SharpFetchTopDw(d.sharp_fetch));
+    }
+    for (const auto& d : info.images) {
+        raise(SharpFetchTopDw(d.sharp_fetch));
+    }
+    for (const auto& d : info.samplers) {
+        raise(SharpFetchTopDw(d.sharp_fetch));
+        // The aniso post-op reads one more dword of the paired T#.
+        if (d.post_op == Shader::SharpFetchPostOp::DisableAnisoIfSingleLod &&
+            d.post_op_tsharp_dw3_off != Shader::UNKNOWN_LOCATION) {
+            raise(u32{d.post_op_tsharp_dw3_off} + 1);
+        }
+    }
+    for (const auto& d : info.fmasks) {
+        // ReadUdSharp<Image>: a whole 8-dword T# in place.
+        raise(u32{d.sharp_idx} + static_cast<u32>(sizeof(AmdGpu::Image) / sizeof(u32)));
+    }
+    return top;
+}
+
+// Per-Program verdict, computed once: may the memo's record stand in for every flat-buffer byte
+// the key's descriptor sections read? Also caps the recorded window at kGatherMemoDw so the
+// probe's compare stays bounded while the logged dw= is still unknown.
+bool GatherMemoWindowOk(Program& program, const Shader::Info& info, u32 flat_dw) noexcept {
+    if (program.gim_window == 0) {
+        const u32 top = ComputeSharpTopDw(info);
+        program.gim_window = (top <= flat_dw && flat_dw <= kGatherMemoDw) ? 1 : 2;
+    }
+    return program.gim_window == 1;
+}
+
+// Address-independent specialization fingerprint over the per-draw spec inputs (runtime_info
+// hash, binding start, every bound sharp) with base_address zeroed, so a pointer re-emit hashes
+// identically. A superset of the spec identity: it can only over-discriminate, never wrongly
+// reuse. Callers exclude HS/DS (their spec folds tess constant-buffer contents read from guest
+// memory). ri_bytes_hash is the raw-byte hash of the stage's persistent RuntimeInfo member.
+SHAD_NO_INLINE u64 ComputeSpecProxyFp(const Shader::Info& info,
+                                      const Shader::Gcn::FetchShaderData& fetch_data,
+                                      u64 ri_bytes_hash,
+                                      const Shader::Backend::Bindings& start) noexcept {
+    u64 h = 0x84222325cbf29ce4ULL;
+    const auto mix = [&](u64 v) noexcept { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+    // Batched gather: one XXH3 over every sharp instead of one call per sharp.
+    // Worst case: 12 B bindings + 40*16 + 64*32 + 8*32 + 16*16 sharps + VS attribute sharps.
+    // 4096 covers it with headroom for 32 attrs.
+    alignas(16) u8 buf[4096];
+    size_t len = 0;
+    const auto put = [&](const void* p, size_t n) noexcept {
+        std::memcpy(buf + len, p, n);
+        len += n;
+    };
+    const size_t attrib_bytes = (info.hw_stage == Shader::HwStage::Vertex && !fetch_data.Empty())
+                                    ? fetch_data.attributes.size() * sizeof(AmdGpu::Buffer)
+                                    : 0;
+    const size_t needed = sizeof(start) + info.buffers.size() * sizeof(AmdGpu::Buffer) +
+                          info.images.size() * sizeof(AmdGpu::Image) +
+                          info.fmasks.size() * sizeof(AmdGpu::Image) +
+                          info.samplers.size() * sizeof(AmdGpu::Sampler) + attrib_bytes;
+    // Image/fmask validity IS base_address != 0, and the spec bitset branches
+    // on it, so zeroing the address must not erase it: fold a per-sharp
+    // validity bit or two T#s differing only in valid-vs-null alias to one fp
+    // and a hit returns the wrong permutation. Buffer validity is num_records,
+    // which stays in the hashed bytes.
+    u64 vmask = 0;
+    u32 vidx = 0;
+    const auto mix_valid = [&](bool valid) noexcept {
+        vmask |= static_cast<u64>(valid) << (vidx++ & 63);
+    };
+    if (needed <= sizeof(buf)) [[likely]] {
+        put(&start, sizeof(start));
+        for (const auto& d : info.buffers) {
+            AmdGpu::Buffer s = d.GetSharp(info);
+            s.base_address = 0;
+            put(&s, sizeof(s));
+        }
+        for (const auto& d : info.images) {
+            AmdGpu::Image s = d.GetSharp(info);
+            mix_valid(s.base_address != 0);
+            s.base_address = 0;
+            put(&s, sizeof(s));
+        }
+        for (const auto& d : info.fmasks) {
+            AmdGpu::Image s = d.GetSharp(info);
+            mix_valid(s.base_address != 0);
+            s.base_address = 0;
+            put(&s, sizeof(s));
+        }
+        for (const auto& d : info.samplers) {
+            AmdGpu::Sampler s = d.GetSharp(info);
+            put(&s, sizeof(s));
+        }
+        // vs_attribs are specialized only for the Vertex stage (see StageSpecialization);
+        // fold the vertex-buffer sharps that feed them.
+        if (attrib_bytes != 0) {
+            for (const auto& a : fetch_data.attributes) {
+                AmdGpu::Buffer s = a.GetSharp(info);
+                s.base_address = 0;
+                put(&s, sizeof(s));
+            }
+        }
+        mix(ri_bytes_hash);
+        mix(vmask);
+        mix(XXH3_64bits(buf, len));
+        return h ? h : 1ULL;
+    }
+    // Per-sharp overflow fallback (an absurd attribute count); counts are Program-static, so
+    // the chosen form stays consistent for this Program.
+    mix(ri_bytes_hash);
+    mix(XXH3_64bits(&start, sizeof(start)));
+    for (const auto& d : info.buffers) {
+        AmdGpu::Buffer s = d.GetSharp(info);
+        s.base_address = 0;
+        mix(XXH3_64bits(&s, sizeof(s)));
+    }
+    for (const auto& d : info.images) {
+        AmdGpu::Image s = d.GetSharp(info);
+        mix_valid(s.base_address != 0);
+        s.base_address = 0;
+        mix(XXH3_64bits(&s, sizeof(s)));
+    }
+    for (const auto& d : info.fmasks) {
+        AmdGpu::Image s = d.GetSharp(info);
+        mix_valid(s.base_address != 0);
+        s.base_address = 0;
+        mix(XXH3_64bits(&s, sizeof(s)));
+    }
+    for (const auto& d : info.samplers) {
+        AmdGpu::Sampler s = d.GetSharp(info);
+        mix(XXH3_64bits(&s, sizeof(s)));
+    }
+    if (info.hw_stage == Shader::HwStage::Vertex && !fetch_data.Empty()) {
+        for (const auto& a : fetch_data.attributes) {
+            AmdGpu::Buffer s = a.GetSharp(info);
+            s.base_address = 0;
+            mix(XXH3_64bits(&s, sizeof(s)));
+        }
+    }
+    mix(vmask);
+    return h ? h : 1ULL;
+}
+
+} // namespace
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
@@ -89,7 +589,7 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.SelectRegs();
     const auto BuildCommon = [&](const auto& program) {
         info.props.fp_denorm_mode32 = program.settings.fp_denorm_mode32;
         info.props.fp_denorm_mode16_64 = program.settings.fp_denorm_mode64;
@@ -221,7 +721,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         break;
     }
     case HwStage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
+        const auto& cs_pgm = rasterizer.SelectCsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
         info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
@@ -269,10 +769,186 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     return info;
 }
 
+// The words each memoized arm of BuildRuntimeInfo reads: the program settings
+// first so a program switch fails at word 0, the color buffers and the
+// interpolant table last. Every other arm reads guest memory or code.
+template <bool Fuse>
+SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __restrict out,
+                                                        const u32* __restrict cmp,
+                                                        u64* diff) const {
+    const auto& regs = rasterizer.SelectRegs();
+    u32 n = 0;
+    // Two accumulators: a single OR chain over up to 61 words is a latency
+    // chain the core cannot overlap. Words are read from the source through
+    // memcpy, never through an aliasing pointer, so padding reaches the entry
+    // exactly as the block copy wrote it.
+    [[maybe_unused]] u64 d0 = 0;
+    [[maybe_unused]] u64 d1 = 0;
+    const auto fold = [&]([[maybe_unused]] const void* src, [[maybe_unused]] u32 words) {
+        if constexpr (Fuse) {
+            const u8* p = static_cast<const u8*>(src);
+            const u32* c = cmp + n;
+            u32 i = 0;
+            for (; i + 2 <= words; i += 2) {
+                u64 x, y;
+                std::memcpy(&x, p + i * sizeof(u32), sizeof(x));
+                std::memcpy(&y, c + i, sizeof(y));
+                if (i & 2) {
+                    d1 |= x ^ y;
+                } else {
+                    d0 |= x ^ y;
+                }
+            }
+            if (i < words) {
+                u32 x, y;
+                std::memcpy(&x, p + i * sizeof(u32), sizeof(x));
+                std::memcpy(&y, c + i, sizeof(y));
+                d0 |= u64{x ^ y};
+            }
+        }
+    };
+    const auto put_words = [&](const void* src, u32 words) {
+        std::memcpy(out + n, src, words * sizeof(u32));
+        fold(src, words);
+        n += words;
+    };
+    const auto put = [&](const auto& v) {
+        static_assert(sizeof(v) % sizeof(u32) == 0);
+        put_words(&v, static_cast<u32>(sizeof(v) / sizeof(u32)));
+    };
+    switch (stage) {
+    case HwStage::Vertex:
+        put(regs.vs_program.settings);
+        put(regs.clipper_control);
+        put(regs.vgt_instance_step_rate_0);
+        put(regs.vgt_instance_step_rate_1);
+        put(regs.vs_output_control);
+        put(regs.primitive_type);
+        put(regs.tess_config);
+        put(indirect_key_);
+        break;
+    case HwStage::Fragment: {
+        put(regs.ps_program.settings);
+        put(regs.ps_input_ena);
+        put(regs.ps_input_addr);
+        put(regs.barycentric_control);
+        put(regs.aa_config);
+        const u32 num_interp = regs.num_interp;
+        put(num_interp);
+        put(regs.z_export_format);
+        put(regs.depth_shader_control);
+        put(regs.blend_control[0]);
+        put(regs.clipper_control);
+        put(regs.stage_enable);
+        put(regs.vs_output_control);
+        put(graphics_key.color_buffers);
+        const u32 count = std::min<u32>(num_interp, static_cast<u32>(regs.ps_inputs.size()));
+        put_words(regs.ps_inputs.data(), count);
+        break;
+    }
+    case HwStage::Compute: {
+        const auto& cs = rasterizer.SelectCsRegs();
+        put(cs.settings);
+        put(cs.num_thread_x);
+        put(cs.num_thread_y);
+        put(cs.num_thread_z);
+        break;
+    }
+    default:
+        break;
+    }
+    ASSERT(n <= kRuntimeInputWords);
+    if constexpr (Fuse) {
+        *diff = d0 | d1;
+    }
+    return n;
+}
+
+bool PipelineCache::MemoRuntimeInfo(HwStage stage, SwStage l_stage, RuntimeInfoStamp& slot) {
+    std::array<u32, kRuntimeInputWords> words;
+    const u32 l = static_cast<u32>(l_stage);
+    auto& entries = ri_memo[l];
+    RuntimeInputMemo*& last = ri_memo_last[l];
+    // The fused form compares against the candidate while it snapshots. Two
+    // entries never hold the same words (a miss writes the non-last entry and
+    // a miss means neither matched), so probing the candidate first cannot
+    // change which entry is selected; the scan below only skips it.
+    RuntimeInputMemo* const cand = last ? last : &entries[0];
+    u64 diff = 0;
+    const u32 n = ri_memo_fused_cmp
+                      ? SnapshotRuntimeInputs<true>(stage, words.data(), cand->words.data(), &diff)
+                      : SnapshotRuntimeInputs<false>(stage, words.data(), nullptr, nullptr);
+    if (n == 0) {
+        return false;
+    }
+    const bool fused_hit = ri_memo_fused_cmp && cand->used && cand->n_words == n && diff == 0;
+    if (ri_memo_fused_cmp) {
+        rimemo_fused += fused_hit;
+        rimemo_scan += !fused_hit;
+    }
+    RuntimeInputMemo* hit = fused_hit ? cand : nullptr;
+    if (!hit) {
+        for (auto& e : entries) {
+            if ((ri_memo_fused_cmp && &e == cand) || !e.used || e.n_words != n ||
+                std::memcmp(e.words.data(), words.data(), n * sizeof(u32)) != 0) {
+                continue;
+            }
+            hit = &e;
+            break;
+        }
+    }
+    if (hit) {
+        auto& e = *hit;
+        if (&e != last) {
+            // The full struct, inactive union tail included: the rebuild's
+            // memset zeroes it, so the copy reproduces the rebuilt bytes.
+            std::memcpy(&runtime_infos[l], &e.ri, sizeof(Shader::RuntimeInfo));
+            last = &e;
+            ++rimemo_restores;
+        }
+        slot.ri_fp_hash = e.ri_fp_hash;
+        slot.hash_valid = e.hash_valid;
+        ++rimemo_hits;
+        if (ri_memo_validate) {
+            ValidateRuntimeInfoMemo(stage, l_stage, e, slot);
+        }
+        return true;
+    }
+    BuildRuntimeInfo(stage, l_stage);
+    RuntimeInputMemo& e = &entries[0] == last ? entries[1] : entries[0];
+    e.n_words = static_cast<u8>(n);
+    std::memcpy(e.words.data(), words.data(), n * sizeof(u32));
+    std::memcpy(&e.ri, &runtime_infos[l], sizeof(Shader::RuntimeInfo));
+    e.used = true;
+    e.hash_valid = false;
+    last = &e;
+    slot.hash_valid = false;
+    ++rimemo_misses;
+    return true;
+}
+
+SHAD_NO_INLINE void PipelineCache::ValidateRuntimeInfoMemo(HwStage stage, SwStage l_stage,
+                                                           RuntimeInputMemo& e,
+                                                           RuntimeInfoStamp& slot) {
+    const u32 l = static_cast<u32>(l_stage);
+    Shader::RuntimeInfo memoized{};
+    std::memcpy(&memoized, &runtime_infos[l], sizeof(memoized));
+    BuildRuntimeInfo(stage, l_stage);
+    if (RuntimeInfoProxyHash(memoized) != RuntimeInfoProxyHash(runtime_infos[l])) {
+        ++rimemo_vmiss;
+        LOG_ERROR(Render_Vulkan, "memoized runtime info for stage {} differs from a rebuild",
+                  static_cast<u32>(stage));
+        std::memcpy(&e.ri, &runtime_infos[l], sizeof(Shader::RuntimeInfo));
+        e.hash_valid = false;
+        slot.hash_valid = false;
+    }
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
-                             AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
+                             const Rasterizer& rasterizer_, AmdGpu::Liverpool* liverpool_,
+                             u32 sparse_page_shift)
+    : instance{instance_}, scheduler{scheduler_}, rasterizer{rasterizer_}, liverpool{liverpool_},
+      desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes}, layouts{instance} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -328,6 +1004,99 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
+    spec_mru_perm_probe = EmulatorSettings.IsSpecMruPermProbe();
+    // The stamp arms once at Liverpool construction; a runtime-enabled
+    // skipcache mode would leave it frozen, so the gate latches the BOOT
+    // stamp state, never Framework::Active().
+    ri_stamp_gate = EmulatorSettings.IsRuntimeInfoStampGate() && liverpool->IsGfxStampActive();
+    ri_input_memo = EmulatorSettings.IsRuntimeInfoInputMemo();
+    ri_memo_fused_cmp = ri_input_memo && EmulatorSettings.IsRiMemoFusedCmp();
+    const bool validate_only =
+        Skipcache::Framework::Instance().ActiveMode() == Skipcache::Mode::ValidateOnly;
+    ri_memo_validate = ri_input_memo && validate_only;
+    // The reuse copies the previous key back before the stage resolve, so the
+    // vertex-format arm (which appends per attribute) must be dynamic, and the
+    // Fragment runtime-info slot must be stamp-gated (see ReuseGraphicsKey).
+    if (EmulatorSettings.IsPipelineKeyStampReuse()) {
+        key_stamp_reuse = ri_stamp_gate && instance.IsVertexInputDynamicState();
+        key_reuse_validate = validate_only;
+        if (!key_stamp_reuse) {
+            LOG_WARNING(Render_Vulkan, "pipeline key stamp reuse needs runtime_info_stamp_gate "
+                                       "and dynamic vertex input; the lookup runs unchanged");
+        }
+    }
+    const auto latch = [](bool want, bool ok, bool& out) {
+        out = want && ok;
+        return want && !ok;
+    };
+    if (latch(EmulatorSettings.IsKeyReuseHashDiff(), key_stamp_reuse, key_reuse_hash_diff)) {
+        LOG_WARNING(Render_Vulkan, "the stage hash accumulator needs pipeline_key_stamp_reuse; "
+                                   "the compare runs unchanged");
+    }
+    // Latched before WarmUp so deserialized permutations get signatures computed.
+    spec_fp_cache = EmulatorSettings.IsSpecFpCache();
+    shader_params_memo = EmulatorSettings.IsShaderParamsMemo();
+    if (const u32 want = EmulatorSettings.GetShaderParamsMemoEntries(); want != 0) {
+        if (!shader_params_memo) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "the binary info table needs shader_params_memo; the search runs unchanged");
+        } else {
+            const u32 n = std::bit_ceil(std::min(want, 4096u));
+            identity_table.resize(n);
+            identity_table_mask = n - 1;
+        }
+    }
+    if (const u32 canonical = EmulatorSettings.GetSpecFpCanonical(); canonical != 0) {
+        if (canonical > 2) {
+            LOG_WARNING(Render_Vulkan,
+                        "spec_fp_canonical {} is out of range; the tier runs unchanged", canonical);
+        } else if (!spec_fp_cache) {
+            LOG_WARNING(Render_Vulkan, "canonical specialization fingerprint needs spec_fp_cache; "
+                                       "the tier runs unchanged");
+        } else {
+            spec_fp_canonical = static_cast<u8>(canonical);
+            spec_fp_validate = validate_only;
+        }
+    }
+    if (latch(EmulatorSettings.IsSpecFpSlotInplace(), spec_fp_canonical == 2,
+              spec_fp_slot_inplace)) {
+        LOG_WARNING(Render_Vulkan, "in-place specialization slot needs spec_fp_canonical 2; "
+                                   "the slot compare runs unchanged");
+    }
+    if (latch(EmulatorSettings.IsSpecFpFront(), spec_fp_canonical != 0, spec_fp_front)) {
+        LOG_WARNING(Render_Vulkan, "specialization fingerprint front needs spec_fp_canonical; "
+                                   "the tier runs unchanged");
+    }
+    if (const u32 fast = EmulatorSettings.GetSpecKeyFast(); fast != 0) {
+        if (spec_fp_canonical == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "spec_key_fast needs spec_fp_canonical; the key runs unchanged");
+        } else {
+            spec_key_align = true;
+            slot_prefetch = fast >= 2 && spec_fp_canonical == 2;
+        }
+    }
+    if (latch(EmulatorSettings.IsSpecKeyFused(),
+              spec_fp_canonical == 2 && spec_fp_slot_inplace && spec_key_align, spec_key_fused)) {
+        LOG_WARNING(Render_Vulkan, "the fused specialization key needs spec_fp_canonical 2, "
+                                   "spec_fp_slot_inplace and spec_key_fast; the key is built "
+                                   "in two passes");
+    }
+    if (EmulatorSettings.IsGatherInputMemo()) {
+        if (!spec_key_fused) {
+            LOG_WARNING(Render_Vulkan, "gather_input_memo needs the fused specialization key; the "
+                                       "gather runs on every call");
+        } else if (spec_fp_validate) {
+            // A memoized hit has no gathered key for ValidateSpecHit to check, so the verify arm
+            // would stop covering exactly the hits the memo introduces.
+            LOG_WARNING(Render_Vulkan, "gather_input_memo is disabled while spec_fp_validate is "
+                                       "on; the verify arm rebuilds every hit");
+        } else {
+            gather_input_memo = true;
+        }
+    }
+    share_layouts = EmulatorSettings.IsDescLayoutShare();
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
@@ -339,9 +1108,35 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    ++graphics_lookups;
+    // The indirect draw's SGPR offsets reach the vertex runtime info without
+    // passing through a register, so the register stamp does not cover them.
+    // Both offsets are u16 at the only producer (Rasterizer::DrawIndirect), so
+    // the packed word is injective - the same bound indirect_key_ already has.
+    const u32 key = static_cast<u32>(params.vertex_sgpr_offset) |
+                    (static_cast<u32>(params.instance_sgpr_offset) << 16);
+    const bool params_changed = key != indirect_key_;
     draw_indirect_params = params;
+    indirect_key_ = key;
+    // pipe_gen invalidates the cached pair when ReplaceShader erases entries.
+    const u64 pipe_gen =
+        Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
+    lookup_pipe_gen_ = pipe_gen;
+    if (key_stamp_reuse && !params_changed && ReuseGraphicsKey(pipe_gen)) {
+        return last_graphics_pipeline;
+    }
     if (!RefreshGraphicsKey()) {
         return nullptr;
+    }
+    // Registers the key does not read (viewport, scissor) restamp every draw,
+    // so the restamp here keys the reuse on the stamp this key was last built
+    // at, not on the one that first stored it.
+    if (last_graphics_pipeline && pipe_gen == last_graphics_pipe_gen &&
+        graphics_key == last_graphics_key) {
+        last_key_stamp = rasterizer.SelectGfxStateStamp();
+        key_is_last = true;
+        ++key_refresh_same;
+        return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
@@ -349,9 +1144,39 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
         GraphicsPipeline::SerializationSupport sdata{};
+        if (pre_compile_hook_) {
+            pre_compile_hook_(pre_compile_user_);
+        }
+        const Shader::Gcn::FetchShaderData* fetch_shader =
+            fetch_shader_ref ? &fetch_shader_ref.Get() : nullptr;
+        Shader::Gcn::FetchShaderData live_fetch{};
+        if (!fetch_shader) {
+            // A vertex stage that reads its attributes through a fetch shader must never get a
+            // pipeline with no vertex input: the draw faults the GPU. Decode the live fetch
+            // shader when the permutation resolve handed over none.
+            const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+            if (vs_info && vs_info->has_fetch_shader) {
+                if (Shader::Gcn::ParseFetchShader(*vs_info, live_fetch)) {
+                    fetch_shader = &live_fetch;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Vertex shader {:#x} resolved without fetch shader data; decoded "
+                            "live ({} attributes)",
+                            vs_info->pgm_hash, fetch_shader ? fetch_shader->attributes.size() : 0);
+            }
+        }
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+            instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
+            graphics_key, *pipeline_cache, infos, runtime_infos, fetch_shader, modules, sdata,
+            false);
+        constexpr auto full_mask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                                   vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+        for (u32 cb = 0; cb < graphics_key.num_color_attachments; ++cb) {
+            if (graphics_key.write_masks[cb] != full_mask) {
+                ++nonfull_mask_pipelines;
+                break;
+            }
+        }
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -365,10 +1190,237 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             }
         }
     }
-    return it->second.get();
+    // memcpy keeps the padding bytes deterministic for the memcmp-based compare.
+    std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
+    last_graphics_pipeline = it->second.get();
+    last_graphics_pipe_gen = pipe_gen;
+    last_key_stamp = rasterizer.SelectGfxStateStamp();
+    key_is_last = true;
+    return last_graphics_pipeline;
+}
+
+// The stamp covers every register the key reads (context, SH and uconfig), so
+// while it repeats the previous key's register-derived fields still hold; only
+// the stage resolve can still change the key, which falls back to the full
+// refresh. The Fragment runtime-info slot must be stamp-current: its rebuild
+// reads the key's color buffers, which the full refresh has already masked.
+bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
+    const u64 stamp = rasterizer.SelectGfxStateStamp();
+    const auto& fs_slot = ri_stamp[static_cast<u32>(SwStage::Fragment)];
+    if (!last_graphics_pipeline || pipe_gen != last_graphics_pipe_gen || stamp != last_key_stamp ||
+        !fs_slot.valid || fs_slot.stamp != stamp) {
+        ++key_reuse_stamp_misses;
+        return false;
+    }
+    if (!key_is_last) {
+        std::memcpy(&graphics_key, &last_graphics_key, sizeof(graphics_key));
+        key_is_last = true;
+    }
+    // The stage resolve writes only the stage hashes, the MRT mask and the
+    // attachment count (the vertex formats are dynamic here), so those three
+    // are the whole compare.
+    const bool resolved = RefreshGraphicsStages(key_reuse_hash_diff);
+    if (!resolved) {
+        key_is_last = false;
+        ++key_reuse_rebuilds;
+        return false;
+    }
+    const bool stages_changed = key_reuse_hash_diff
+                                    ? stage_hash_diff != 0
+                                    : graphics_key.stage_hashes != last_graphics_key.stage_hashes;
+    key_reuse_diff_decisions += key_reuse_hash_diff;
+    if (stages_changed || graphics_key.mrt_mask != last_graphics_key.mrt_mask ||
+        graphics_key.num_color_attachments != last_graphics_key.num_color_attachments) {
+        key_is_last = false;
+        ++key_reuse_rebuilds;
+        return false;
+    }
+    ++key_reuse_hits;
+    if (!key_reuse_validate) {
+        return true;
+    }
+    if (RefreshGraphicsKey() && graphics_key == last_graphics_key) {
+        key_is_last = true;
+        return true;
+    }
+    ++key_reuse_mismatches;
+    LOG_ERROR(Render_Vulkan, "stamp-reused graphics key differs from a full refresh at stamp {}",
+              stamp);
+    return false;
+}
+
+// A stored spec whose info points elsewhere came from the serialized cache;
+// its compare is not meaningful, so only live-info permutations are checked.
+void PipelineCache::ValidateSpecHit(const Program& program, u32 hit_idx, const Shader::Info& info,
+                                    const Shader::RuntimeInfo& runtime_info,
+                                    Shader::Backend::Bindings start) {
+    const auto& stored = program.modules[hit_idx].spec;
+    if (stored.info != &program.info) {
+        return;
+    }
+    spec_scratch.Rebuild(info, runtime_info, profile, start);
+    if (!(stored == spec_scratch)) {
+        ++specfp_validate_misses;
+        LOG_ERROR(Render_Vulkan,
+                  "canonical fingerprint hit on permutation {} of {:#x} differs from the rebuilt "
+                  "specialization",
+                  hit_idx, info.pgm_hash);
+    }
+}
+
+// Default-off tripwire: re-derives the fused fold's diff word from the pre-gather copy and
+// the refilled slot, so a wrong accumulator shows up as a counter rather than a bad hit.
+SHAD_NO_INLINE void PipelineCache::NoteFusedDiff(const u8* before, const u8* after, size_t key_len,
+                                                 u64 diff) {
+    u64 ref = 0;
+    size_t i = 0;
+    for (; i + 8 <= key_len; i += 8) {
+        u64 a, b;
+        std::memcpy(&a, before + i, 8);
+        std::memcpy(&b, after + i, 8);
+        ref |= a ^ b;
+    }
+    if (i < key_len) {
+        u32 a, b;
+        std::memcpy(&a, before + i, 4);
+        std::memcpy(&b, after + i, 4);
+        ref |= a ^ b;
+    }
+    if (ref != diff) {
+        ++specfp_fused_miss;
+    }
+}
+
+void PipelineCache::DumpColorMaskStats(u64 emit_skips) {
+    if (graphics_pipelines.empty()) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] CWMASK static={} pipes={} nonfull={} emitskip={} draws={} per300f",
+             instance.IsDynamicColorWriteMaskEnabled() ? 0 : 1, graphics_pipelines.size(),
+             nonfull_mask_pipelines, emit_skips, graphics_lookups);
+    graphics_lookups = 0;
+}
+
+void PipelineCache::DumpRuntimeInfoMemoStats() {
+    if (!ri_input_memo) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] RIMEMO hits={} misses={} restores={} vmiss={} fused={} scan={} per300f",
+             rimemo_hits, rimemo_misses, rimemo_restores, rimemo_vmiss, rimemo_fused, rimemo_scan);
+    rimemo_hits = rimemo_misses = rimemo_restores = rimemo_vmiss = rimemo_fused = rimemo_scan = 0;
+}
+
+void PipelineCache::DumpLayoutStats() {
+    if (!share_layouts) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache, "[SkipCache] LAYOUTS shapes={} pipelines={}", layouts.NumLayouts(),
+             graphics_pipelines.size() + compute_pipelines.size());
+}
+
+void PipelineCache::DumpHeapPipelineStats() {
+    u64 heap = 0;
+    u64 arrays = 0;
+    for (const auto& [key, pipeline] : graphics_pipelines) {
+        heap += !pipeline->UsesPushDescriptors();
+        arrays += pipeline->HasDescriptorArrays();
+    }
+    for (const auto& [key, pipeline] : compute_pipelines) {
+        heap += !pipeline->UsesPushDescriptors();
+        arrays += pipeline->HasDescriptorArrays();
+    }
+    LOG_INFO(Render_Skipcache, "[SkipCache] HEAPPIPES heap={} arrays={} of {}", heap, arrays,
+             graphics_pipelines.size() + compute_pipelines.size());
+}
+
+void PipelineCache::DumpDescHeapStats() {
+    const auto hs = desc_heap.DrainStats();
+    if (hs.commits == 0) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] DESCHEAP commits={} reused={} fresh={} live={} pools={} per300f",
+             hs.commits, hs.reused, hs.fresh, hs.live, hs.pools);
+}
+
+void PipelineCache::DumpSpecFpStats() {
+    if (spec_fp_canonical == 0) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] SPECFP slot={} mru={} mru2={} table={} rebuild={} vmiss={} inplace_kb={} "
+             "rihash={} front={} pf={} fused={} fusedmiss={} per300f",
+             specfp_slot_hits, specfp_mru_hits, specfp_mru2_hits, specfp_table_hits,
+             specfp_rebuilds, specfp_validate_misses, specfp_inplace_bytes >> 10, specfp_ri_rehash,
+             specfp_front_hits, specfp_slot_pf, specfp_fused, specfp_fused_miss);
+    specfp_slot_hits = specfp_mru_hits = specfp_mru2_hits = specfp_table_hits = specfp_rebuilds =
+        specfp_validate_misses = specfp_inplace_bytes = specfp_ri_rehash = specfp_front_hits =
+            specfp_slot_pf = specfp_fused = specfp_fused_miss = 0;
+    if (gather_input_memo) {
+        LOG_INFO(Render_Skipcache,
+                 "[SkipCache] GIMEMO probes={} hits={} wprobes={} whits={} recs={} big={} dw={} "
+                 "per300f",
+                 gim_probes, gim_hits, gim_wprobes, gim_whits, gim_recs, gim_big, gim_dw);
+        gim_probes = gim_hits = gim_wprobes = gim_whits = gim_recs = gim_big = gim_dw = 0;
+    }
+}
+
+void PipelineCache::NoteSharpVerdicts(const Shader::Info& info) {
+    for (const auto& d : info.buffers) {
+        ++(d.sharp_fetch.direct ? sharp_direct_buf : sharp_slow_buf);
+    }
+    for (const auto& d : info.images) {
+        ++(d.sharp_fetch.direct ? sharp_direct_img : sharp_slow_img);
+    }
+    for (const auto& d : info.samplers) {
+        ++(d.sharp_fetch.direct ? sharp_direct_smp : sharp_slow_smp);
+    }
+}
+
+void PipelineCache::DumpSharpReadStats() {
+    // img/buf/smp are direct/slow descriptor counts cumulative over program creation;
+    // gslow/bslow are this window's gather image and buffer reads that assembled
+    // through Fetch; bconst the buffer reads keyed as zero without assembling.
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] SHARPREAD img={}/{} buf={}/{} smp={}/{} gslow={} bslow={} bconst={} "
+             "per300f",
+             sharp_direct_img, sharp_slow_img, sharp_direct_buf, sharp_slow_buf, sharp_direct_smp,
+             sharp_slow_smp, sharp_gather_slow_reads, sharp_gather_slow_buffers,
+             sharp_gather_const_buffers);
+    sharp_gather_slow_reads = sharp_gather_slow_buffers = sharp_gather_const_buffers = 0;
+}
+
+void PipelineCache::DumpProgramIdentityStats() {
+    if (pgmid_map_hits == 0 && pgmid_map_probes == 0) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] PGMID map_hits={} map_probes={} params_hits={} params_misses={} "
+             "table_hits={} table_misses={} pf={} per300f",
+             pgmid_map_hits, pgmid_map_probes, params_hits, params_misses, params_table_hits,
+             params_table_misses, params_prefetches);
+    pgmid_map_hits = pgmid_map_probes = params_hits = params_misses = 0;
+    params_table_hits = params_table_misses = params_prefetches = 0;
+}
+
+void PipelineCache::DumpKeyReuseStats() {
+    if (!key_stamp_reuse) {
+        return;
+    }
+    LOG_INFO(Render_Skipcache,
+             "[SkipCache] KEYREUSE hits={} rebuilds={} misses={} mismatches={} hdiff={} "
+             "samekey={} per300f",
+             key_reuse_hits, key_reuse_rebuilds, key_reuse_stamp_misses, key_reuse_mismatches,
+             key_reuse_diff_decisions, key_refresh_same);
+    key_reuse_hits = key_reuse_rebuilds = key_reuse_stamp_misses = key_reuse_mismatches = 0;
+    key_reuse_diff_decisions = key_refresh_same = 0;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    lookup_pipe_gen_ =
+        Skipcache::Framework::Instance().Gens().pipe_gen.load(std::memory_order_acquire);
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -378,9 +1430,12 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         ComputePipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, false);
+        if (pre_compile_hook_) {
+            pre_compile_hook_(pre_compile_user_);
+        }
+        it.value() = std::make_unique<ComputePipeline>(
+            instance, scheduler, desc_heap, share_layouts ? &layouts : nullptr, profile,
+            *pipeline_cache, compute_key, *infos[0], modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
@@ -394,7 +1449,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
-    const auto& regs = liverpool->regs;
+    key_is_last = false;
+    const auto& regs = rasterizer.SelectRegs();
     auto& key = graphics_key;
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
@@ -446,13 +1502,15 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
-    if (!RefreshGraphicsStages()) {
+    if (!RefreshGraphicsStages(false)) {
         return false;
     }
 
     // Second pass to mask out render targets not written by shader and fill remaining info
     u8 color_samples = 0;
     bool all_color_samples_same = true;
+    // Local accumulator; nothing in the loop reads key.num_samples.
+    u8 num_samples = key.num_samples;
     for (s32 cb = 0; cb < key.num_color_attachments && !skip_cb_binding; ++cb) {
         const auto& col_buf = regs.color_buffers[cb];
         const u32 target_mask = regs.color_target_mask.GetMask(cb);
@@ -469,16 +1527,17 @@ bool PipelineCache::RefreshGraphicsKey() {
             key.blend_controls[cb] = regs.blend_control[cb];
         }
 
-        // Apply swizzle to target mask
-        key.write_masks[cb] =
-            vk::ColorComponentFlags{key.color_buffers[cb].swizzle.ApplyMask(target_mask)};
+        // Apply swizzle to target mask. Reading the register rather than pass one's key line is
+        // safe: regs cannot change across RefreshGraphicsStages().
+        key.write_masks[cb] = vk::ColorComponentFlags{col_buf.Swizzle().ApplyMask(target_mask)};
 
         // Fill color samples
         const u8 prev_color_samples = std::exchange(color_samples, col_buf.NumSamples());
         all_color_samples_same &= color_samples == prev_color_samples || prev_color_samples == 0;
         key.color_samples[cb] = color_samples;
-        key.num_samples = std::max(key.num_samples, color_samples);
+        num_samples = std::max(num_samples, color_samples);
     }
+    key.num_samples = num_samples;
 
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration
     if (color_samples != 0) {
@@ -493,41 +1552,115 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
-bool PipelineCache::RefreshGraphicsStages() {
-    const auto& regs = liverpool->regs;
-    auto& key = graphics_key;
-    fetch_shader = nullptr;
+// Every record here is followed by GetProgram inserting that hash, so a memo
+// hit never feeds a compile path's params.code. A null compute address takes
+// the search.
+template <typename Pgm>
+Shader::ShaderParams PipelineCache::ResolveParams(SwStage l_stage, const Pgm& pgm) {
+    if (!shader_params_memo) {
+        return AmdGpu::GetParams(pgm);
+    }
+    auto& id = stage_identity[static_cast<u32>(l_stage)];
+    const u32* const code = pgm.template Address<u32*>();
+    if (code && id.code != code && !identity_table.empty()) {
+        // Evict the front (it holds the last resolve's program) into the table before replacing it.
+        // A table hit is accepted only on the search's own anchors, the 0xBEEB03FF token and the
+        // trailer position; the hash re-read below validates it. A written-back entry has hash ==
+        // program_hash, so a failed re-read carries a program GetProgram's hash test rejects.
+        if (id.code) {
+            identity_table[IdentitySlot(id.code)].id = id;
+        }
+        const auto& e = identity_table[IdentitySlot(code)].id;
+        if (e.code == code && code[0] == 0xBEEB03FF &&
+            e.hash_ptr ==
+                &std::bit_cast<const AmdGpu::BinaryInfo*>(code + (code[1] + 1) * 2)->shader_hash) {
+            id = e;
+            ++params_table_hits;
+        } else {
+            ++params_table_misses;
+        }
+    }
+    if (code && id.code == code) {
+        // memcpy: on the linear-scan branch the BinaryInfo is only 4-byte aligned.
+        u64 hash;
+        std::memcpy(&hash, id.hash_ptr, sizeof(hash));
+        if (hash == id.hash) {
+            ++params_hits;
+            return {.user_data = pgm.user_data, .code = std::span{code, id.len_dw}, .hash = hash};
+        }
+    }
+    ++params_misses;
+    const auto& bininfo = AmdGpu::SearchBinaryInfo(code);
+    id.code = code;
+    id.hash_ptr = &bininfo.shader_hash;
+    id.hash = bininfo.shader_hash;
+    id.len_dw = bininfo.length / sizeof(u32);
+    return {.user_data = pgm.user_data, .code = std::span{code, id.len_dw}, .hash = id.hash};
+}
 
+bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
+    const auto& regs = rasterizer.SelectRegs();
+    auto& key = graphics_key;
+    fetch_shader_ref = {};
+    stage_hash_diff = 0;
+
+    // An armed resolve accumulates old ^ new per stage hash it writes, so the
+    // reuse decision never reloads the array right after these stores.
+    const auto store_hash = [&](u32 idx, u64 hash) {
+        if (track_hash_diff) {
+            stage_hash_diff |= key.stage_hashes[idx] ^ hash;
+        }
+        key.stage_hashes[idx] = hash;
+    };
     Shader::Backend::Bindings binding{};
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
         if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
-            key.stage_hashes[stage_out_idx] = 0;
+            store_hash(stage_out_idx, 0);
             infos[stage_out_idx] = nullptr;
             return false;
         }
 
         const auto* pgm = regs.ProgramForStage(stage_in_idx);
         if (!pgm || !pgm->Address<u32*>()) {
-            key.stage_hashes[stage_out_idx] = 0;
+            store_hash(stage_out_idx, 0);
             infos[stage_out_idx] = nullptr;
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
-        std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
+        const auto params = ResolveParams(stage_out, *pgm);
+        store_hash(stage_out_idx, GetProgram(stage_in, stage_out, params, binding, stage_out_idx));
         return true;
     };
 
     infos.fill(nullptr);
     modules.fill(nullptr);
 
+    if (!identity_table.empty() &&
+        regs.stage_enable.raw == static_cast<u32>(AmdGpu::ShaderStageEnable::VgtStages::Vs)) {
+        // The Vertex lines are demanded after the Fragment resolve: the code
+        // start by the token check or the search, the remembered hash line by
+        // the re-read when the front or the table names this program.
+        if (const u32* code = regs.vs_program.Address<u32*>()) {
+            const auto& vid = stage_identity[static_cast<u32>(SwStage::Vertex)];
+            const auto& e = identity_table[IdentitySlot(code)].id;
+            const StageIdentity* known = vid.code == code ? &vid : e.code == code ? &e : nullptr;
+            __builtin_prefetch(code, 0, 3);
+            if (known) {
+                __builtin_prefetch(known->hash_ptr, 0, 3);
+            }
+            ++params_prefetches;
+        }
+    }
+
     bind_stage(HwStage::Fragment, SwStage::Fragment);
 
     const auto* fs_info = infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
+    // Shader::Info::mrt_mask is u8, which is the only thing bounding this to
+    // NUM_COLOR_BUFFERS; the second color loop indexes both regs.color_buffers and
+    // key.color_buffers with it.
     key.num_color_attachments = std::bit_width(key.mrt_mask);
 
     switch (regs.stage_enable.raw) {
@@ -594,12 +1727,12 @@ bool PipelineCache::RefreshGraphicsStages() {
         return false;
     }
 
-    const auto* vs_info = infos[static_cast<u32>(SwStage::Vertex)];
-    if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {
+    const auto* vs_info = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+    if (!instance.IsVertexInputDynamicState() && vs_info && fetch_shader_ref) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
         // Stride will still be handled outside the pipeline using dynamic state.
         u32 vertex_binding = 0;
-        for (const auto& attrib : fetch_shader->attributes) {
+        for (const auto& attrib : fetch_shader_ref.Get().attributes) {
             const auto& buffer = attrib.GetSharp(*vs_info);
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
@@ -614,10 +1747,12 @@ bool PipelineCache::RefreshGraphicsStages() {
 
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
-    const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], compute_key.value) =
-        GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
+    const auto& cs_pgm = rasterizer.SelectCsRegs();
+    const auto cs_params = ResolveParams(SwStage::Compute, cs_pgm);
+    // The compute program publishes into slot 0, which the compute lookup
+    // dereferences; compute stages carry no fetch shader.
+    compute_key.value =
+        GetProgram(Shader::HwStage::Compute, SwStage::Compute, cs_params, binding, 0);
     return true;
 }
 
@@ -629,6 +1764,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    info.ResolveDirectReads();
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
@@ -654,56 +1790,518 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
-PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
-                                                const Shader::ShaderParams& params,
-                                                Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
-    auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
-    if (new_program) {
-        it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
-        auto& program = it_pgm.value();
-        auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
-
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
-            fetch_shader = &fetch;
-        }
-        return std::make_tuple(&program->info, module, perm_hash);
+// Single publish point for every GetProgram exit: infos/modules feed the pipeline lookups,
+// the fetch shader ref the vertex format walk; compute stages carry none.
+SHAD_FORCE_INLINE u64 PipelineCache::Publish(u32 out_slot, SwStage l_stage,
+                                             const Shader::Info* out_info, vk::ShaderModule module,
+                                             const Program* pgm, u32 perm_idx, u64 hash) {
+    DEBUG_ASSERT(out_slot < MaxShaderStages);
+    infos[out_slot] = out_info;
+    modules[out_slot] = module;
+    const FetchShaderRef ref{pgm, perm_idx};
+    if (l_stage != SwStage::Compute && ref) {
+        fetch_shader_ref = ref;
     }
+    return hash;
+}
 
-    auto& program = it_pgm.value();
+// A permutation index names the store's entries. The store can hold permutations this session has
+// not loaded, which cached pipeline keys still name; a new one takes the next unused index.
+static size_t FreePermutationIndex(u64 pgm_hash, size_t perm_idx) {
+    while (Storage::DataBase::Instance().Contains(
+        Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", HashCombine(pgm_hash, perm_idx)))) {
+        ++perm_idx;
+    }
+    return perm_idx;
+}
+
+// Every later hit of the program advances the bindings by its info, as the pipeline layout does;
+// a compile whose SPIR-V spans a different range leaves the next stages' bindings undeclared.
+static void CheckBindingSpan(const Shader::Info& info, Shader::Backend::Bindings start,
+                             const Shader::Backend::Bindings& emitted, size_t perm_idx) {
+    info.AddBindings(start);
+    if (start != emitted) {
+        LOG_ERROR(Render_Vulkan,
+                  "{} shader {:#x} permutation {} spans bindings to {}, its layout to {}",
+                  info.hw_stage, info.pgm_hash, perm_idx, emitted.unified, start.unified);
+    }
+}
+
+// The first-ever build of a program: a few hundred calls per session, each
+// carrying a StageSpecialization that must not sit in GetProgram's frame.
+u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
+                                     const Shader::ShaderParams& params,
+                                     Shader::Backend::Bindings& binding, u32 out_slot,
+                                     std::unique_ptr<Program>& created_slot, StageIdentity& id) {
+    const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];
+    created_slot = std::make_unique<Program>(stage, l_stage, params);
+    auto start = binding;
+    auto ri_compile = runtime_info;
+    const size_t perm_idx = FreePermutationIndex(params.hash, 0);
+    const auto module =
+        CompileModule(created_slot->info, ri_compile, params.code, perm_idx, binding);
+    CheckBindingSpan(created_slot->info, start, binding, perm_idx);
+    NoteSharpVerdicts(created_slot->info);
+    auto spec = Shader::StageSpecialization(created_slot->info, ri_compile, profile, start);
+    const auto perm_hash = HashCombine(params.hash, perm_idx);
+
+    if (spec_fp_cache) {
+        spec.ComputeSig();
+    }
+    RegisterShaderMeta(created_slot->info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+    created_slot->InsertPermut(module, std::move(spec), perm_idx);
+    id.program = created_slot.get();
+    id.program_hash = params.hash;
+    return Publish(out_slot, l_stage, &created_slot->info, module, created_slot.get(),
+                   static_cast<u32>(perm_idx), perm_hash);
+}
+
+u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::ShaderParams& params,
+                              Shader::Backend::Bindings& binding, u32 out_slot) {
+    const bool non_tess =
+        l_stage != SwStage::TessellationControl && l_stage != SwStage::TessellationEval;
+    auto& ri_slot = ri_stamp[static_cast<u32>(l_stage)];
+    if (slot_prefetch && non_tess) {
+        // Warms the slot lines the fold reads and writes: the header and the
+        // first 256 bytes of the key, issued ahead of the runtime info and
+        // the gather.
+        const auto* p = reinterpret_cast<const char*>(&gather_slots[static_cast<u32>(l_stage)]);
+        for (u32 i = 0; i < 5; ++i) {
+            __builtin_prefetch(p + i * 64, 1, 3);
+        }
+    }
+    const bool stampable =
+        ri_stamp_gate && (stage == HwStage::Vertex || stage == HwStage::Fragment);
+    const u64 reg_stamp = stampable ? rasterizer.SelectGfxStateStamp() : 0;
+    if (!stampable || !ri_slot.valid || ri_slot.stamp != reg_stamp ||
+        ri_slot.stage != static_cast<u8>(stage) ||
+        (stage == HwStage::Vertex && ri_slot.indirect_key != indirect_key_)) {
+        if (!ri_input_memo || !MemoRuntimeInfo(stage, l_stage, ri_slot)) {
+            BuildRuntimeInfo(stage, l_stage);
+            ri_memo_last[static_cast<u32>(l_stage)] = nullptr;
+            ri_slot.hash_valid = false;
+        }
+        ri_slot.stamp = reg_stamp;
+        ri_slot.stage = static_cast<u8>(stage);
+        ri_slot.indirect_key = indirect_key_;
+        ri_slot.valid = stampable;
+    }
+    // Reference, not a copy: the member lives until the next BuildRuntimeInfo. Compile
+    // branches copy it first because CompileModule rewrites tess/fragment fields through its
+    // reference, and a new program's spec must be built from that same mutated copy.
+    const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];
+    auto& id = stage_identity[static_cast<u32>(l_stage)];
+    Program* program = id.program && id.program_hash == params.hash ? id.program : nullptr;
+    if (program) {
+        ++pgmid_map_hits;
+    } else {
+        ++pgmid_map_probes;
+        auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
+        if (new_program) {
+            return CreateProgramSlow(stage, l_stage, params, binding, out_slot, it_pgm.value(), id);
+        }
+        program = it_pgm.value().get();
+        id.program = program;
+        id.program_hash = params.hash;
+    }
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+
+    // Spec-fingerprint tier: catches the per-draw UBO-pointer churn a raw user_data key cannot
+    // (the raw bytes change every draw, the spec result does not). A hit skips the
+    // StageSpecialization rebuild below entirely. HS/DS are excluded - their spec folds tess
+    // constant-buffer contents this key cannot cover. spec_fp is reused at the populate site
+    // after resolution; it stays 0 when the tier did not run.
+    u64 spec_fp = 0;
+    const bool spec_fp_eligible = spec_fp_cache && non_tess;
+    size_t key_len = 0;
+    if (spec_fp_eligible && !program->modules.empty()) {
+        // Raw-byte hash of the persistent member: its padding is stable across calls, so a
+        // padding mismatch can only over-discriminate into a miss.
+        u64 ri_fp_hash;
+        if (ri_slot.hash_valid) {
+            ri_fp_hash = ri_slot.ri_fp_hash;
+        } else {
+            ri_fp_hash = RuntimeInfoProxyHash(runtime_info);
+            ++specfp_ri_rehash;
+            ri_slot.ri_fp_hash = ri_fp_hash;
+            // The memo entry the member was restored from keeps the hash with
+            // its bytes, so a later restore brings both back.
+            auto* memo = ri_input_memo ? ri_memo_last[static_cast<u32>(l_stage)] : nullptr;
+            if (memo) {
+                memo->ri_fp_hash = ri_fp_hash;
+                memo->hash_valid = true;
+            }
+            ri_slot.hash_valid = ri_slot.valid || memo != nullptr;
+        }
+        auto& slot = gather_slots[static_cast<u32>(l_stage)];
+        const auto slot_hit = [&]() -> u64 {
+            ++specfp_slot_hits;
+            if (spec_fp_validate) {
+                ValidateSpecHit(*program, slot.perm_idx, info, runtime_info, binding);
+            }
+            info.AddBindings(binding);
+            return Publish(out_slot, l_stage, &program->info, slot.module, program, slot.perm_idx,
+                           slot.perm_hash);
+        };
+        if (spec_key_fused) {
+            // Whenever slot.program is set, slot.buf holds that program's key;
+            // the gather writes the slot before the header fields describe it,
+            // and nothing inside this window resolves the same stage again.
+            const bool pre_same = slot.program == program && slot.pipe_gen == lookup_pipe_gen_;
+            u64 diff = 0;
+            // The flat window RefreshFlatBuf just produced, read only when the memo is on so the
+            // off arm keeps today's instruction stream. Walker-less programs alias the 16
+            // user-data registers; a walker's first destination dword is NUM_USER_DATA_REGS, so
+            // the window always starts with those same registers either way.
+            bool walker = false;
+            u32 flat_dw = Shader::NUM_USER_DATA_REGS;
+            if (gather_input_memo) {
+                walker = info.srt_info.walker_func != nullptr;
+                if (walker) {
+                    flat_dw = info.srt_info.flattened_bufsize_dw;
+                }
+            }
+            if (gather_input_memo && pre_same && slot.in_program == program) {
+                // Byte identity over every input the key's descriptor sections read is strictly
+                // stronger than the fold's masked compare, so the recorded permutation is the one
+                // the gather would have resolved to. Conjuncts are ordered cheapest-first: the
+                // scalar mismatch is the common one.
+                ++gim_probes;
+                gim_wprobes += walker;
+                gim_dw += flat_dw;
+                if (slot.in_len == flat_dw && slot.in_pgm_base == info.pgm_base &&
+                    slot.in_ri_hash == ri_fp_hash && slot.in_bind[0] == binding.unified &&
+                    slot.in_bind[1] == binding.buffer &&
+                    std::memcmp(slot.in_flat.data(), info.flat_ud, size_t{flat_dw} * sizeof(u32)) ==
+                        0) {
+                    ++gim_hits;
+                    gim_whits += walker;
+                    ++specfp_slot_hits;
+                    specfp_slot_pf += slot_prefetch;
+                    info.AddBindings(binding);
+                    return Publish(out_slot, l_stage, &program->info, slot.module, program,
+                                   slot.perm_idx, slot.perm_hash);
+                }
+            }
+            if (spec_fp_validate) {
+                // The tripwire keeps the bytes the gather replaces, so the
+                // accumulator is checked against them and not against the
+                // sharps, which guest threads rewrite concurrently.
+                std::memcpy(key_scratch.data(), slot.buf.data(), slot.buf.size());
+            }
+            key_len = GatherSpecKeyImpl<true>(info, *program, ri_fp_hash, binding, slot.buf.data(),
+                                              true, &diff);
+            ++specfp_fused;
+            if (key_len == 0) {
+                // A partial key sits in the slot and no field describes it.
+                slot.program = nullptr;
+                slot.in_program = nullptr;
+            } else {
+                if (gather_input_memo) {
+                    // Record what this call's key was gathered from, next to the key itself: every
+                    // later exit leaves slot.program either null or describing this permutation,
+                    // so pre_same certifies the record the same way it certifies the key. A
+                    // vertex stage with a fetch shader never arms - its attribute section walks
+                    // the guest fetch table through a pointer in user data, which no flat-byte
+                    // compare covers - and neither does a program whose sharps could reach past
+                    // the recorded window.
+                    const bool attr_key =
+                        info.hw_stage == Shader::HwStage::Vertex && info.has_fetch_shader;
+                    const bool arm = !attr_key && GatherMemoWindowOk(*program, info, flat_dw);
+                    gim_big += !attr_key && flat_dw > kGatherMemoDw;
+                    if (arm) {
+                        std::memcpy(slot.in_flat.data(), info.flat_ud,
+                                    size_t{flat_dw} * sizeof(u32));
+                        slot.in_len = flat_dw;
+                        slot.in_pgm_base = info.pgm_base;
+                        slot.in_ri_hash = ri_fp_hash;
+                        slot.in_bind = {binding.unified, binding.buffer};
+                        ++gim_recs;
+                    }
+                    slot.in_program = arm ? program : nullptr;
+                }
+                if (spec_fp_validate) {
+                    NoteFusedDiff(key_scratch.data(), slot.buf.data(), key_len, diff);
+                }
+                specfp_inplace_bytes += key_len;
+                specfp_slot_pf += slot_prefetch;
+                if (pre_same && slot.len == key_len && diff == 0) {
+                    return slot_hit();
+                }
+                slot.program = nullptr;
+                spec_fp = XXH3_64bits(slot.buf.data(), key_len);
+                spec_fp = spec_fp ? spec_fp : 1;
+            }
+        } else if (spec_fp_canonical != 0) {
+            key_len = GatherSpecKey(info, *program, ri_fp_hash, binding, key_scratch.data(),
+                                    spec_key_align);
+            if (key_len != 0 && spec_fp_canonical == 2) {
+                const bool same = slot.program == program && slot.len == key_len &&
+                                  slot.pipe_gen == lookup_pipe_gen_;
+                bool hit;
+                if (spec_fp_slot_inplace) {
+                    // The fold rewrites the slot on every resolve, so the key
+                    // the fill below records is the key the slot holds; a miss
+                    // leaves a key no slot field describes until then.
+                    const u64 diff = FoldKeyIntoSlot(slot.buf.data(), key_scratch.data(), key_len);
+                    hit = same && diff == 0;
+                    if (!hit) {
+                        slot.program = nullptr;
+                    }
+                    specfp_inplace_bytes += key_len;
+                    specfp_slot_pf += slot_prefetch;
+                } else {
+                    hit = same && std::memcmp(slot.buf.data(), key_scratch.data(), key_len) == 0;
+                }
+                if (hit) {
+                    return slot_hit();
+                }
+            }
+            if (key_len != 0) {
+                spec_fp = XXH3_64bits(key_scratch.data(), key_len);
+                spec_fp = spec_fp ? spec_fp : 1;
+            }
+        } else {
+            spec_fp = ComputeSpecProxyFp(info, program->modules[0].spec.fetch_shader_data,
+                                         ri_fp_hash, binding);
+        }
+        // A resolved hit: the MRU carries the module so the strided Module
+        // load is skipped on repeats, and value 2 records the key.
+        const auto resolved = [&](size_t hit_idx, vk::ShaderModule module) {
+            const u64 hit_hash = HashCombine(params.hash, hit_idx);
+            if (spec_fp_canonical != 0) {
+                program->mru.module = module;
+                program->mru.pipe_gen = lookup_pipe_gen_;
+                if (spec_fp_canonical == 2) {
+                    slot.program = program;
+                    slot.pipe_gen = lookup_pipe_gen_;
+                    slot.perm_hash = hit_hash;
+                    slot.module = module;
+                    slot.perm_idx = static_cast<u32>(hit_idx);
+                    slot.len = static_cast<u32>(key_len);
+                    if (!spec_fp_slot_inplace) {
+                        std::memcpy(slot.buf.data(), key_scratch.data(), key_len);
+                    }
+                }
+                if (spec_fp_validate) {
+                    ValidateSpecHit(*program, static_cast<u32>(hit_idx), info, runtime_info,
+                                    binding);
+                }
+            }
+            info.AddBindings(binding);
+            program->last_hit_perm = static_cast<u32>(hit_idx);
+            return Publish(out_slot, l_stage, &program->info, module, program,
+                           static_cast<u32>(hit_idx), hit_hash);
+        };
+        // MRU front: consecutive draws overwhelmingly repeat the fingerprint,
+        // and this compare reads a line the probe already has hot.
+        if (spec_fp != 0) [[likely]] {
+            if (program->mru.fp == spec_fp && program->mru.perm_idx < program->modules.size())
+                [[likely]] {
+                const size_t hit_idx = program->mru.perm_idx;
+                ++specfp_mru_hits;
+                const vk::ShaderModule module =
+                    spec_fp_canonical != 0 && program->mru.pipe_gen == lookup_pipe_gen_
+                        ? program->mru.module
+                        : program->modules[hit_idx].module;
+                return resolved(hit_idx, module);
+            }
+            if (spec_fp_front) {
+                auto& fr = program->front;
+                if (fr.pipe_gen == lookup_pipe_gen_) {
+                    u32 mask = 0;
+                    for (u32 i = 0; i < Program::kSpecFpFront; ++i) {
+                        mask |= static_cast<u32>(fr.fp[i] == spec_fp) << i;
+                    }
+                    if (mask != 0) {
+                        const u32 i = std::countr_zero(mask);
+                        const size_t hit_idx = fr.perm_idx[i];
+                        if (hit_idx < program->modules.size()) {
+                            ++specfp_front_hits;
+                            program->mru.fp = spec_fp;
+                            program->mru.perm_idx = static_cast<u32>(hit_idx);
+                            return resolved(hit_idx, fr.module[i]);
+                        }
+                    }
+                }
+            } else if (spec_fp_canonical != 0 && program->mru2.fp == spec_fp &&
+                       program->mru2.perm_idx < program->modules.size()) {
+                program->SwapMru();
+                const size_t hit_idx = program->mru.perm_idx;
+                ++specfp_mru2_hits;
+                const vk::ShaderModule module = program->mru.pipe_gen == lookup_pipe_gen_
+                                                    ? program->mru.module
+                                                    : program->modules[hit_idx].module;
+                return resolved(hit_idx, module);
+            }
+            // No lazy allocation here: a table allocated at this probe would be
+            // value-initialised, so the probe that triggered it always misses. The populate
+            // site in ResolvePermutationSlow allocates for itself.
+            if (program->spec_fp_lru) {
+                const u32 fp_slot = static_cast<u32>(spec_fp) & (Program::kSpecFpCacheSize - 1);
+                const auto& fe = (*program->spec_fp_lru)[fp_slot];
+                if (fe.fp == spec_fp && fe.perm_idx < program->modules.size()) [[likely]] {
+                    const size_t hit_idx = fe.perm_idx;
+                    ++specfp_table_hits;
+                    if (spec_fp_front) {
+                        program->FrontInsert(spec_fp, fe.perm_idx, program->modules[hit_idx].module,
+                                             lookup_pipe_gen_);
+                    } else if (spec_fp_canonical != 0) {
+                        program->DemoteMru();
+                    }
+                    program->mru.fp = spec_fp;
+                    program->mru.perm_idx = fe.perm_idx;
+                    return resolved(hit_idx, program->modules[hit_idx].module);
+                }
+            }
+        }
+    }
+    return ResolvePermutationSlow(stage, l_stage, params, binding, out_slot, program, spec_fp,
+                                  key_len);
+}
+
+u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
+                                          const Shader::ShaderParams& params,
+                                          Shader::Backend::Bindings& binding, u32 out_slot,
+                                          Program* program, u64 spec_fp, size_t key_len) {
+    auto& info = program->info;
+    const auto& runtime_info = runtime_infos[static_cast<u32>(l_stage)];
+    auto& spec = spec_scratch;
+    spec.Rebuild(info, runtime_info, profile, binding);
+#ifdef _DEBUG
+    {
+        // A fresh construction must match the rebuilt scratch member for member.
+        const Shader::StageSpecialization ref_spec(info, runtime_info, profile, binding);
+        DEBUG_ASSERT(ref_spec.info == spec.info && ref_spec.runtime_info == spec.runtime_info &&
+                     ref_spec.bitset == spec.bitset &&
+                     ref_spec.fetch_shader_data == spec.fetch_shader_data &&
+                     ref_spec.vs_attribs == spec.vs_attribs && ref_spec.buffers == spec.buffers &&
+                     ref_spec.images == spec.images && ref_spec.fmasks == spec.fmasks &&
+                     ref_spec.samplers == spec.samplers && ref_spec.start == spec.start);
+    }
+#endif
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
 
     vk::ShaderModule module{};
+    size_t hit_idx = std::numeric_limits<size_t>::max();
 
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it == program->modules.end()) {
-        auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+    if (spec_fp_cache) {
+        // Fast path: a (sig, sig2) pair stands in for the deep spec comparison the legacy
+        // branch runs.
+        spec.ComputeSig();
+        if (const auto it_sig = program->perm_index_by_sig.find(spec.sig);
+            it_sig != program->perm_index_by_sig.end() &&
+            it_sig->second < program->modules.size()) {
+            const auto& ms = program->modules[it_sig->second].spec;
+            if (ms.sig == spec.sig && ms.sig2 == spec.sig2) [[likely]] {
+                hit_idx = it_sig->second;
+            }
+        }
+        if (hit_idx == std::numeric_limits<size_t>::max()) {
+            // perm_index_by_sig keeps only the first index per sig (AddPermut), so a sig
+            // collision still needs the scan.
+            for (size_t i = 0; i < program->modules.size(); ++i) {
+                const auto& m = program->modules[i];
+                if (m.module && m.spec.sig == spec.sig && m.spec.sig2 == spec.sig2) {
+                    hit_idx = i;
+                    break;
+                }
+            }
+            if (hit_idx == std::numeric_limits<size_t>::max()) {
+                // The signatures hash more bytes than the structural compare tests, so a
+                // permutation can go unrecognised by (sig, sig2) while being the same
+                // specialization; compiling it again stores a duplicate the warm-up later
+                // refuses to preload. Settle a miss structurally before compiling.
+                const auto it = std::ranges::find_if(
+                    program->modules, [&](const auto& m) { return m.module && m.spec == spec; });
+                if (it != program->modules.end()) {
+                    hit_idx = static_cast<size_t>(std::distance(program->modules.begin(), it));
+                }
+            }
+            if (hit_idx != std::numeric_limits<size_t>::max()) {
+                // Keep the map warm for future lookups.
+                program->perm_index_by_sig.try_emplace(spec.sig, hit_idx);
+            }
+        }
+    } else {
+        if (spec_mru_perm_probe) {
+            // Probes the previously matched permutation with the same predicate and
+            // orientation the linear search below uses.
+            const u32 mru = program->last_hit_perm;
+            if (mru < program->modules.size() && program->modules[mru].spec == spec) {
+                hit_idx = mru;
+            }
+        }
+        if (hit_idx == std::numeric_limits<size_t>::max()) {
+            const auto it = std::ranges::find_if(
+                program->modules, [&](const auto& m) { return m.module && m.spec == spec; });
+            if (it != program->modules.end()) {
+                hit_idx = static_cast<size_t>(std::distance(program->modules.begin(), it));
+            }
+        }
+    }
+    if (hit_idx == std::numeric_limits<size_t>::max()) {
+        auto new_info = Shader::Info(stage, l_stage, params);
+        auto ri_compile = runtime_info;
+        const auto start = binding;
+        perm_idx = FreePermutationIndex(params.hash, perm_idx);
+        perm_hash = HashCombine(params.hash, perm_idx);
+        module = CompileModule(new_info, ri_compile, params.code, perm_idx, binding);
+        CheckBindingSpan(info, start, binding, perm_idx);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
-        module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
+        module = program->modules[hit_idx].module;
+        perm_idx = hit_idx;
         perm_hash = HashCombine(params.hash, perm_idx);
     }
-    if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
-        fetch_shader = &fetch;
+    // Record spec fingerprint -> perm_idx: the next draw with structurally identical
+    // sharps skips the rebuild. spec_fp != 0 only in the eligible tier.
+    if (spec_fp != 0) {
+        const u32 fp_slot = static_cast<u32>(spec_fp) & (Program::kSpecFpCacheSize - 1);
+        if (!program->spec_fp_lru) {
+            program->spec_fp_lru = std::make_unique<
+                std::array<Program::SpecFpCacheEntry, Program::kSpecFpCacheSize>>();
+        }
+        (*program->spec_fp_lru)[fp_slot] = Program::SpecFpCacheEntry{
+            .fp = spec_fp,
+            .perm_idx = static_cast<u32>(perm_idx),
+        };
+        if (spec_fp_front) {
+            program->FrontInsert(spec_fp, static_cast<u32>(perm_idx), module, lookup_pipe_gen_);
+        } else if (spec_fp_canonical != 0) {
+            program->DemoteMru();
+        }
+        program->mru.fp = spec_fp;
+        program->mru.perm_idx = static_cast<u32>(perm_idx);
+        if (spec_fp_canonical != 0) {
+            ++specfp_rebuilds;
+            program->mru.module = module;
+            program->mru.pipe_gen = lookup_pipe_gen_;
+            if (spec_fp_canonical == 2) {
+                auto& slot = gather_slots[static_cast<u32>(l_stage)];
+                slot.program = program;
+                slot.pipe_gen = lookup_pipe_gen_;
+                slot.perm_hash = perm_hash;
+                slot.module = module;
+                slot.perm_idx = static_cast<u32>(perm_idx);
+                slot.len = static_cast<u32>(key_len);
+                if (!spec_fp_slot_inplace) {
+                    std::memcpy(slot.buf.data(), key_scratch.data(), key_len);
+                }
+            }
+        }
     }
-    return std::make_tuple(&program->info, module, perm_hash);
+    program->last_hit_perm = static_cast<u32>(perm_idx);
+    return Publish(out_slot, l_stage, &program->info, module, program, static_cast<u32>(perm_idx),
+                   perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
@@ -716,6 +2314,8 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                 d.destroyShaderModule(m.module);
                 m.module = CompileSPV(spv_code, d);
                 new_module = m.module;
+                // Index-keyed memos (spec_fp_lru, perm_index_by_sig) survive the in-place
+                // swap; the pipe_gen bump below covers the pipeline memo.
             }
         }
     }
@@ -731,6 +2331,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             }
         }
     }
+    Skipcache::Framework::Instance().BumpPipeGen();
     return new_module;
 }
 

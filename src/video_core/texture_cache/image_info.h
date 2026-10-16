@@ -43,6 +43,7 @@ struct ImageInfo {
     ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr htile_address,
               AmdGpu::CbDbExtent hint, bool write_buffer = false) noexcept;
     ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& desc) noexcept;
+    ImageInfo(const AmdGpu::Image& sharp, bool is_depth) noexcept;
 
     bool IsTiled() const {
         return tile_mode != AmdGpu::TileMode::DisplayLinearAligned;
@@ -57,6 +58,8 @@ struct ImageInfo {
     s32 SliceOf(const ImageInfo& info, s32 mip) const;
 
     bool IsCompatible(const ImageInfo& info) const;
+    // Writes guest_size; runs only from the constructors, since the texture
+    // cache mirrors the field into a per-image record while it is registered.
     void UpdateSize() noexcept;
 
     struct {

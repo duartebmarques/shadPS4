@@ -575,6 +575,46 @@ set(JPEG_LIB src/core/libraries/jpeg/jpeg_error.h
              src/core/libraries/jpeg/jpegenc.h
 )
 
+# Photo mode and album of Gravity Rush 2
+list(APPEND JPEG_LIB src/core/libraries/gr2_photo/gr2_photo.cpp
+                     src/core/libraries/gr2_photo/gr2_photo.h
+                     src/core/libraries/gr2_photo/photo_content.cpp
+                     src/core/libraries/gr2_photo/photo_content.h
+                     src/core/libraries/gr2_photo/photo_gallery.cpp
+                     src/core/libraries/gr2_photo/photo_gallery.h
+                     src/core/libraries/gr2_photo/photo_jpegdec.cpp
+                     src/core/libraries/gr2_photo/photo_jpegdec.h
+                     src/core/libraries/gr2_photo/photo_jpegenc.cpp
+                     src/core/libraries/gr2_photo/photo_jpegenc.h
+                     src/video_core/texture_cache/photo_readback.cpp
+                     src/video_core/texture_cache/photo_readback.h
+)
+
+# Online play of Gravity Rush 2
+list(APPEND NETWORK_LIBS src/core/libraries/gr2_online/gr2_online.cpp
+                         src/core/libraries/gr2_online/gr2_online.h
+                         src/core/libraries/gr2_online/online_host.cpp
+                         src/core/libraries/gr2_online/online_host.h
+                         src/core/libraries/gr2_online/online_http.cpp
+                         src/core/libraries/gr2_online/online_http.h
+                         src/core/libraries/gr2_online/online_np_auth.cpp
+                         src/core/libraries/gr2_online/online_np_auth.h
+                         src/core/libraries/gr2_online/online_np_manager.cpp
+                         src/core/libraries/gr2_online/online_np_manager.h
+                         src/core/libraries/gr2_online/online_np_web_api.cpp
+                         src/core/libraries/gr2_online/online_np_web_api.h
+                         src/core/libraries/gr2_online/online_patches.cpp
+                         src/core/libraries/gr2_online/online_patches.h
+                         src/core/libraries/gr2_online/online_save.cpp
+                         src/core/libraries/gr2_online/online_save.h
+                         src/core/libraries/gr2_online/online_secure.cpp
+                         src/core/libraries/gr2_online/online_secure.h
+                         src/core/libraries/gr2_online/online_session.cpp
+                         src/core/libraries/gr2_online/online_session.h
+                         src/core/libraries/gr2_online/online_stat.cpp
+                         src/core/libraries/gr2_online/online_stat.h
+)
+
 set(PLAYGO_LIB src/core/libraries/playgo/playgo.cpp
                src/core/libraries/playgo/playgo.h
                src/core/libraries/playgo/playgo_dialog.cpp
@@ -794,6 +834,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/bit_field.h
            src/common/bounded_threadsafe_queue.h
            src/common/concepts.h
+           src/common/cpu_pause.h
            src/common/cstring.h
            src/common/debug.h
            src/common/decoder.cpp
@@ -1139,6 +1180,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
 )
 
 set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
+               src/video_core/amdgpu/gfx_state_stamp.h
                src/video_core/amdgpu/liverpool.cpp
                src/video_core/amdgpu/liverpool.h
                src/video_core/amdgpu/pixel_format.cpp
@@ -1166,6 +1208,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/range_set.h
                src/video_core/buffer_cache/region_definitions.h
                src/video_core/buffer_cache/region_manager.h
+               src/video_core/buffer_cache/stream_copy_lane.cpp
+               src/video_core/buffer_cache/stream_copy_lane.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
                src/video_core/renderer_vulkan/liverpool_to_vk.h
                src/video_core/renderer_vulkan/vk_common.cpp
@@ -1174,6 +1218,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+               src/video_core/renderer_vulkan/vk_guest_memory.cpp
+               src/video_core/renderer_vulkan/vk_guest_memory.h
                src/video_core/renderer_vulkan/vk_instance.cpp
                src/video_core/renderer_vulkan/vk_instance.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
@@ -1208,6 +1254,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/host_passes/fsr_pass.h
                src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
                src/video_core/renderer_vulkan/host_passes/pp_pass.h
+               src/video_core/skipcache/skipcache.cpp
+               src/video_core/skipcache/skipcache.h
                src/video_core/texture_cache/blit_helper.cpp
                src/video_core/texture_cache/blit_helper.h
                src/video_core/texture_cache/host_compatibility.cpp

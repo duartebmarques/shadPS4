@@ -1,22 +1,33 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
+#include <chrono>
+#include <cstring>
 #include <limits>
+
 #include <xxhash.h>
 
+#include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
-#include "common/hash.h"
+#include "common/rdtsc.h"
+#include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/host_compatibility.h"
+#include "video_core/texture_cache/photo_readback.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -26,16 +37,62 @@ static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
+namespace {
+constexpr u32 ClampMemoWays(u32 v) {
+    return v == 0 ? 0 : v >= 4 ? 4 : v >= 2 ? 2 : 1;
+}
+// 1024 keeps the direct-mapped mask in range, 32768 keeps memo_slot in u16.
+constexpr u32 ClampMemoEntries(u32 v) {
+    return v == 0 ? 2048u : std::bit_floor(std::clamp<u32>(v, 1024u, 32768u));
+}
+constexpr u8 ViewKeyOf(const TextureCache::ImageDesc& desc) {
+    return static_cast<u8>(desc.deferred_is_depth) |
+           static_cast<u8>(static_cast<u8>(desc.deferred_is_array) << 1);
+}
+} // namespace
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                            BufferCache& buffer_cache_, PageManager& tracker_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
+    : find_image_memo_(ClampMemoEntries(EmulatorSettings.GetFindimgMemoEntries())),
+      instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, slot_images{MAX_IMAGES},
       slot_image_views{MAX_IMAGE_VIEWS}, slot_samplers{MAX_SAMPLERS},
       blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
+      readback_linear_images_async{readback_linear_images &&
+                                   EmulatorSettings.IsReadbackLinearImagesAsync()},
+      image_fast_state{EmulatorSettings.IsImageFastState()},
+      view_memo{EmulatorSettings.IsTextureViewMemo()},
+      findimg_trust_gen{EmulatorSettings.IsFindimgTrustGen()},
+      findimg_range_inval{EmulatorSettings.IsFindimgRangeInvalidate() && findimg_trust_gen},
+      memo_first{EmulatorSettings.IsFindimgMemoFirst()},
+      bind_noop{EmulatorSettings.IsBindNoopMemo() && view_memo},
+      image_update_direct{EmulatorSettings.IsImageUpdateDirect() && image_fast_state},
+      lru_lazy_touch{EmulatorSettings.IsTextureLruLazyTouch()},
+      invalidate_filter{EmulatorSettings.IsTextureInvalidateFilter()},
+      memo_ways{ClampMemoWays(EmulatorSettings.GetFindimgMemoWays())},
+      memo_set_shift{static_cast<u32>(
+          64 - std::countr_zero(u64{find_image_memo_.size() / std::max<u32>(memo_ways, 1u)}))},
+      // The side array exists only under the setting: with it off nothing is
+      // allocated and no populate ever stores a range.
+      memo_range_(findimg_range_inval ? find_image_memo_.size() : 0) {
 
+    invalidate_cover_ = std::make_unique<std::atomic<u64>[]>(CoverWords);
+    addr_filter_.resize(slot_images.MaxIndexCapacity());
+    if (EmulatorSettings.IsImageUpdateDirect() && !image_update_direct) {
+        LOG_WARNING(Render_Vulkan,
+                    "direct image updates need image_fast_state; the dedup probe runs unchanged");
+    }
+    if (EmulatorSettings.IsFindimgRangeInvalidate() && !findimg_range_inval) {
+        LOG_WARNING(Render_Vulkan, "range-scoped memo invalidation needs findimg_trust_gen; the "
+                                   "global texture generation keeps invalidating the whole memo");
+    }
+    if (EmulatorSettings.IsBindNoopMemo() && !bind_noop) {
+        LOG_WARNING(Render_Vulkan,
+                    "bind no-op memo needs texture_view_memo; the transit probe runs unchanged");
+    }
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
     pressure_gc_samplers = max_samplers * 7 / 8;
@@ -72,6 +129,27 @@ TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    if (readback_linear_images_async) {
+        bool recorded = false;
+        for (const ImageId image_id : download_images) {
+            recorded |= DownloadImageMemoryAsync(image_id);
+        }
+        download_images.clear();
+        if (recorded) {
+            // Makes the copies visible to the background writer's host reads.
+            const vk::MemoryBarrier2 barrier = {
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+            };
+            scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+                .memoryBarrierCount = 1,
+                .pMemoryBarriers = &barrier,
+            });
+        }
+        return;
+    }
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, true);
     }
@@ -86,6 +164,18 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
+    if (DownloadImageInPlace(image, download_size)) {
+        if (sync) {
+            const u64 t0 = Common::FencedRDTSC();
+            scheduler.Finish();
+            scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage,
+                                 Common::FencedRDTSC() - t0);
+            Skipcache::Framework::Instance().BumpMemGen();
+        } else {
+            scheduler.DeferPriorityOperation([] { Skipcache::Framework::Instance().BumpMemGen(); });
+        }
+        return;
+    }
     const auto download =
         runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
     const vk::BufferImageCopy image_download = {
@@ -105,19 +195,126 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
     if (sync) {
+        const u64 t0 = Common::FencedRDTSC();
         scheduler.Finish();
+        scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage,
+                             Common::FencedRDTSC() - t0);
         download.Invalidate();
         Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
                                                   download.mapped, download_size);
+        Skipcache::Framework::Instance().BumpMemGen();
     } else {
         scheduler.DeferPriorityOperation(
             [this, device_addr = image.info.guest_address, download, download_size] {
                 download.Invalidate();
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
+                Skipcache::Framework::Instance().BumpMemGen();
                 runtime.GetStagingPool().FreeDeferred(download);
             });
     }
+}
+
+bool TextureCache::DownloadImageInPlace(Image& image, u32 download_size) {
+    if (!EmulatorSettings.IsInplaceImageDownloads() || !Vulkan::GuestMemory::Installed()) {
+        return false;
+    }
+    const auto phys =
+        Core::Memory::Instance()->DirectPhysOf(image.info.guest_address, download_size);
+    if (!phys || (*phys & 15) != 0) {
+        return false;
+    }
+    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    if (!chunk || *phys + download_size > chunk->phys + chunk->size) {
+        return false;
+    }
+    const vk::BufferImageCopy image_download = {
+        .bufferOffset = *phys - chunk->phys,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    };
+    runtime.DownloadImageInPlace(&image, chunk->buffer, std::span{&image_download, 1});
+    return true;
+}
+
+bool TextureCache::DownloadImageMemoryAsync(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    // Copies into a buffer need a single-sample image.
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.info.guest_address == 0 ||
+        image.info.num_samples > 1) {
+        return false;
+    }
+    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
+                              image.info.resources.layers * (image.info.num_bits / 8);
+    // A resolution-scaled image is larger than the guest allocation it would be written into.
+    constexpr u64 MaxDownloadSize = 64_MB;
+    if (download_size == 0 || download_size > image.info.guest_size ||
+        download_size > MaxDownloadSize) {
+        return false;
+    }
+    if (DownloadImageInPlace(image, download_size)) {
+        scheduler.DeferPriorityOperation([] { Skipcache::Framework::Instance().BumpMemGen(); });
+        return true;
+    }
+    // Each copy gets its own staging buffer, so no later copy can reuse the bytes before the
+    // background writer has read them.
+    std::unique_ptr<Buffer> staging;
+    {
+        std::scoped_lock lk{async_staging_mutex};
+        const auto it = std::ranges::find_if(async_staging_pool, [&](const auto& buffer) {
+            return buffer->SizeBytes() >= download_size;
+        });
+        if (it != async_staging_pool.end()) {
+            staging = std::move(*it);
+            async_staging_pool.erase(it);
+        }
+    }
+    if (!staging) {
+        staging = std::make_unique<Buffer>(instance, 0,
+                                           std::max<u64>(std::bit_ceil(u64{download_size}), 64_KB),
+                                           MemoryType::HostCached, "Async Image Download");
+    }
+    const vk::BufferImageCopy image_download = {
+        .bufferOffset = 0,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    };
+    runtime.DownloadImage(&image, staging.get(), std::span{&image_download, 1});
+    scheduler.DeferPriorityOperation([this, staging = std::move(staging),
+                                      device_addr = image.info.guest_address,
+                                      download_size]() mutable {
+        staging->Invalidate(0, download_size);
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                  staging->mapped_data.data(), download_size);
+        Skipcache::Framework::Instance().BumpMemGen();
+        constexpr size_t MaxPooledBuffers = 8;
+        constexpr u64 MaxPooledSize = 16_MB;
+        std::scoped_lock lk{async_staging_mutex};
+        if (async_staging_pool.size() < MaxPooledBuffers && staging->SizeBytes() <= MaxPooledSize) {
+            async_staging_pool.push_back(std::move(staging));
+        }
+    });
+    return true;
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -127,16 +324,31 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
+    image.MarkFastStateDirty();
     UntrackImage(image_id);
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+    // The coverage probe runs ahead of the page table walk: most guest faults land in
+    // memory no image covers, and the walk they would take visits nothing.
+    // With the filter off the walk still runs and audits the probe.
+    const bool covered = size == 0 || CoverAny(addr, size);
+    invfilter_probes_.fetch_add(1, std::memory_order_relaxed);
+    if (!covered) {
+        invfilter_skips_.fetch_add(1, std::memory_order_relaxed);
+        if (invalidate_filter) {
+            return;
+        }
+    }
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
 
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(pages_start, pages_end - pages_start,
                          [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+    if (!covered && !image_ids.empty()) {
+        invfilter_unsound_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     for (const auto image_id : image_ids) {
         Image& image = slot_images[image_id];
@@ -148,6 +360,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            image.MarkFastStateDirty();
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -169,6 +382,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+    bool marked = false;
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
@@ -177,7 +391,14 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        image.MarkFastStateDirty();
+        marked = true;
     });
+    // Every written storage buffer binding lands here; with no image marked
+    // nothing the dirty generation guards has changed.
+    if (marked) {
+        Skipcache::Framework::Instance().BumpImgDirtyGen();
+    }
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -271,7 +492,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
-        scheduler.CurrentTick() - cache_image.tick_accessed_last > NUM_FRAMES_BEFORE_REMOVAL;
+        gc_tick - cache_image.gc_tick_accessed_last > NUM_FRAMES_BEFORE_REMOVAL;
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -410,7 +631,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   cache_image.info.resources.levels, cache_image.info.resources.layers,
                   cache_image.info.num_samples, static_cast<u32>(cache_image.info.tile_mode),
                   cache_image.info.num_bits, +cache_image.info.props.is_block,
-                  cache_image.info.guest_size, cache_image.tick_accessed_last, safe_to_delete,
+                  cache_image.info.guest_size, cache_image.gc_tick_accessed_last, safe_to_delete,
                   bool(cache_image.info.props.is_pow2), cache_image.info.alt_tile,
 
                   // New image details
@@ -446,8 +667,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   static_cast<s64>(image_info.guest_size) - static_cast<s64>(expected_size),
                   (static_cast<double>(image_info.guest_size) / expected_size - 1.0) * 100.0,
 
-                  merged_image_id.index, static_cast<int>(binding), scheduler.CurrentTick(),
-                  scheduler.CurrentTick() - cache_image.tick_accessed_last);
+                  merged_image_id.index, static_cast<int>(binding), gc_tick,
+                  gc_tick - cache_image.gc_tick_accessed_last);
 
         UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
     }
@@ -474,8 +695,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 // bound as render target. In this case we need to rebind render target.
                 if (cache_image.binding.is_target) {
                     cache_image.binding.needs_rebind = 1u;
+                    NoteRebind();
                     if (merged_image_id) {
-                        GetImage(merged_image_id).binding.is_target = 1u;
+                        Image& merged = slot_images[merged_image_id];
+                        TouchImage(merged);
+                        merged.binding.is_target = 1u;
                     }
 
                     FreeImage(cache_image_id);
@@ -507,6 +731,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
+        NoteRebind();
     }
 
     FreeImage(image_id);
@@ -514,9 +739,363 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+// The sampled guard timing, kept off the hot function's frame.
+static SHAD_NO_INLINE void RecordGuardSample(VideoCore::Skipcache::Framework& sc,
+                                             VideoCore::Skipcache::CacheCounters& ctr, u64 t0) {
+    ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
+    ++ctr.guard_samples;
+}
+
+// The generation the image memo certifies with: the range-scoped one under
+// findimg_range_invalidate, where register and unregister clear the slots they
+// intersect instead of bumping it, the global texture generation otherwise.
+// The probe, the verify abort and the populate commit must all read the same
+// one, or a wave misfiles divergences as aborts.
+[[nodiscard]] static inline u64 MemoGenNow(VideoCore::Skipcache::Framework& sc,
+                                           const std::atomic<u64>& img_memo_gen, bool range_inval) {
+    return range_inval ? img_memo_gen.load(std::memory_order_acquire)
+                       : sc.Gens().tex_gen.load(std::memory_order_acquire);
+}
+
+ImageId TextureCache::FindImageMemoized(ImageDesc& desc, const AmdGpu::Image& tsharp, u16* hint) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Framework::Instance();
+    constexpr auto kCache = CacheId::FindImage;
+    if (!sc.Active() || !sc.ShouldProbe(kCache)) {
+        // The only writer of the memo fields on this configuration: a primed
+        // desc (bind_image_lean) carries the previous binding's, and the
+        // bind no-op memo indexes the slot unchecked.
+        desc.ClearMemo();
+        if (memo_first && !GateTsharp(tsharp)) [[unlikely]] {
+            return ImageId{};
+        }
+        return FindImage(desc);
+    }
+    // Eager-view bindings carry a rewritten range the key does not cover;
+    // they neither consume nor populate.
+    const bool deferred = !desc.view_ready;
+    auto& ctr = sc.Counters(kCache);
+    ++ctr.eligible;
+    const bool timed = sc.SampleTimer(kCache);
+    const u64 t0 = timed ? sc.Now() : 0;
+    const u64 tex_gen = MemoGenNow(sc, img_memo_gen_, findimg_range_inval);
+    // Read word-at-a-time: no 32-byte copy of the sharp on the frame, and the
+    // key compare cannot lower to a library call.
+    const std::byte* const tp = reinterpret_cast<const std::byte*>(&tsharp);
+    u64 w0;
+    u64 w1;
+    u64 w2;
+    u64 w3;
+    std::memcpy(&w0, tp, 8);
+    std::memcpy(&w1, tp + 8, 8);
+    std::memcpy(&w2, tp + 16, 8);
+    std::memcpy(&w3, tp + 24, 8);
+    const u8 view_key = ViewKeyOf(desc);
+    const u8 type = static_cast<u8>(desc.type);
+    const auto key_matches = [&](const FindImageMemoEntry& c) {
+        return c.valid && c.tsharp_raw[0] == w0 && c.tsharp_raw[1] == w1 && c.tsharp_raw[2] == w2 &&
+               c.tsharp_raw[3] == w3 && c.type == type && c.view_key == view_key;
+    };
+    FindImageMemoEntry* set = nullptr;
+    const u32 ways = memo_ways == 0 ? 1u : memo_ways;
+    u32 way = 0;
+    bool matched = false;
+    // findimg_slot_hint: the entry this binding ordinal last matched is tried
+    // first. It is a probe-order choice, not a certificate: it must pass the
+    // scan's full key compare, and since no two valid ways hold one key a
+    // hinted match is the entry the scan would have returned.
+    if (hint != nullptr) {
+        ++findimg_hint_probes_;
+        const u16 h = *hint;
+        if (h == ImageDesc::NoMemoSlot) {
+            ++findimg_hint_none_;
+        } else {
+            FindImageMemoEntry& c = find_image_memo_[h];
+            if (key_matches(c)) {
+                way = h & (ways - 1);
+                set = &c - way;
+                matched = true;
+                ++findimg_hint_hits_;
+            }
+        }
+    }
+    if (!matched) {
+        if (memo_ways == 0) {
+            set = &find_image_memo_[((w0 >> 8) ^ (w0 >> 40) ^ w1 ^ view_key) & 1023];
+        } else {
+            // Each T# word gets its own odd multiplier; the top bits are taken
+            // because a product's low bits see only the low input bits.
+            const u64 mix = (w0 ^ view_key) * 0x9E3779B97F4A7C15ULL + w1 * 0xC2B2AE3D27D4EB4FULL +
+                            (w2 ^ w3) * 0x165667B19E3779F9ULL;
+            set = &find_image_memo_[(mix >> memo_set_shift) * memo_ways];
+        }
+        // Hit predicate: identical T#, same binding class, texture-cache structure
+        // untouched since populate (tex_gen covers register/unregister/delete and
+        // both rebind arms, so the slot provably was not reused), and the image
+        // itself still carries the recorded identity. No two valid ways hold the
+        // same key: a populate happens only after no valid way matched.
+        while (way < ways && !key_matches(set[way])) {
+            ++way;
+        }
+        matched = way < ways;
+    }
+    bool would_hit = false;
+    if (!matched) {
+        // No valid way holds the key: a free way makes this a cold miss,
+        // otherwise the least recently used way is the conflict victim.
+        way = MemoVictim(set, ways);
+        if (set[way].valid) {
+            ++ctr.miss_key;
+        } else {
+            ++ctr.miss_cold;
+        }
+    } else if (!deferred) {
+        ++ctr.veto[1];
+    } else if (set[way].tex_gen != tex_gen) {
+        ++ctr.miss_gen[LaneTex];
+    } else if (findimg_trust_gen) {
+        // Register, unregister and slot delete all bump the generation, so an
+        // equal one certifies the entry's image identity without the record.
+        would_hit = true;
+    } else {
+        const Image& image = slot_images[set[way].image_id];
+        if (image.image_uid != set[way].image_uid ||
+            False(image.flags & ImageFlagBits::Registered)) {
+            ++ctr.veto[0];
+        } else {
+            would_hit = true;
+        }
+    }
+    FindImageMemoEntry& e = set[way];
+    const size_t slot = static_cast<size_t>(&e - find_image_memo_.data());
+    if (hint != nullptr) {
+        // The entry a hit read or the slow arm will write: valid to hint at
+        // either way, since the next probe re-checks the key.
+        *hint = static_cast<u16>(slot);
+    }
+    if (matched && ways > 1) {
+        e.touch_stamp = ++findimg_touch_seq_;
+    }
+    if (timed) {
+        RecordGuardSample(sc, ctr, t0);
+    }
+    if (would_hit) {
+        ++ctr.hits;
+        if (memo_ways != 0) {
+            ++findimg_way_hits_[way];
+        }
+        if (sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
+            // Consumed hit: replicate the slow path's residual effects (access
+            // stamps, LRU touch, overlap view rebase). With findimg_trust_gen they
+            // run once per entry per gc tick.
+            if (!findimg_trust_gen || e.lru_tick != gc_tick) {
+                e.lru_tick = gc_tick;
+                Image& image = slot_images[e.image_id];
+                image.tick_accessed_last = scheduler.CurrentTick();
+                image.gc_tick_accessed_last = gc_tick;
+                TouchImage(image);
+            }
+            desc.view_info = e.view_info;
+            desc.view_ready = true;
+            if (view_memo) {
+                desc.memo_view = e.view_handle;
+                desc.memo_backing = e.view_backing;
+                desc.memo_slot = static_cast<u16>(slot);
+                if (bind_noop) {
+                    desc.memo_bind_epoch = e.bind_epoch;
+                    desc.memo_bind_layout = e.bind_layout;
+                }
+            }
+            return e.image_id;
+        }
+    }
+    return FindImageMemoizedSlow(desc, tsharp, e,
+                                 u64{ways} | u64{matched} << 8 | u64{would_hit} << 9 |
+                                     u64{deferred} << 10 | u64{timed} << 11,
+                                 tex_gen);
+}
+
+SHAD_NO_INLINE bool TextureCache::GateTsharp(const AmdGpu::Image& tsharp) {
+    ++tsgate_calls_;
+    if (IsMeta(tsharp.Address())) [[unlikely]] {
+        LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
+    }
+    const auto data_fmt = tsharp.GetDataFmt();
+    const auto num_fmt = tsharp.GetNumberFmt();
+    if (data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+        ++tsgate_rejects_;
+        return false;
+    }
+    if (!Core::Memory::Instance()->IsValidGpuMapping(tsharp.Address(), 0) ||
+        !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+        // Takes the whole sharp: pitch and width are bitfields and cannot bind
+        // to a reference of their own.
+        LOG_WARNING(Render_Vulkan,
+                    "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
+                    "data_format={}, num_format={}",
+                    tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
+                    static_cast<u32>(num_fmt));
+        ++tsgate_rejects_;
+        return false;
+    }
+    return true;
+}
+
+ImageId TextureCache::FindImageMemoizedSlow(ImageDesc& desc, const AmdGpu::Image& tsharp,
+                                            FindImageMemoEntry& e, u64 packed, u64 tex_gen) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Framework::Instance();
+    constexpr auto kCache = CacheId::FindImage;
+    auto& ctr = sc.Counters(kCache);
+    const u32 ways = static_cast<u32>(packed & 0xFF);
+    const bool matched = ((packed >> 8) & 1) != 0;
+    const bool would_hit = ((packed >> 9) & 1) != 0;
+    const bool deferred = ((packed >> 10) & 1) != 0;
+    const bool timed = ((packed >> 11) & 1) != 0;
+    // A primed desc (bind_image_lean) still carries the previous binding's memo
+    // fields; the gate below must never let a stale slot reach the bind no-op
+    // memo, which indexes it unchecked.
+    desc.ClearMemo();
+    // No valid way can hold a failing T#, so matched and would_hit are false
+    // here and nothing the verify or populate would have counted is skipped.
+    if (memo_first && !GateTsharp(tsharp)) [[unlikely]] {
+        return ImageId{};
+    }
+    // Recomputed from the entry, never from set_index * ways: with one way the
+    // index is masked, not multiplied.
+    const size_t slot = static_cast<size_t>(&e - find_image_memo_.data());
+    // The slot the bind no-op memo indexes; the consumed hit writes its own.
+    if (view_memo) {
+        desc.memo_slot = static_cast<u16>(slot);
+    }
+    const u8 view_key = ViewKeyOf(desc);
+    // Authoritative path, exactly once; prediction is only compared, never
+    // served, outside the consumed-hit flow above.
+    const ImageId predicted = would_hit ? e.image_id : ImageId{};
+    const u64 m0 = timed && !would_hit ? sc.Now() : 0;
+    desc.EnsureViewInfo();
+    const ImageId real = FindImage(desc);
+    if (timed && !would_hit) {
+        ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
+        ++ctr.miss_samples;
+    }
+    if (would_hit && sc.GetState(kCache) != State::Learning) {
+        if (predicted == real && e.view_info == desc.view_info) {
+            sc.RecordVerifyClean(kCache);
+            // A lost valid bit is the range-scoped form of a generation change:
+            // FindImage above can register or free an image intersecting this T#
+            // range and that walk clears the entry. Always false with the
+            // setting off, where only a probe writes the bit.
+        } else if (!e.valid || MemoGenNow(sc, img_memo_gen_, findimg_range_inval) != tex_gen) {
+            sc.RecordVerifyAborted(kCache);
+            e.valid = false;
+        } else {
+            sc.RecordDivergence(kCache, "memoized image id or view rebase mismatch");
+            e.valid = false;
+        }
+    }
+    if (!would_hit && deferred) {
+        // Populate with commit re-check: a structural mutation racing the
+        // build leaves the entry invalid. The previous occupant's handle
+        // never carries over.
+        if (memo_ways != 0 && !matched && e.valid) {
+            ++findimg_evictions_;
+        }
+        e.valid = false;
+        e.tsharp_raw = std::bit_cast<std::array<u64, 4>>(tsharp);
+        e.type = static_cast<u8>(desc.type);
+        e.view_key = view_key;
+        e.image_id = real;
+        e.lru_tick = 0;
+        e.view_info = desc.view_info;
+        e.view_handle = vk::ImageView{};
+        e.view_backing = nullptr;
+        e.bind_epoch = 0;
+        e.bind_layout = {};
+        {
+            const Image& image = slot_images[real];
+            e.image_uid = image.image_uid;
+        }
+        e.tex_gen = tex_gen;
+        if (findimg_range_inval) {
+            // The range this entry answers for: every register or unregister
+            // intersecting it clears the entry, which is what the equal
+            // generation certifies under the setting. FindImage engaged the
+            // info above, and a registered image's range never moves.
+            const auto& info = desc.Info();
+            memo_range_[slot] = MemoRangeOf(info.guest_address, info.guest_size);
+        }
+        if (MemoGenNow(sc, img_memo_gen_, findimg_range_inval) == tex_gen) {
+            e.valid = true;
+            sc.NotifyPopulated(kCache);
+        }
+        // Stamped on every populate, a failed commit included, so a written way
+        // never outranks a valid one at the next victim scan.
+        if (ways > 1) {
+            e.touch_stamp = ++findimg_touch_seq_;
+        }
+    }
+    return real;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
-    const auto& info = desc.info;
+    // Materialized first: the view is rebased below, so a deferred one is built first.
+    desc.EnsureViewInfo();
+    const auto& info = desc.Info();
     ASSERT(info.guest_address != 0);
+
+    // Exact-address fast path over the bucket of the base page, which holds every image
+    // based at the address. The filters below mirror the perfect-match loop exactly (last
+    // match wins, in registration order); any demotion or exact-format miss falls through
+    // to the walk.
+    if (info.guest_size > 0) {
+        if (const auto bucket = page_table.find(info.guest_address >> Traits::PAGE_BITS)) {
+            u32 cands = 0;
+            ImageId match{};
+            AddrFilter match_rec{};
+            const u32 want_type = static_cast<u32>(info.type);
+            for (const BucketEntry& entry : bucket->entries) {
+                if (entry.Address() != info.guest_address) {
+                    continue;
+                }
+                ++cands;
+                const AddrFilter rec = AddrFilterOf(entry.id.index);
+                if (rec.guest_size != info.guest_size) {
+                    continue;
+                }
+                if (rec.size != info.size) {
+                    continue;
+                }
+                if (!IsVulkanFormatCompatible(rec.pixel_format, info.pixel_format) ||
+                    (rec.type != want_type && info.size != Extent3D{1, 1, 1})) {
+                    continue;
+                }
+                if (exact_fmt && info.pixel_format != rec.pixel_format) {
+                    continue;
+                }
+                match = entry.id;
+                match_rec = rec;
+            }
+            if (cands != 0) {
+                ++addr_filter_calls_;
+                addr_filter_cands_ += cands;
+                if (match && match_rec.resources >= info.resources) {
+                    Image& image = slot_images[match];
+                    DEBUG_ASSERT(image.info.guest_size == match_rec.guest_size &&
+                                 image.info.pixel_format == match_rec.pixel_format &&
+                                 static_cast<u32>(image.info.type) == match_rec.type &&
+                                 image.info.resources == match_rec.resources &&
+                                 image.info.size == match_rec.size);
+                    ++addr_filter_fast_;
+                    image.tick_accessed_last = scheduler.CurrentTick();
+                    image.gc_tick_accessed_last = gc_tick;
+                    TouchImage(image);
+                    return match;
+                }
+                ++addr_filter_walk_;
+            }
+        }
+    }
 
     SmallVector<ImageId, 8> image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
@@ -546,21 +1125,50 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         image_id = cache_id;
     }
 
-    // Try to resolve overlaps (if any)
     int view_mip{-1};
     int view_slice{-1};
+    // Mirrors the validation FindImageSlow re-runs; side effect free, so double
+    // evaluation on the slow route is safe. !image_id must stay the first
+    // disjunct: the short circuit keeps a null id from indexing slot_images.
+    if (!image_id || (exact_fmt && info.pixel_format != slot_images[image_id].info.pixel_format) ||
+        slot_images[image_id].info.resources < info.resources) [[unlikely]] {
+        image_id = FindImageSlow(desc, exact_fmt, image_id, image_ids, view_mip, view_slice);
+    }
+
+    Image& image = slot_images[image_id];
+    image.tick_accessed_last = scheduler.CurrentTick();
+    image.gc_tick_accessed_last = gc_tick;
+    TouchImage(image);
+
+    // If the image requested is a subresource of the image from cache record its location.
+    if (view_mip > 0) {
+        desc.view_info.range.base.level = view_mip;
+    }
+    if (view_slice > 0) {
+        desc.view_info.range.base.layer = view_slice;
+    }
+
+    return image_id;
+}
+
+ImageId TextureCache::FindImageSlow(ImageDesc& desc, bool exact_fmt, ImageId image_id,
+                                    const SmallVector<ImageId, 8>& image_ids, int& out_view_mip,
+                                    int& out_view_slice) {
+    const auto& info = desc.Info();
+
+    // Try to resolve overlaps (if any)
     if (!image_id) {
         for (const auto& cache_id : image_ids) {
-            view_mip = -1;
-            view_slice = -1;
+            out_view_mip = -1;
+            out_view_slice = -1;
 
             const auto& merged_info = image_id ? slot_images[image_id].info : info;
             auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
                 ResolveOverlap(merged_info, desc.type, cache_id, image_id);
             if (overlap_image_id) {
                 image_id = overlap_image_id;
-                view_mip = overlap_view_mip;
-                view_slice = overlap_view_slice;
+                out_view_mip = overlap_view_mip;
+                out_view_slice = overlap_view_slice;
             }
         }
     }
@@ -582,19 +1190,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
-
-    Image& image = slot_images[image_id];
-    image.tick_accessed_last = scheduler.CurrentTick();
-    TouchImage(image);
-
-    // If the image requested is a subresource of the image from cache record its location.
-    if (view_mip > 0) {
-        desc.view_info.range.base.level = view_mip;
-    }
-    if (view_slice > 0) {
-        desc.view_info.range.base.layer = view_slice;
-    }
-
     return image_id;
 }
 
@@ -625,18 +1220,62 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
-ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+vk::ImageView TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
-        image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
-            image.info.guest_address != 0) {
-            std::unique_lock lk{download_images_mutex};
-            download_images.emplace(image_id);
+        FindTextureStorage(image, image_id);
+    } else if (image_update_direct) {
+        UpdateImage(image, image_id);
+    } else {
+        MaybeUpdateImage(image_id);
+    }
+    // The update above can switch the backing, so the memoized handle is
+    // taken only while its backing is the live one. A recorded handle is a
+    // view of that backing for the image's lifetime: views die only in
+    // DeleteImage, which bumps tex_gen, and backing_images only grows.
+    if (desc.memo_view && desc.memo_backing == image.backing) {
+        ++view_memo_hits_;
+        return desc.memo_view;
+    }
+    return FindTextureSlow(image, image_id, desc);
+}
+
+void TextureCache::FindTextureStorage(Image& image, ImageId image_id) {
+    image.flags |= ImageFlagBits::GpuModified;
+    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+        image.info.guest_address != 0) {
+        std::unique_lock lk{download_images_mutex};
+        download_images.emplace(image_id);
+    }
+    UpdateImage(image, image_id);
+    PhotoReadback::Track(image, image_id);
+}
+
+vk::ImageView TextureCache::FindTextureSlow(Image& image, ImageId image_id, const ImageDesc& desc) {
+    const vk::ImageView handle = image.FindViewHandle(desc.view_info);
+    if (desc.memo_slot != ImageDesc::NoMemoSlot) {
+        // Write-back under the full key: the binding passes run all probes
+        // before any FindTexture, so the slot may have been repopulated by
+        // another T# in between. tex_gen is left out: a stale-gen entry
+        // getting a handle is dead-written and cleared on the next populate.
+        ++view_memo_slow_;
+        FindImageMemoEntry& e = find_image_memo_[desc.memo_slot];
+        if (MemoEntryMatches(e, desc, image_id)) {
+            if (e.view_handle && e.view_backing == image.backing && e.view_handle != handle) {
+                VideoCore::Skipcache::Framework::Instance().RecordDivergence(
+                    VideoCore::Skipcache::CacheId::FindImage, "memoized view handle mismatch");
+                e.valid = false;
+            } else {
+                // Epochs are per backing and each starts at 1, so a recorded
+                // no-op belongs to the backing recorded with it.
+                e.view_handle = handle;
+                e.view_backing = image.backing;
+                e.bind_epoch = 0;
+                ++view_memo_writebacks_;
+            }
         }
     }
-    UpdateImage(image_id);
-    return image.FindView(desc.view_info);
+    return handle;
 }
 
 void TextureCache::RegisterMeta(VAddr address, MetaDataInfo info) {
@@ -665,6 +1304,7 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+    const ImageInfo& rt_info = desc.Info();
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
@@ -672,15 +1312,17 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
-    UpdateImage(image_id);
+    UpdateImage(image, image_id);
+    PhotoReadback::Track(image, image_id);
 
     // Register meta data for this color buffer
-    const VAddr cmask_addr = desc.info.meta_info.cmask_addr;
+    const VAddr cmask_addr = rt_info.meta_info.cmask_addr;
     if (image.info.meta_info.cmask_addr != cmask_addr) {
         UnregisterMeta(image.info.meta_info.cmask_addr, image.image_uid);
         image.info.meta_info.cmask_addr = cmask_addr;
     }
     if (cmask_addr) {
+        MetaBloomInsert(cmask_addr);
         RegisterMeta(cmask_addr, MetaDataInfo{
                                      .type = MetaType::CMask,
                                      .owner_id = image_id,
@@ -689,12 +1331,13 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
                                  });
     }
 
-    const VAddr fmask_addr = desc.info.meta_info.fmask_addr;
+    const VAddr fmask_addr = rt_info.meta_info.fmask_addr;
     if (image.info.meta_info.fmask_addr != fmask_addr) {
         UnregisterMeta(image.info.meta_info.fmask_addr, image.image_uid);
         image.info.meta_info.fmask_addr = fmask_addr;
     }
     if (fmask_addr) {
+        MetaBloomInsert(fmask_addr);
         RegisterMeta(fmask_addr, MetaDataInfo{
                                      .type = MetaType::FMask,
                                      .owner_id = image_id,
@@ -707,18 +1350,20 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 }
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+    const ImageInfo& dsc_info = desc.Info();
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
-    UpdateImage(image_id);
+    UpdateImage(image, image_id);
 
     // Register meta data for this depth buffer
-    const VAddr htile_addr = desc.info.meta_info.htile_addr;
+    const VAddr htile_addr = dsc_info.meta_info.htile_addr;
     if (image.info.meta_info.htile_addr != htile_addr) {
         UnregisterMeta(image.info.meta_info.htile_addr, image.image_uid);
         image.info.meta_info.htile_addr = htile_addr;
     }
     if (htile_addr) {
+        MetaBloomInsert(htile_addr);
         RegisterMeta(htile_addr, MetaDataInfo{
                                      .type = MetaType::HTile,
                                      .owner_id = image_id,
@@ -728,9 +1373,125 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
                                  });
     }
 
-    AssociateStencil(image_id, desc.info);
+    AssociateStencil(image_id, dsc_info);
 
     return image.FindView(desc.view_info, false);
+}
+
+// The fast tier runs per image binding per draw; every path that dirties
+// or untracks an image marks the fast state, so a clean read proves the full
+// pass a no-op. The image_fast_state toggle latched at construction gates it.
+void TextureCache::UpdateImage(Image& image, ImageId image_id) {
+    const u64 now_tick = scheduler.CurrentTick();
+    if (!image_fast_state || !UpdateImageFast(image, now_tick)) {
+        UpdateImageSlow(image_id, now_tick);
+    }
+}
+
+void TextureCache::UpdateImage(ImageId image_id) {
+    const u64 now_tick = scheduler.CurrentTick();
+    // Every caller has already dereferenced this id: Presenter::PrepareFrame
+    // passes a FindImage result, and MaybeUpdateImage's callers (FindTexture,
+    // Rasterizer::BeginRendering) hold a live Image& for it.
+    if (image_fast_state && UpdateImageFast(slot_images[image_id], now_tick)) {
+        return;
+    }
+    UpdateImageSlow(image_id, now_tick);
+}
+
+void TextureCache::UpdateImageSlow(ImageId image_id, u64 now_tick) {
+    Image& image = slot_images[image_id];
+    if (!image_fast_state) {
+        TouchImage(image);
+        TrackImage(image_id);
+        RefreshImage(image);
+        return;
+    }
+    // Verify tier: the check and the restamp hold the image mutex, which the fault
+    // paths hold while they mark the image dirty, so no dirty mark is overwritten.
+    const auto tracked_ok = [&] {
+        const VAddr begin = image.info.guest_address;
+        const VAddr end = begin + image.info.guest_size;
+        return !image.IsUntracked() && begin == image.track_addr && end == image.track_addr_end;
+    };
+    {
+        std::scoped_lock lk{image.mutex};
+        const bool needs_refresh = True(image.flags & ImageFlagBits::Dirty) || !tracked_ok();
+        const bool needs_touch = now_tick - image.tick_accessed_last > kTouchIntervalTicks;
+        if (!needs_refresh && !needs_touch) {
+            update_relock_ += image_update_direct;
+            image.UpdateFastState(now_tick, true);
+            return;
+        }
+    }
+    update_full_ += image_update_direct;
+    TrackImage(image_id);
+    TouchImage(image);
+    RefreshImage(image);
+    image.tick_accessed_last = now_tick;
+    image.gc_tick_accessed_last = gc_tick;
+    std::scoped_lock lk{image.mutex};
+    if (False(image.flags & ImageFlagBits::Dirty) && tracked_ok()) {
+        image.UpdateFastState(now_tick, true);
+    }
+}
+
+void TextureCache::MaybeUpdateImage(ImageId image_id) {
+    using namespace VideoCore::Skipcache;
+    auto& sc = Framework::Instance();
+    constexpr auto kCache = CacheId::UpdateImageDedup;
+    // The bool first: ShouldProbe advances the Learning burst counters.
+    if (image_update_direct || !sc.Active() || !sc.ShouldProbe(kCache)) {
+        UpdateImage(image_id);
+        return;
+    }
+    auto& ctr = sc.Counters(kCache);
+    ++ctr.eligible;
+    const bool timed = sc.SampleTimer(kCache);
+    const u64 t0 = timed ? sc.Now() : 0;
+    const DrawToken t = sc.Capture(0, scheduler.CurrentTick());
+    const u32 index = image_id.index;
+    const bool would_hit = sc.DedupProbe(index, t);
+    if (timed) {
+        ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
+        ++ctr.guard_samples;
+    }
+    if (!would_hit) {
+        ++ctr.miss_key;
+        const u64 m0 = timed ? sc.Now() : 0;
+        UpdateImage(image_id);
+        if (timed) {
+            ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
+            ++ctr.miss_samples;
+        }
+        sc.DedupCommit(index, t);
+        return;
+    }
+    ++ctr.hits;
+    if (sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
+        return; // consumed hit: same image, same tick, all lanes unchanged
+    }
+    if (sc.GetState(kCache) == State::Learning) {
+        // Observe-only: instruments never change behavior.
+        UpdateImage(image_id);
+        return;
+    }
+    // Predict-then-execute. Premise (read-only whitelist): the dirty flags a
+    // redundant UpdateImage would find must be clear.
+    const bool premise_clean = False(slot_images[image_id].flags & ImageFlagBits::Dirty);
+    UpdateImage(image_id); // authoritative path, exactly once
+    if (premise_clean) {
+        sc.RecordVerifyClean(kCache);
+    } else {
+        // A racing CPU fault legitimately sets a dirty flag between the
+        // hit-check and here; a moved lane means aborted, not divergence.
+        const DrawToken t2 = sc.Capture(0, scheduler.CurrentTick());
+        if (t2.mem_gen != t.mem_gen || t2.tex_gen != t.tex_gen) {
+            sc.RecordVerifyAborted(kCache);
+        } else {
+            sc.RecordDivergence(kCache, "dirty flags set under equal lanes");
+        }
+    }
 }
 
 void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_info) {
@@ -838,8 +1599,73 @@ void TextureCache::RefreshImage(Image& image) {
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth) {
-    // Compare and plain uses of one S# need separate samplers.
-    const u64 hash = HashCombine(XXH3_64bits(&sharp, sizeof(sharp)), is_depth);
+    using namespace VideoCore::Skipcache;
+    auto& sc = Framework::Instance();
+    constexpr auto kCache = CacheId::Sampler;
+    static_assert(sizeof(AmdGpu::Sampler) == 16);
+    ++sampler_calls_;
+    // Compare and plain uses of one S# need separate samplers, so the key carries
+    // is_depth in the S#'s reserved word-3 bits 12..29 (raw1 bits 44..61, between
+    // border_color_ptr and border_color_type), which are masked out.
+    constexpr u64 kReservedBits = u64{0x3FFFF} << 44;
+    auto raw = std::bit_cast<std::array<u64, 2>>(sharp);
+    raw[1] = (raw[1] & ~kReservedBits) | (u64{is_depth} << 44);
+    // Every S# field reaches the set index: the filters, max_lod, border color
+    // and clamp modes all sit above the low bits of either word.
+    const u64 mix = (raw[0] ^ (raw[1] * 0x9E3779B97F4A7C15ULL)) * 0xC2B2AE3D27D4EB4FULL;
+    SamplerMemoEntry* const set = &sampler_memo_[(mix >> 56) * 2];
+    SamplerMemoEntry* e = nullptr;
+    // Word compares: the array compare spilled both key words to build one
+    // vector test, and a vector load over two scalar stores cannot forward.
+    if (set[0].handle && set[0].key[0] == raw[0] && set[0].key[1] == raw[1]) {
+        e = &set[0];
+    } else if (set[1].handle && set[1].key[0] == raw[0] && set[1].key[1] == raw[1]) {
+        e = &set[1];
+    }
+    const bool fast_active = sc.ActiveMode() == Mode::Adaptive || sc.ActiveMode() == Mode::Forced;
+    if (fast_active && e) {
+        // An equal touch tick makes the LRU touch a no-op, so the hit reduces
+        // to returning the memoized handle.
+        if (e->touch_tick != static_cast<u32>(gc_tick)) {
+            sampler_lru_cache.Touch(slot_samplers[e->id], gc_tick);
+            e->touch_tick = static_cast<u32>(gc_tick);
+            ++sampler_touches_;
+        }
+        return e->handle;
+    }
+    const bool probing = sc.Active() && sc.ShouldProbe(kCache);
+    bool would_hit = false;
+    bool timed = false;
+    u64 t0 = 0;
+    if (probing) {
+        auto& ctr = sc.Counters(kCache);
+        ++ctr.eligible;
+        timed = sc.SampleTimer(kCache);
+        t0 = timed ? sc.Now() : 0;
+        // The memo mirrors the map key exactly (the S# bytes plus the compare flag).
+        if (e) {
+            would_hit = true;
+            ++ctr.hits;
+        } else if (!set[0].handle && !set[1].handle) {
+            ++ctr.miss_cold;
+        } else {
+            ++ctr.miss_key;
+        }
+        if (timed) {
+            ctr.guard_ns += sc.CorrectSample(sc.Now() - t0);
+            ++ctr.guard_samples;
+        }
+        if (would_hit && sc.MayConsume(kCache) && !sc.ShouldVerify(kCache)) {
+            // Consumed hit still touches the LRU: never starve the GC the
+            // cache depends on.
+            sampler_lru_cache.Touch(slot_samplers[e->id], gc_tick);
+            e->touch_tick = static_cast<u32>(gc_tick);
+            return e->handle;
+        }
+    }
+    const u64 m0 = timed && !would_hit ? sc.Now() : 0;
+    ++sampler_slow_;
+    const u64 hash = XXH3_64bits(raw.data(), sizeof(raw));
     const auto [it, new_sampler] = samplers.try_emplace(hash);
     if (new_sampler) {
         it->second = slot_samplers.Insert(instance, sharp, border_color_base, is_depth);
@@ -847,10 +1673,73 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
         sampler.hash = hash;
         sampler_lru_cache.Insert(sampler, gc_tick);
     }
-
     Sampler& sampler = slot_samplers[it->second];
     sampler_lru_cache.Touch(sampler, gc_tick);
-    return sampler.Handle();
+    const vk::Sampler handle = sampler.Handle();
+    if (timed && !would_hit) {
+        auto& ctr = sc.Counters(kCache);
+        ctr.miss_ns += sc.CorrectSample(sc.Now() - m0);
+        ++ctr.miss_samples;
+    }
+    if (probing && would_hit && sc.GetState(kCache) != State::Learning) {
+        if (e->handle == handle) {
+            sc.RecordVerifyClean(kCache);
+        } else {
+            sc.RecordDivergence(kCache, "sampler handle mismatch");
+            e->handle = vk::Sampler{};
+        }
+    }
+    if (!would_hit && (probing || fast_active)) {
+        // e is null on every path that reaches here: the fast arm returned
+        // whenever fast_active && e, and under probing would_hit == (e != nullptr).
+        // The touch tick is stamped right after Insert/Touch at gc_tick, so an
+        // equal stamp implies the LRU item tick equals gc_tick. Ticks tie
+        // within a submit, so the eviction falls back to way 0.
+        SamplerMemoEntry* victim;
+        if (!set[0].handle) {
+            victim = &set[0];
+        } else if (!set[1].handle) {
+            victim = &set[1];
+        } else {
+            victim = set[0].touch_tick <= set[1].touch_tick ? &set[0] : &set[1];
+        }
+        *victim = SamplerMemoEntry{
+            .key = raw,
+            .handle = handle,
+            .id = it->second,
+            .touch_tick = static_cast<u32>(gc_tick),
+        };
+        if (probing) {
+            sc.NotifyPopulated(kCache);
+        }
+    }
+    return handle;
+}
+
+bool TextureCache::MemoEntryMatches(const FindImageMemoEntry& e, const ImageDesc& desc,
+                                    ImageId image_id) const {
+    const u8 view_key = ViewKeyOf(desc);
+    return e.valid && e.image_id == image_id && e.type == static_cast<u8>(desc.type) &&
+           e.view_key == view_key &&
+           e.tsharp_raw == std::bit_cast<std::array<u64, 4>>(desc.deferred_tsharp) &&
+           e.view_info == desc.view_info;
+}
+
+void TextureCache::RecordBindNoop(ImageId image_id, const ImageDesc& desc,
+                                  vk::ImageLayout dst_layout) {
+    FindImageMemoEntry& e = find_image_memo_[desc.memo_slot];
+    const Image& image = slot_images[image_id];
+    if (!MemoEntryMatches(e, desc, image_id) || e.view_backing != image.backing) {
+        return;
+    }
+    // A no-op answered now repeats until the backing's epoch moves; the layout
+    // stored with it is the one the descriptor reads.
+    const bool noop = image.BarriersNoop(dst_layout, vk::AccessFlagBits2::eShaderRead,
+                                         Image::kShaderReadStages, desc.view_info.range);
+    e.bind_epoch = noop ? image.backing->state_epoch : 0;
+    e.bind_layout = image.backing->state.layout;
+    ++bind_noop_records_;
+    bind_noop_zero_ += !noop;
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
@@ -862,13 +1751,32 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
     ASSERT_MSG((info.guest_address & 0xff) == 0, "Trying to register an unaligned image");
-    ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {
-        page_table[page].entries.emplace_back(BucketEntry{
-            .key = u32(info.guest_address >> 8),
-            .size = info.guest_size,
-            .id = image_id,
+    // The record must exist before the id is reachable through the page table,
+    // which unlocked readers walk.
+    AddrFilterOf(image_id.index) = AddrFilter{
+        .guest_size = image.info.guest_size,
+        .pixel_format = image.info.pixel_format,
+        .type = static_cast<u32>(image.info.type),
+        .resources = image.info.resources,
+        .size = image.info.size,
+    };
+    {
+        // The coverage bit precedes the page table entry, which the unlocked
+        // fault probe relies on.
+        std::scoped_lock lk{cover_mutex_};
+        CoverSet(info.guest_address, info.guest_size);
+        ForEachPage(info.guest_address, info.guest_size, [this, image_id, info](u64 page) {
+            page_table[page].entries.emplace_back(BucketEntry{
+                .key = u32(info.guest_address >> 8),
+                .size = info.guest_size,
+                .id = image_id,
+            });
         });
-    });
+    }
+    if (findimg_range_inval) {
+        InvalidateMemoForImage(info);
+    }
+    Skipcache::Framework::Instance().BumpTexGen();
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
@@ -878,15 +1786,102 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
-    ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
-        const auto page_it = page_table.find(page);
-        ASSERT_MSG(page_it, "Unregistering unregistered page={:#x}", page << Traits::PAGE_BITS);
-        auto& entries = page_it->entries;
-        const auto vector_it = std::ranges::find(entries, image_id, &BucketEntry::id);
-        ASSERT_MSG(vector_it != entries.end(), "Unregistering unregistered image in page={:#x}",
-                   page << Traits::PAGE_BITS);
-        entries.erase(vector_it);
-    });
+    {
+        std::scoped_lock lk{cover_mutex_};
+        ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
+            const auto page_it = page_table.find(page);
+            ASSERT_MSG(page_it, "Unregistering unregistered page={:#x}", page << Traits::PAGE_BITS);
+            auto& entries = page_it->entries;
+            const auto vector_it = std::ranges::find(entries, image_id, &BucketEntry::id);
+            ASSERT_MSG(vector_it != entries.end(), "Unregistering unregistered image in page={:#x}",
+                       page << Traits::PAGE_BITS);
+            entries.erase(vector_it);
+        });
+        CoverRecompute(image.info.guest_address, image.info.guest_size);
+    }
+    if (findimg_range_inval) {
+        InvalidateMemoForImage(image.info);
+    }
+    Skipcache::Framework::Instance().BumpTexGen();
+}
+
+TextureCache::MemoRange TextureCache::MemoRangeOf(VAddr addr, u64 size) noexcept {
+    // The walk may over-invalidate, never miss; a zero-size image still owns one
+    // page, matching FindImage's max(size, 1).
+    constexpr u64 MaxPage = std::numeric_limits<u32>::max();
+    constexpr u64 PageShift = 12;
+    const u64 lo = static_cast<u64>(addr) >> PageShift;
+    const u64 hi =
+        (static_cast<u64>(addr) + std::max<u64>(size, 1) + ((1ULL << PageShift) - 1)) >> PageShift;
+    const u32 lo_page = static_cast<u32>(std::min<u64>(lo, MaxPage - 1));
+    return MemoRange{lo_page, static_cast<u32>(std::clamp<u64>(hi, lo_page + 1, MaxPage))};
+}
+
+void TextureCache::MemoRangeWalk(const MemoRange* ranges, u32 count) {
+    if (count == 0) {
+        return;
+    }
+    ++memo_range_walks_;
+    // One pass for the whole burst: the union bound rejects the entries no
+    // freed image can touch with a single compare.
+    u32 lo_min = ranges[0].lo_page;
+    u32 hi_max = ranges[0].hi_page;
+    for (u32 b = 1; b < count; ++b) {
+        lo_min = std::min(lo_min, ranges[b].lo_page);
+        hi_max = std::max(hi_max, ranges[b].hi_page);
+    }
+    const size_t entries = memo_range_.size();
+    for (size_t i = 0; i < entries; ++i) {
+        const MemoRange e = memo_range_[i];
+        if (e.lo_page >= hi_max || lo_min >= e.hi_page) {
+            continue;
+        }
+        for (u32 b = 0; b < count; ++b) {
+            const MemoRange& r = ranges[b];
+            if (e.lo_page < r.hi_page && r.lo_page < e.hi_page) {
+                // Only entries that were live count: the measured disjoint
+                // fraction is inval versus the generation misses it replaces.
+                memo_range_inval_ += find_image_memo_[i].valid ? 1 : 0;
+                find_image_memo_[i].valid = false;
+                memo_range_[i] = MemoRange{};
+                break;
+            }
+        }
+    }
+}
+
+SHAD_NO_INLINE void TextureCache::InvalidateMemoRange(VAddr addr, u64 size) {
+    // The side array and the memo's valid bits are written by this walk and by
+    // the populate, both on the GPU command thread; InvalidateMemoForImage
+    // sends every other thread to a generation bump.
+    DEBUG_ASSERT_MSG(liverpool == nullptr || liverpool->OnGpuThread(),
+                     "image memo range invalidation off the GPU command thread");
+    const MemoRange r = MemoRangeOf(addr, size);
+    if (memo_range_batching_ && memo_range_batch_count_ < MemoRangeBatchMax) {
+        // Queued: the batch is flushed when the garbage collector pass that
+        // opened it ends, and no memo probe can run in between.
+        memo_range_batch_[memo_range_batch_count_++] = r;
+        return;
+    }
+    MemoRangeWalk(&r, 1);
+}
+
+void TextureCache::InvalidateMemoForImage(const ImageInfo& info) {
+    // Registration and unregistration also run on guest threads (the video-out
+    // registration route and UnmapMemory), which must not write the side array
+    // the memo probe reads. They bump the generation instead, after the page
+    // table edit, so no entry certified before the edit outlives it.
+    if (liverpool != nullptr && liverpool->OnGpuThread()) {
+        InvalidateMemoRange(info.guest_address, info.guest_size);
+    } else {
+        BumpImgMemoGen();
+    }
+}
+
+SHAD_NO_INLINE void TextureCache::FlushMemoRangeBatch() {
+    const u32 count = memo_range_batch_count_;
+    memo_range_batch_count_ = 0;
+    MemoRangeWalk(memo_range_batch_.data(), count);
 }
 
 void TextureCache::TrackImage(ImageId image_id) {
@@ -918,6 +1913,7 @@ void TextureCache::TrackImage(ImageId image_id) {
 
 void TextureCache::UntrackImage(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     if (image.IsUntracked()) {
         return;
     }
@@ -932,6 +1928,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
 
 void TextureCache::UntrackImageHead(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     const auto image_begin = image.info.guest_address;
     if (image.IsUntracked() || image_begin < image.track_addr) {
         return;
@@ -951,6 +1948,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
 
 void TextureCache::UntrackImageTail(ImageId image_id) {
     auto& image = slot_images[image_id];
+    image.MarkFastStateDirty();
     const auto image_end = image.info.guest_address + image.info.guest_size;
     if (image.IsUntracked() || image.track_addr_end < image_end) {
         return;
@@ -970,11 +1968,77 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+        u64 budget = 0;
+        if (instance.IsIntegrated()) {
+            instance.GetDeviceMemoryUsageAndBudget(total_used_memory, budget);
+        } else {
+            total_used_memory = instance.GetDeviceMemoryUsage();
+        }
+        // On integrated GPUs (Steam Deck) the usage covers the system-memory heaps, which hold
+        // far more than images (the buffers backing guest memory), while the startup budget
+        // keeps only what is left after an 8 GB system reserve (its 2 GB floor on the Deck).
+        // Usage then sat above the critical mark for good, and every submission evicted images
+        // used a few frames ago and uploaded them again. Compare with the driver's current
+        // budget instead. Ported from bbport (deadinside28/bloodborne_pc).
+        if (budget != 0) {
+            trigger_gc_memory = budget / 10 * 7;
+            pressure_gc_memory = budget / 100 * 85;
+            critical_gc_memory = budget / 100 * 95;
+        }
     }
-    if (total_used_memory < trigger_gc_memory) {
+    // Integrated GPUs (Steam Deck): images left unused for IdleSeconds go even below the trigger,
+    // so the textures of areas left behind do not pile up in the shared system memory until the
+    // budget marks are reached. Ported from bbport (deadinside28/bloodborne_pc).
+    constexpr u64 IdleSeconds = 20;
+    u64 idle_tick = 0;
+    if (instance.IsIntegrated()) {
+        const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+        if (second != gc_second) {
+            gc_second = second;
+            gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+        }
+        idle_tick = gc_tick_at_second[(second - IdleSeconds) % gc_tick_at_second.size()];
+    }
+    const bool below_trigger = total_used_memory < trigger_gc_memory;
+    if (below_trigger && idle_tick == 0) {
         return;
     }
+    lru_lazy_gc_runs_ += lru_lazy_touch;
+    u64 lazy_visits = 0;
+    bool lazy_hard = false;
+    // Every free in this pass queues its range and the memo is cleared in one walk
+    // when the pass ends; memo probes run on this thread, never inside the pass.
+    memo_range_batching_ = findimg_range_inval;
+    SCOPE_EXIT {
+        FlushMemoRangeBatch();
+        memo_range_batching_ = false;
+    };
+    if (below_trigger) {
+        // Idle pass: only images the CPU side can drop without a write-back (GPU-written ones
+        // stay), at most a few per collection and a bounded walk.
+        size_t idle_deletions = 10;
+        u32 visited = 0;
+        image_lru_cache.ForEachItemBelow(idle_tick, [&](Image& image) {
+            if (idle_deletions == 0 || ++visited > 256) {
+                return true;
+            }
+            if (image.gc_tick_accessed_last >= idle_tick) {
+                // Lazy touch mode: the list tick is only a lower bound; relink at gc_tick.
+                image_lru_cache.Touch(image, gc_tick);
+                return false;
+            }
+            if (image.SafeToDownload()) {
+                return false;
+            }
+            --idle_deletions;
+            FreeImage(slot_images.GetSlotId(image));
+            return false;
+        });
+        return;
+    }
+
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
@@ -986,8 +2050,20 @@ void TextureCache::GarbageCollectImages() {
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        lazy_hard |= pressured || aggresive;
     };
     const auto clean_up = [&](Image& image) {
+        if (lru_lazy_touch) {
+            ++lazy_visits;
+            // The list tick is only a lower bound in lazy mode, so an entry touched inside
+            // the walk window is relinked here, at gc_tick so the list stays sorted for
+            // ForEachItemBelow's early-out.
+            if (gc_tick - image.gc_tick_accessed_last < ticks_to_destroy) {
+                image_lru_cache.Touch(image, gc_tick);
+                ++lru_lazy_relinks_;
+                return false;
+            }
+        }
         if (num_deletions == 0) {
             return true;
         }
@@ -1006,6 +2082,7 @@ void TextureCache::GarbageCollectImages() {
             DownloadImageMemory(image_id);
         }
         FreeImage(image_id);
+        lru_lazy_frees_ += lru_lazy_touch;
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
@@ -1029,6 +2106,11 @@ void TextureCache::GarbageCollectImages() {
         configure(true);
         image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
+    // Per-pass worst case: a per300f total cannot tell an amortised pass from a
+    // one-off sweep of the whole live set after a long stretch below the trigger.
+    lru_lazy_visits_ += lazy_visits;
+    lru_lazy_maxvisit_ = std::max(lru_lazy_maxvisit_, lazy_visits);
+    lru_lazy_hard_ += lru_lazy_touch && lazy_hard;
 }
 
 void TextureCache::GarbageCollectSamplers() {
@@ -1038,6 +2120,7 @@ void TextureCache::GarbageCollectSamplers() {
     }
     bool pressured = false;
     bool aggresive = false;
+    bool erased = false;
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
 
@@ -1057,6 +2140,7 @@ void TextureCache::GarbageCollectSamplers() {
         samplers.erase(sampler.hash);
         const auto sampler_id = slot_samplers.GetSlotId(sampler);
         slot_samplers.Erase(sampler_id);
+        erased = true;
         return false;
     };
 
@@ -1069,12 +2153,32 @@ void TextureCache::GarbageCollectSamplers() {
         configure(true);
         sampler_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
+    if (erased) {
+        sampler_memo_.fill({});
+    }
 }
 
 void TextureCache::RunGarbageCollector() {
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;
+}
+
+// The victim is the first invalid way, else the way with the smallest touch
+// stamp; with one way the scan never reads the stamp line.
+u32 TextureCache::MemoVictim(const FindImageMemoEntry* set, u32 ways) const {
+    for (u32 w = 0; w < ways; ++w) {
+        if (!set[w].valid) {
+            return w;
+        }
+    }
+    u32 victim = 0;
+    for (u32 w = 1; w < ways; ++w) {
+        if (set[w].touch_stamp < set[victim].touch_stamp) {
+            victim = w;
+        }
+    }
+    return victim;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
@@ -1111,6 +2215,8 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
         slot_images.Erase(image_id);
     });
+    Skipcache::Framework::Instance().BumpTexGen();
+    PhotoReadback::Forget(image_id);
 }
 
 } // namespace VideoCore

@@ -3,6 +3,8 @@ version = 1
 [[annotations]]
 path = [
     "REUSE.toml",
+    "dist/**",
+    "docs/**",
     "CMakeSettings.json",
     "CMakePresets.json",
     ".github/FUNDING.yml",

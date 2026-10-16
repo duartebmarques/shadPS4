@@ -98,6 +98,11 @@ public:
         return capacity - free_list.size();
     }
 
+    /// One past the largest index Insert can return, fixed when the vector is created.
+    std::size_t MaxIndexCapacity() const noexcept {
+        return small_vector ? capacity : max_chunks * CHUNK_SIZE / sizeof(T);
+    }
+
 private:
     void SetStorageBit(u32 index) noexcept {
         stored_bitset[index / 64] |= u64(1) << (index % 64);

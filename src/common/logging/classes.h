@@ -115,6 +115,7 @@ enum class Class {
     Render,                  ///< Video Core
     Render_Vulkan,           ///< Vulkan backend
     Render_Recompiler,       ///< Shader recompiler
+    Render_Skipcache,        ///< Adaptive skip caches
     ShadNet,                 ///< shadNet binary protocol client
     ImGui,                   ///< ImGui
     Loader,                  ///< ROM loader

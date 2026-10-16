@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <numeric>
 #include <utility>
 
 #include "common/adaptive_mutex.h"
+#include "common/cpu_pause.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -20,6 +22,72 @@ using LockType = std::mutex;
 #endif
 
 /**
+ * The region lock: a bounded spin (tracker_lock_spin_rounds, see that setting for why) in
+ * front of the blocking acquire.
+ *
+ * Counter invariant: every increment sits inside the `rounds != 0` gate and
+ * must never be hoisted out of it; gpu_spin_rounds is non-zero on the
+ * GpuCommandProcessor thread alone (latched once in Liverpool::Process), and
+ * Drain() is called from Rasterizer::OnSubmit on that same thread. The
+ * counters are therefore GPU-command-thread confined and need no atomics.
+ */
+class RegionLock {
+public:
+    void lock() noexcept {
+        // Budget first: at 0 this stays the plain blocking acquire, no extra trylock.
+        const u32 rounds = gpu_spin_rounds;
+        if (rounds == 0) {
+            inner_.lock();
+            return;
+        }
+        if (inner_.try_lock()) {
+            return;
+        }
+        ++contended_;
+        for (u32 r = 0; r < rounds; ++r) {
+            for (int p = 0; p < SPINS_PER_ROUND; ++p) {
+                Common::CpuPause();
+            }
+            if (inner_.try_lock()) {
+                rounds_used_ += r + 1;
+                ++spun_;
+                return;
+            }
+        }
+        rounds_used_ += rounds;
+        ++blocked_;
+        inner_.lock();
+    }
+
+    void unlock() {
+        inner_.unlock();
+    }
+
+    struct Stats {
+        u64 contended;
+        u64 spun;
+        u64 blocked;
+        u64 rounds_used;
+    };
+    static Stats Drain() {
+        return Stats{std::exchange(contended_, u64{0}), std::exchange(spun_, u64{0}),
+                     std::exchange(blocked_, u64{0}), std::exchange(rounds_used_, u64{0})};
+    }
+
+    // Non-zero on the GPU command thread alone. See the counter invariant above.
+    static inline thread_local u32 gpu_spin_rounds{0};
+
+private:
+    static constexpr int SPINS_PER_ROUND = 16;
+
+    static inline u64 contended_{};
+    static inline u64 spun_{};
+    static inline u64 blocked_{};
+    static inline u64 rounds_used_{};
+    LockType inner_;
+};
+
+/**
  * Allows tracking CPU and GPU modification of pages in a contigious virtual address region.
  * Information is stored in bitsets for spacial locality and fast update of single pages.
  */
@@ -27,7 +95,8 @@ class RegionManager {
 public:
     explicit RegionManager(PageManager* tracker_, VAddr cpu_addr_)
         : tracker{tracker_}, cpu_addr{cpu_addr_},
-          readbacks_mode{EmulatorSettings.GetReadbacksMode()} {
+          readbacks_mode{EmulatorSettings.GetReadbacksMode()},
+          readback_offload{EmulatorSettings.IsReadbackOffload()} {
         cpu.Fill(true);
         gpu.Fill(false);
     }
@@ -182,6 +251,14 @@ public:
         }
     }
 
+    /// Sums the GPU write sequences of the words covering a range. Each sequence only grows, so
+    /// the sum changes whenever a GPU write is marked in the range.
+    u64 GpuWriteSeq(u64 offset, u64 size) const noexcept {
+        const auto bounds = GetBounds(offset, size);
+        return std::accumulate(gpu_write_seq.begin() + bounds.start_word,
+                               gpu_write_seq.begin() + bounds.end_word + 1, u64{0});
+    }
+
     void Lock(const Bounds& bounds) noexcept {
         mutex.lock();
     }
@@ -244,6 +321,9 @@ private:
         }
         if constexpr (gpu_op != StateOp::None) {
             gpu[index] = Apply<gpu_op>(gpu[index], mask);
+            if constexpr (gpu_op == StateOp::Set) {
+                ++gpu_write_seq[index];
+            }
             gpu.set_summary =
                 gpu[index] ? (gpu.set_summary | summary_bit) : (gpu.set_summary & ~summary_bit);
             gpu.clear_summary = gpu[index] != ~u64{0} ? (gpu.clear_summary | summary_bit)
@@ -292,7 +372,9 @@ private:
         if constexpr (iter_type == Type::GPU) {
             return any_set(gpu);
         } else if constexpr (gpu_op == StateOp::Set) {
-            return any_clear(gpu);
+            // With readback_offload a mark of pages already GPU modified still advances
+            // gpu_write_seq, so it is never skipped.
+            return readback_offload || any_clear(gpu);
         } else if constexpr (gpu_op == StateOp::Clear) {
             return any_set(gpu);
         } else {
@@ -332,9 +414,12 @@ private:
     PageManager* tracker;
     VAddr cpu_addr{};
     u32 readbacks_mode;
+    bool readback_offload{};
     RegionBits cpu;
     RegionBits gpu;
-    LockType mutex;
+    /// Advanced by every GPU mark of a word, including marks of pages already GPU modified.
+    std::array<u64, NUM_REGION_WORDS> gpu_write_seq{};
+    RegionLock mutex;
 };
 
 } // namespace VideoCore

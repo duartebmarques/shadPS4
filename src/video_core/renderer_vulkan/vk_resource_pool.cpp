@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "common/assert.h"
+#include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -102,23 +103,89 @@ vk::CommandBuffer CommandPool::Commit() {
     return cmd_buffers[index];
 }
 
+PipelineLayoutCache::Layouts PipelineLayoutCache::Acquire(
+    std::span<const vk::DescriptorSetLayoutBinding> bindings,
+    vk::DescriptorSetLayoutCreateFlags flags, const vk::PushConstantRange& push_constants,
+    std::string_view debug_name) {
+    // The key is the raw shape: flags, the push range and each binding's
+    // index, type, count and stages; equal keys are equal layouts.
+    std::string key;
+    key.reserve(16 + 16 * bindings.size());
+    const auto put = [&](const auto& v) {
+        key.append(reinterpret_cast<const char*>(&v), sizeof(v));
+    };
+    put(static_cast<u32>(flags));
+    put(static_cast<u32>(push_constants.stageFlags));
+    put(push_constants.offset);
+    put(push_constants.size);
+    for (const auto& b : bindings) {
+        ASSERT(b.pImmutableSamplers == nullptr);
+        put(b.binding);
+        put(static_cast<u32>(b.descriptorType));
+        put(b.descriptorCount);
+        put(static_cast<u32>(b.stageFlags));
+    }
+    auto [it, inserted] = layouts.try_emplace(std::move(key));
+    if (inserted) {
+        const auto device = instance.GetDevice();
+        const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
+            .flags = flags,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        };
+        auto [set_result, set] = device.createDescriptorSetLayoutUnique(desc_layout_ci);
+        ASSERT_MSG(set_result == vk::Result::eSuccess,
+                   "Failed to create shared descriptor set layout: {}", vk::to_string(set_result));
+        const vk::DescriptorSetLayout set_layout = *set;
+        const vk::PipelineLayoutCreateInfo layout_info = {
+            .setLayoutCount = 1U,
+            .pSetLayouts = &set_layout,
+            .pushConstantRangeCount = 1U,
+            .pPushConstantRanges = &push_constants,
+        };
+        auto [layout_result, layout] = device.createPipelineLayoutUnique(layout_info);
+        ASSERT_MSG(layout_result == vk::Result::eSuccess,
+                   "Failed to create shared pipeline layout: {}", vk::to_string(layout_result));
+        SetObjectName(device, *layout, "Shared PipelineLayout {}", debug_name);
+        it.value() = Entry{std::move(set), std::move(layout)};
+    }
+    return {*it->second.set, *it->second.pipeline};
+}
+
 DescriptorHeap::DescriptorHeap(const Instance& instance, Semaphore* work_semaphore_,
                                std::span<const vk::DescriptorPoolSize> pool_sizes_,
                                u32 descriptor_heap_count_)
     : device{instance.GetDevice()}, work_semaphore{work_semaphore_},
       descriptor_heap_count{descriptor_heap_count_}, pool_sizes{pool_sizes_} {
     CreateDescriptorPool();
+    recycle = EmulatorSettings.IsDescHeapRecycle();
 }
 
 DescriptorHeap::~DescriptorHeap() {
+    // The newest ring entry bounds every recycled set still in flight.
+    u64 newest = 0;
+    for (const auto& [key, ring] : recycled) {
+        if (!ring.empty() && ring.back().tick > newest) {
+            newest = ring.back().tick;
+        }
+    }
+    if (newest != 0) {
+        work_semaphore->Wait(newest);
+    }
     device.destroyDescriptorPool(curr_pool);
     for (const auto [pool, tick] : pending_pools) {
         work_semaphore->Wait(tick);
         device.destroyDescriptorPool(pool);
     }
+    for (const auto pool : full_pools) {
+        device.destroyDescriptorPool(pool);
+    }
 }
 
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
+    if (recycle) {
+        return CommitRecycled(set_layout);
+    }
     const u64 set_key = std::bit_cast<u64>(set_layout);
     const auto [it, _] = descriptor_sets.try_emplace(set_key);
 
@@ -130,17 +197,9 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
     }
 
     DescSetBatch desc_sets(DescriptorSetBatch);
-    std::array<vk::DescriptorSetLayout, DescriptorSetBatch> layouts;
-    layouts.fill(set_layout);
-
-    vk::DescriptorSetAllocateInfo alloc_info = {
-        .descriptorPool = curr_pool,
-        .descriptorSetCount = DescriptorSetBatch,
-        .pSetLayouts = layouts.data(),
-    };
 
     // Attempt to allocate the descriptor set batch.
-    auto result = device.allocateDescriptorSets(&alloc_info, desc_sets.data());
+    auto result = AllocateBatch(set_layout, desc_sets);
     if (result == vk::Result::eSuccess) {
         const auto desc_set = desc_sets.back();
         desc_sets.pop_back();
@@ -165,8 +224,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
     }
 
     // Attempt to allocate again with fresh pool.
-    alloc_info.descriptorPool = curr_pool;
-    result = device.allocateDescriptorSets(&alloc_info, desc_sets.data());
+    result = AllocateBatch(set_layout, desc_sets);
     ASSERT_MSG(result == vk::Result::eSuccess,
                "Unexpected error during descriptor set allocation {}", vk::to_string(result));
 
@@ -176,6 +234,68 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
     desc_sets.pop_back();
     descriptor_sets[set_key] = std::move(desc_sets);
     return desc_set;
+}
+
+vk::Result DescriptorHeap::AllocateBatch(vk::DescriptorSetLayout set_layout, DescSetBatch& out) {
+    std::array<vk::DescriptorSetLayout, DescriptorSetBatch> layouts;
+    layouts.fill(set_layout);
+    const vk::DescriptorSetAllocateInfo alloc_info = {
+        .descriptorPool = curr_pool,
+        .descriptorSetCount = DescriptorSetBatch,
+        .pSetLayouts = layouts.data(),
+    };
+    return device.allocateDescriptorSets(&alloc_info, out.data());
+}
+
+vk::DescriptorSet DescriptorHeap::CommitRecycled(vk::DescriptorSetLayout set_layout) {
+    auto& ring = recycled[std::bit_cast<u64>(set_layout)];
+    ++commits_;
+    if (ring.empty() || ring.front().tick > work_semaphore->KnownGpuTick()) {
+        // Nothing retired: a fresh batch goes to the front with tick 0 so it
+        // is consumed before any set still in flight.
+        DescSetBatch batch(DescriptorSetBatch);
+        auto result = AllocateBatch(set_layout, batch);
+        if (result != vk::Result::eSuccess) {
+            ASSERT_MSG(result == vk::Result::eErrorOutOfPoolMemory ||
+                           result == vk::Result::eErrorFragmentedPool,
+                       "Unexpected error during descriptor set allocation: {}",
+                       vk::to_string(result));
+            full_pools.push_back(curr_pool);
+            CreateDescriptorPool();
+            result = AllocateBatch(set_layout, batch);
+            ASSERT_MSG(result == vk::Result::eSuccess,
+                       "Unexpected error during descriptor set allocation {}",
+                       vk::to_string(result));
+        }
+        for (const auto set : batch) {
+            ring.push_front(RecycledSet{set, 0});
+        }
+        fresh_ += DescriptorSetBatch;
+        live_ += DescriptorSetBatch;
+        if (live_ > 16384 && !warned_) {
+            warned_ = true;
+            LOG_WARNING(Render_Vulkan, "descriptor heap ring holds {} live sets", live_);
+        }
+    } else {
+        ++reused_;
+    }
+    const vk::DescriptorSet set = ring.front().set;
+    ring.pop_front();
+    ring.push_back(RecycledSet{set, work_semaphore->CurrentTick()});
+    return set;
+}
+
+void DescriptorHeap::Forget(vk::DescriptorSetLayout set_layout) {
+    // The forgotten sets stay allocated in their pools until the heap dies.
+    const u64 set_key = std::bit_cast<u64>(set_layout);
+    recycled.erase(set_key);
+    descriptor_sets.erase(set_key);
+}
+
+DescriptorHeap::Stats DescriptorHeap::DrainStats() {
+    const Stats out{commits_, reused_, fresh_, live_, full_pools.size() + 1};
+    commits_ = reused_ = fresh_ = 0;
+    return out;
 }
 
 void DescriptorHeap::CreateDescriptorPool() {

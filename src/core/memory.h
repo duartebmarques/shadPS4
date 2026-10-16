@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -212,11 +213,9 @@ public:
     }
 
     bool IsValidMapping(const VAddr virtual_addr, const u64 size = 0) {
-        const auto end_it = std::prev(vma_map.end());
-        const VAddr end_addr = end_it->first + end_it->second.size;
-
-        // If the address fails boundary checks, return early.
-        if (virtual_addr < vma_map.begin()->first || virtual_addr >= end_addr) {
+        // vma_span_{begin,end} mirror vma_map's extent; RefreshVmaBounds updates them at every
+        // site that changes the map, so this per-copy boundary test needs no tree walk.
+        if (virtual_addr < vma_span_begin || virtual_addr >= vma_span_end) {
             return false;
         }
 
@@ -248,13 +247,100 @@ public:
         return size_to_validate <= 0;
     }
 
-    u64 ClampRangeSize(VAddr virtual_addr, u64 size);
+    /// Small ranges (the per-binding common case) skip the map lookup and
+    /// its shared-lock pair entirely; the clamp only matters past 1 GiB.
+    u64 ClampRangeSize(VAddr virtual_addr, u64 size) {
+        if (size < 1_GB) [[likely]] {
+            return size;
+        }
+        return ClampRangeSizeSlow(virtual_addr, size);
+    }
+    u64 ClampRangeSizeSlow(VAddr virtual_addr, u64 size);
 
     void SetPrtArea(u32 id, VAddr address, u64 size);
 
+    /// Holds the memory map's shared lock open for a batch of guest copies: while
+    /// tls_in_guest_copy_scope is set, ResolveBackingSpans and TryWriteBacking skip their own
+    /// acquisition. The mutex is recursive-shared, so nesting is safe and only the
+    /// outermost scope takes ownership.
+    class GuestCopyScope {
+    public:
+        explicit GuestCopyScope(MemoryManager* mm) : mm_{mm}, owner_{!tls_in_guest_copy_scope} {
+            if (owner_) {
+                mm_->mutex.lock_shared();
+                tls_in_guest_copy_scope = true;
+            }
+        }
+        ~GuestCopyScope() {
+            if (owner_) {
+                tls_in_guest_copy_scope = false;
+                mm_->mutex.unlock_shared();
+            }
+        }
+        GuestCopyScope(const GuestCopyScope&) = delete;
+        GuestCopyScope& operator=(const GuestCopyScope&) = delete;
+
+    private:
+        MemoryManager* mm_;
+        bool owner_;
+    };
+
+    static inline thread_local bool tls_in_guest_copy_scope = false;
+
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// A contiguous run of the never-protected physical backing view.
+    struct BackingSpan {
+        const u8* ptr;
+        u64 size;
+    };
+    /// Resolves [virtual_addr, virtual_addr + size) to backing spans for the
+    /// stream copy lane. Returns the span count, or 0 when any part of the
+    /// range lacks physical backing (the caller copies inline instead).
+    u32 ResolveBackingSpans(VAddr virtual_addr, u64 size, BackingSpan* out, u32 max_spans,
+                            bool open_push_window);
+
+    /// Called (if registered) before an unmap edits the address space, so the
+    /// stream copy lane can drain jobs whose backing pointers would dangle.
+    static void RegisterUnmapDrain(void (*drain)());
+
+    /// Ends the push window ResolveBackingSpans opened: spans resolved under
+    /// the shared lock stay unmap-safe until the caller queued its jobs, and
+    /// the unmap drain waits the window out before snapshotting the queue.
+    static void EndBackingPush();
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
+
+    /// Writes a GPU fence label (4 or 8 bytes) from any thread, after the GPU finished the work
+
+    /// before it. Returns false, writing nothing, when the guest no longer maps the address.
+
+    bool TryWriteLabel(VAddr address, u64 value, u32 num_bytes);
+
+    /// The direct memory offset backing [address, address + size) when one Direct or Pooled
+
+    /// mapping holds the whole range contiguously; used to bind guest memory in place.
+
+    std::optional<PAddr> DirectPhysOf(VAddr address, u64 size);
+
+    /// Installs guest memory chunks into the address space under the exclusive lock, keeping
+    /// direct memory that is already mapped in the memfd.
+    void InstallGuestMemoryChunks(AddressSpace::ChunkAllocator alloc,
+                                  AddressSpace::ChunkRelease release, void* user);
+
+    /// Backing offsets below this hold direct memory (flexible memory starts here).
+    u64 GetDirectBackingLimit() const {
+        return direct_backing_limit;
+    }
+    struct BackingWriteStats {
+        u64 calls;
+        u64 hits;
+        u64 hit_bytes;
+        u64 miss_bytes;
+        u64 multi;
+    };
+    /// Returns and resets the calling thread's backing write memo counters.
+    static BackingWriteStats DrainBackingWriteStats();
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
@@ -317,7 +403,7 @@ private:
         return std::prev(fmem_map.upper_bound(target));
     }
 
-    bool HasPhysicalBacking(VirtualMemoryArea vma) {
+    static bool HasPhysicalBacking(const VirtualMemoryArea& vma) noexcept {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
                vma.type == VMAType::Pooled;
     }
@@ -326,6 +412,10 @@ private:
                          VMAType type, std::string_view name, u64 alignment);
 
     VAddr SearchFree(VAddr virtual_addr, u64 size, u32 alignment);
+
+    /// Recompute the cached address span covered by vma_map. Called from every
+    /// site that can change the map's structure.
+    void RefreshVmaBounds();
 
     VMAHandle MergeAdjacent(VMAMap& map, VMAHandle iter);
 
@@ -345,9 +435,17 @@ private:
 
 private:
     AddressSpace impl;
+    // Backing offsets below this hold direct memory; flexible memory starts here.
+    u64 direct_backing_limit{};
     PhysMap dmem_map;
     PhysMap fmem_map;
     VMAMap vma_map;
+    VAddr vma_span_begin{};
+    VAddr vma_span_end{};
+    /// Incremented on every structural change to vma_map. Readers holding the
+    /// shared lock may cache lookups against it; see TryWriteBacking.
+    u64 vma_generation{1};
+    bool backing_write_memo_{};
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
     u64 total_direct_size{};
@@ -373,5 +471,10 @@ private:
 };
 
 using Memory = Common::Singleton<MemoryManager>;
+
+/// Observes direct writes to guest memory through its physical backing, which
+/// bypass page protection and therefore every write watcher.
+using BackingWriteObserver = void (*)(void* user, VAddr virtual_addr, u64 size);
+void SetBackingWriteObserver(BackingWriteObserver observer, void* user);
 
 } // namespace Core

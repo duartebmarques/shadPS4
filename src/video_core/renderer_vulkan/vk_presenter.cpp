@@ -15,6 +15,7 @@
 #include "imgui/notifications_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
+#include "imgui/renderer/texture_manager.h"
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -492,6 +493,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
+    // ImGui draws into the present command buffers: its textures outlive them.
+    ImGui::Core::TextureManager::SetGpuTimeline(
+        [this] { return present_scheduler.CurrentTick(); },
+        [this](u64 tick) { return present_scheduler.IsFree(tick); });
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
     ImGui::Friends::Register();
     ImGui::ShadNetNotify::Register();
@@ -503,6 +508,7 @@ Presenter::~Presenter() {
     ImGui::ShadNetNotify::Unregister();
     ImGui::Friends::Unregister();
     ImGui::Layer::RemoveLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
+    ImGui::Core::TextureManager::SetGpuTimeline({}, {});
 
     draw_scheduler.Finish();
     present_scheduler.Finish();
@@ -703,7 +709,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     view_info.mapping.a = AmdGpu::CompSwizzle::One;
 
     auto& image = texture_cache.GetImage(image_id);
-    auto image_view = *image.FindView(view_info).image_view;
+    vk::ImageView image_view = image.FindViewHandle(view_info);
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
@@ -1076,7 +1082,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        std::unique_lock queue_lk{Scheduler::queue_mutex};
+        const bool presented = swapchain.Present();
+        queue_lk.unlock();
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
@@ -1084,7 +1093,38 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        NoteFrameTime();
     }
+}
+
+void Presenter::NoteFrameTime() {
+    // Frame pacing per 300 presented game frames: the average hides hitches, the tail shows them.
+    const auto now = std::chrono::steady_clock::now();
+    const auto prev = std::exchange(last_frame_time, now);
+    if (prev == std::chrono::steady_clock::time_point{}) {
+        return;
+    }
+    frame_times_us[num_frame_times++] =
+        static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(now - prev).count());
+    if (num_frame_times < frame_times_us.size()) {
+        return;
+    }
+    num_frame_times = 0;
+    auto sorted = frame_times_us;
+    std::ranges::sort(sorted);
+    u64 total = 0;
+    u32 over_40 = 0, over_50 = 0, over_100 = 0;
+    for (const u32 us : sorted) {
+        total += us;
+        over_40 += us > 40'000;
+        over_50 += us > 50'000;
+        over_100 += us > 100'000;
+    }
+    const auto ms = [](u64 us) { return static_cast<double>(us) / 1000.0; };
+    LOG_INFO(Render,
+             "FRAMETIME avg={:.1f} p99={:.1f} max={:.1f} >40ms={} >50ms={} >100ms={} per300f",
+             ms(total / sorted.size()), ms(sorted[sorted.size() * 99 / 100]), ms(sorted.back()),
+             over_40, over_50, over_100);
 }
 
 Frame* Presenter::GetRenderFrame() {

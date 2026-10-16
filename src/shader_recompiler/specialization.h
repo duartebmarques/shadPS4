@@ -4,6 +4,9 @@
 #pragma once
 
 #include <bitset>
+#include <type_traits>
+
+#include <xxhash.h>
 
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -89,11 +92,39 @@ struct StageSpecialization {
     SmallVector<FMaskSpecialization, 8> fmasks;
     SmallVector<SamplerSpecialization, 16> samplers;
     Backend::Bindings start{};
+    // 128-bit signature pair over the fields operator== consults. Computed only while the
+    // spec_fp_cache setting is on: sig == 0 doubles as the "never computed" sentinel, and such
+    // specs never enter Program::perm_index_by_sig.
+    u64 sig{};
+    u64 sig2{};
 
     StageSpecialization() = default;
-    StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
-        : info{&info_}, runtime_info{runtime_info_}, start{start_} {
+    StageSpecialization(const Info& info_, const RuntimeInfo& runtime_info_,
+                        const Profile& profile_, Backend::Bindings start_) {
+        Rebuild(info_, runtime_info_, profile_, start_);
+    }
+
+    // Refills every member as a fresh construction would while retaining vector capacity,
+    // so a persistent scratch object avoids per-call construction and destruction cost.
+    // The pipeline cache's canonical fingerprint masks each sharp down to the fields read
+    // here; a new field read below needs its bit in that mask.
+    void Rebuild(const Info& info_, const RuntimeInfo& runtime_info_, const Profile& profile_,
+                 Backend::Bindings start_) {
+        info = &info_;
+        runtime_info = runtime_info_;
+        start = start_;
+        sig = 0;
+        sig2 = 0;
+        bitset.reset();
+        vs_attribs.clear();
+        buffers.clear();
+        images.clear();
+        fmasks.clear();
+        samplers.clear();
+        fetch_shader_data.size = 0;
+        fetch_shader_data.attributes.clear();
+        fetch_shader_data.vertex_offset_sgpr = -1;
+        fetch_shader_data.instance_offset_sgpr = -1;
         if (info_.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info_, fetch_shader_data)) {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data.attributes,
@@ -189,16 +220,88 @@ struct StageSpecialization {
         return info != nullptr;
     }
 
+    /// True when the stage declares any descriptor, so its start bindings are part of its
+    /// identity. User data is read from the flat buffer, which is one of those descriptors.
+    [[nodiscard]] bool HasBindings() const noexcept {
+        return !buffers.empty() || !images.empty() || !samplers.empty();
+    }
+
+    // Fills sig/sig2 from every field operator== consults (plus the program identity), so two
+    // specs with equal signatures are interchangeable up to a ~2^-128 collision. Called explicitly
+    // by the pipeline cache while the spec_fp_cache setting is on.
+    void ComputeSig() noexcept {
+        u64 h1 = 1469598103934665603ULL;
+        u64 h2 = 0x84222325cbf29ce4ULL;
+        auto step = [&](u64 v) noexcept {
+            h1 ^= v;
+            h1 *= 1099511628211ULL;
+            h2 ^= v + 0x9e3779b97f4a7c15ULL + (h2 << 6) + (h2 >> 2);
+        };
+        auto mix_pod_vec = [&](const auto& vec) noexcept {
+            using T = typename std::decay_t<decltype(vec)>::value_type;
+            static_assert(std::is_trivially_copyable_v<T>);
+            step(static_cast<u64>(vec.size()));
+            if (!vec.empty()) {
+                step(XXH3_64bits(vec.data(), vec.size() * sizeof(T)));
+            }
+        };
+        step(static_cast<u64>(info ? info->pgm_hash : 0));
+        step(static_cast<u64>(info ? static_cast<u32>(info->hw_stage) : 0));
+        step(static_cast<u64>(info ? static_cast<u32>(info->sw_stage) : 0));
+        step(XXH3_64bits(&runtime_info, sizeof(runtime_info)));
+        // Mirrors operator==: the starts only count when the stage declares descriptors.
+        step(HasBindings() ? (u64{start.unified} << 32) | start.buffer : 0u);
+        // bitset is the single source of truth (Deserialize restores only it), so the two words
+        // are derived here rather than stored.
+        static_assert(MaxStageResources == 128);
+        step(((bitset << 64) >> 64).to_ullong());
+        step((bitset >> 64).to_ullong());
+        step(fetch_shader_data.Empty() ? 0ULL : 1ULL);
+        if (!fetch_shader_data.Empty()) {
+            const u64 fs_packed =
+                static_cast<u64>(fetch_shader_data.attributes.size()) |
+                (static_cast<u64>(static_cast<u8>(fetch_shader_data.vertex_offset_sgpr)) << 16) |
+                (static_cast<u64>(static_cast<u8>(fetch_shader_data.instance_offset_sgpr)) << 24);
+            step(fs_packed);
+            for (const auto& a : fetch_shader_data.attributes) {
+                u64 w = 0;
+                w |= static_cast<u64>(a.dest_vgpr) << 8;
+                w |= static_cast<u64>(a.num_elements) << 16;
+                w |= static_cast<u64>(a.sgpr_base) << 24;
+                w |= static_cast<u64>(a.dword_offset) << 32;
+                w |= static_cast<u64>(a.instance_data) << 40;
+                w |= static_cast<u64>(a.inst_offset) << 48;
+                step(w);
+                step(static_cast<u64>(a.data_format) | (static_cast<u64>(a.num_format) << 8));
+            }
+        }
+        mix_pod_vec(vs_attribs);
+        mix_pod_vec(buffers);
+        mix_pod_vec(images);
+        mix_pod_vec(fmasks);
+        mix_pod_vec(samplers);
+        sig = h1;
+        sig2 = h2;
+    }
+
     bool operator==(const StageSpecialization& other) const {
         if (!Valid()) {
             return false;
         }
 
-        if (vs_attribs != other.vs_attribs) {
+        // Cheap scalar rejects run before the vector walks; every compare is a
+        // side-effect-free const compare, so the reorder cannot change the result.
+        // The starts only matter once the stage declares descriptors.
+        const bool no_bindings = !HasBindings();
+        if (!no_bindings && start != other.start) {
             return false;
         }
 
         if (runtime_info != other.runtime_info) {
+            return false;
+        }
+
+        if (vs_attribs != other.vs_attribs) {
             return false;
         }
 
@@ -214,12 +317,8 @@ struct StageSpecialization {
         // bindings still may change as they depend on previously processed FS. The check below
         // handles this case and prevents generation of redundant permutations. This is also safe
         // for other types of shaders with no bindings.
-        if (buffers.empty() && images.empty() && samplers.empty()) {
+        if (no_bindings) {
             return true;
-        }
-
-        if (start != other.start) {
-            return false;
         }
 
         u32 binding{};

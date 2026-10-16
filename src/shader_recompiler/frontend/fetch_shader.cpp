@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <cstring>
+#include <memory>
 #include <utility>
+#include <vector>
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -40,12 +44,60 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+namespace {
+
+/**
+ * Memo of the per-draw fetch shader decode, keyed by the code pointer. A hit is
+ * accepted only after a memcmp over exactly the bytes the previous decode
+ * consumed, so a guest that rewrites shader code in place re-parses, and bytes
+ * past that region cannot matter because the decode never read them.
+ */
+struct FetchShaderMemo {
+    static constexpr size_t NumEntries = 64; // direct mapped, power of two
+    static constexpr u32 MaxCachedBytes = 4096;
+
+    struct Entry {
+        const u32* code{};
+        std::vector<u32> words; // exact copy of the decoded region
+        FetchShaderData data;
+    };
+
+    std::array<Entry, NumEntries> entries{};
+
+    static size_t Index(const u32* code) {
+        u64 key = reinterpret_cast<uintptr_t>(code);
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33;
+        return static_cast<size_t>(key & (NumEntries - 1));
+    }
+};
+
+} // Anonymous namespace
+
 bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
     if (!info.has_fetch_shader) {
         return false;
     }
 
+    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    // Heap backed: only the pointer lives in thread-local storage, since fetch
+    // shaders are also parsed from shader compilation workers.
+    static thread_local std::unique_ptr<FetchShaderMemo> memo;
+    if (!memo) {
+        memo = std::make_unique<FetchShaderMemo>();
+    }
+    auto& entry = memo->entries[FetchShaderMemo::Index(code)];
+    if (entry.code == code && !entry.words.empty() &&
+        std::memcmp(code, entry.words.data(), entry.words.size() * sizeof(u32)) == 0) {
+        out_fetch_data = entry.data;
+        return true;
+    }
+
+    // Overwrite every field a hit would, so the result never depends on the memo state.
     out_fetch_data.attributes.clear();
+    out_fetch_data.vertex_offset_sgpr = -1;
+    out_fetch_data.instance_offset_sgpr = -1;
 
     struct VsharpLoad {
         u32 dword_offset{};
@@ -53,7 +105,6 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     };
     std::array<VsharpLoad, 104> loads{};
 
-    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     const u32* ptr = code;
     while (true) {
         const u32 word0 = *(ptr++);
@@ -132,6 +183,15 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     }
 
     out_fetch_data.size = (ptr - code) * sizeof(u32);
+    // Instruction lengths are dword multiples, so this copies exactly the decoded region.
+    if (out_fetch_data.size <= FetchShaderMemo::MaxCachedBytes) {
+        entry.words.assign(code, ptr);
+        entry.data = out_fetch_data;
+        entry.code = code;
+    } else {
+        entry.code = nullptr;
+        entry.words.clear();
+    }
     return true;
 }
 

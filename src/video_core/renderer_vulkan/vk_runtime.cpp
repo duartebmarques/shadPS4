@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
@@ -101,6 +103,8 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+    covered_range_skip = EmulatorSettings.IsCoveredRangeSkip();
+    guest_sync_barriers = EmulatorSettings.IsGuestSyncBarriers();
 }
 
 void Runtime::TickFrame() {
@@ -156,6 +160,26 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
     cmdbuf.updateBuffer(dst->Handle(), offset, sizeof(value), &value);
 
     AccessBuffer(dst, offset, sizeof(value), vk::PipelineStageFlagBits2::eCopy,
+                 vk::AccessFlagBits2::eTransferWrite);
+}
+
+void Runtime::UpdateBuffer(const VideoCore::Buffer* dst, u64 offset, std::span<const u8> data) {
+    if (data.empty()) {
+        return;
+    }
+    scheduler.EndRendering();
+    if (IsBufferAccessed(dst, offset, data.size(), true)) {
+        FlushBarriers();
+    }
+    const auto cmdbuf = scheduler.CommandBuffer();
+    // vkCmdUpdateBuffer takes at most 64 KiB; the data is copied into the command buffer.
+    constexpr std::size_t Piece = 32_KB;
+    for (std::size_t at = 0; at < data.size(); at += Piece) {
+        const std::size_t piece = std::min(Piece, data.size() - at);
+        cmdbuf.updateBuffer(dst->Handle(), offset + at, piece, data.data() + at);
+    }
+    // Synchronization2 places vkCmdUpdateBuffer in the clear stage.
+    AccessBuffer(dst, offset, data.size(), vk::PipelineStageFlagBits2::eAllTransfer,
                  vk::AccessFlagBits2::eTransferWrite);
 }
 
@@ -221,6 +245,35 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
         AccessBuffer(dst, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
                      vk::AccessFlagBits2::eTransferWrite);
     }
+}
+
+void Runtime::DownloadImageInPlace(VideoCore::Image* src, vk::Buffer dst,
+                                   std::span<const vk::BufferImageCopy> download_copies) {
+    SetBackingSamples(src, src->info.num_samples);
+    Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
+            vk::AccessFlagBits2::eTransferRead);
+    // Buffers bound in place alias the chunk without the barrier tracker knowing, so order the
+    // copy against all earlier and later work on it, and make it visible to the guest CPU.
+    memory_barrier.srcStageMask |= vk::PipelineStageFlagBits2::eAllCommands;
+    memory_barrier.srcAccessMask |= vk::AccessFlagBits2::eMemoryWrite;
+    FlushBarriers();
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.copyImageToBuffer(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst,
+                             download_copies);
+
+    const vk::MemoryBarrier2 after = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask =
+            vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                         vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &after,
+    });
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
@@ -686,31 +739,56 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         // Update current layout in tracker to new backings layout
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
+        // A reused backing keeps its old barrier memo; the state just changed
+        // underneath it.
+        ++new_backing->state_epoch;
+        VideoCore::Skipcache::Framework::Instance().BumpLayoutGen();
         new_backing->state.pl_stage = dst_stage;
     }
 
     backing = new_backing;
+    image->backing_num_samples = new_backing->num_samples;
+    image->backing_epoch = new_backing->state_epoch;
 }
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                               bool check_read_access) {
+                               bool check_read_access, bool guest_shader) {
+    // The untracked buffer only ever reports reads, so its write list was always empty.
+    if (handle == untracked_buffer) {
+        return false;
+    }
     MakeCurrent(handle);
-    bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
+    const u64 end = offset + size;
+    bool has_access = resource->write_ranges.Overlaps(offset, end);
     if (check_read_access && !has_access) {
-        has_access |= resource->read_ranges.Overlaps(offset, offset + size);
+        has_access |= resource->read_ranges.Overlaps(offset, end);
+    }
+    // A guest write conflicts only with accesses a guest sync point or an emulator transfer
+    // ordered before it.
+    if (has_access && check_read_access && guest_shader && guest_sync_barriers &&
+        !resource->ordered_write_ranges.Overlaps(offset, end) &&
+        !resource->ordered_read_ranges.Overlaps(offset, end)) {
+        ++relaxed_write_skips;
+        return false;
     }
     return has_access;
 }
 
+void Runtime::NoteGuestSync() {
+    if (!guest_accesses_unordered) {
+        return;
+    }
+    guest_accesses_unordered = false;
+    ++guest_syncs;
+    for (auto& barriers : resources) {
+        barriers.ordered_read_ranges = barriers.read_ranges;
+        barriers.ordered_write_ranges = barriers.write_ranges;
+    }
+}
+
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                           vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
-    MakeCurrent(handle);
-
-    const Interval range = {
-        .start = offset,
-        .end = offset + size,
-    };
-
+                           vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                           bool guest_shader) {
     constexpr static vk::AccessFlags2 READ_MASK =
         vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eVertexAttributeRead |
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
@@ -723,11 +801,50 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
+    // Only a reported write would look up the reads of the untracked buffer, and none ever is,
+    // so they go unrecorded. The stage still joins the pending barrier.
+    if (handle == untracked_buffer) {
+        ASSERT_MSG(!(src_access & WRITE_MASK), "Write reported for the untracked buffer");
+        ++untracked_skips;
+        memory_barrier.srcStageMask |= src_stage;
+        return;
+    }
+
+    MakeCurrent(handle);
+
+    const Interval range = {
+        .start = offset,
+        .end = offset + size,
+    };
+
+    // A range one recorded interval already covers leaves the list as it is.
+    const auto add = [this, &range](BufferBarriers::AccessList& list) {
+        if (covered_range_skip) {
+            ++barrier_adds;
+            if (list.FindCovering(range.start, range.end) != list.end()) {
+                ++barrier_skips;
+                return;
+            }
+        }
+        list.Add(range);
+    };
     if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
+        add(resource->write_ranges);
     }
     if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
+        add(resource->read_ranges);
+    }
+    if (guest_sync_barriers) {
+        if (guest_shader) {
+            guest_accesses_unordered = true;
+        } else {
+            if (src_access & WRITE_MASK) {
+                resource->ordered_write_ranges.Add(range);
+            }
+            if (src_access & READ_MASK) {
+                resource->ordered_read_ranges.Add(range);
+            }
+        }
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -761,8 +878,11 @@ void Runtime::FlushBarriers() {
     for (auto& resource : resources) {
         resource.read_ranges.Clear();
         resource.write_ranges.Clear();
+        resource.ordered_read_ranges.Clear();
+        resource.ordered_write_ranges.Clear();
     }
     resources.clear();
+    guest_accesses_unordered = false;
     resource = nullptr;
 }
 

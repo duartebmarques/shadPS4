@@ -36,6 +36,11 @@ struct SharpFetch {
     std::array<u32, N> immediates;
     std::array<SharpLocation, N> offsets;
     u8 load_mask;
+    // Derived read verdict, never trusted from disk: 1 when the sharp is one contiguous
+    // full-mask load with no post-op, so readers take it in place from flat_ud. The owner's
+    // ResolveDirectRead sets it after the passes and after a preload; the defaulted
+    // operator== compares it, which only the patching-pass dedupe of fresh Infos uses.
+    u8 direct{};
 
     bool operator==(const SharpFetch&) const = default;
 
@@ -56,6 +61,26 @@ struct SharpFetch {
         }
         std::memcpy(out, out_dw.data(), sizeof(out_dw));
         return true;
+    }
+
+    // True when every dword comes from consecutive flat-buffer slots, so the
+    // sharp can be read in place rather than assembled by Fetch.
+    constexpr bool IsContiguousLoad() const noexcept {
+        if (load_mask != (1u << N) - 1 || offsets[0] == UNKNOWN_LOCATION) {
+            return false;
+        }
+        for (u32 i = 1; i < N; i++) {
+            if (offsets[i] != offsets[0] + i) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Sets direct from the owner's eligibility. The offset bound keeps the in-place read inside
+    // the flat buffer; a run that reaches UNKNOWN_LOCATION holds an unresolved dword.
+    constexpr void ResolveDirect(bool eligible) noexcept {
+        direct = eligible && IsContiguousLoad() && offsets[0] < UNKNOWN_LOCATION - N;
     }
 };
 
@@ -98,20 +123,30 @@ struct BufferResource {
         return buffer_type != BufferType::Guest;
     }
 
+    void ResolveDirectRead() noexcept {
+        sharp_fetch.ResolveDirect(post_op == SharpFetchPostOp::None);
+    }
+
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer;
-        if (!sharp_fetch.Fetch(info.flattened_ud_buf.data(), &buffer)) {
-            return AmdGpu::Buffer::Null();
+        if (sharp_fetch.direct) [[likely]] {
+            std::memcpy(&buffer, info.FlatUd() + sharp_fetch.offsets[0], sizeof(buffer));
+        } else {
+            if (!sharp_fetch.Fetch(info.FlatUd(), &buffer)) {
+                return AmdGpu::Buffer::Null();
+            }
+            if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
+                reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
+            } else if (post_op == SharpFetchPostOp::ClearStrideAndBitshiftDw2WithImm) {
+                buffer.stride = 0;
+                buffer.num_records <<= post_op_dw2_shift;
+            } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
+                buffer.base_address += info.PgmBase();
+            }
         }
-        if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
-            reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
-        } else if (post_op == SharpFetchPostOp::ClearStrideAndBitshiftDw2WithImm) {
-            buffer.stride = 0;
-            buffer.num_records <<= post_op_dw2_shift;
-        } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
-            buffer.base_address += info.pgm_base;
-        }
-        if (!buffer.Valid()) {
+        // No logging here: a log line's fmt machinery would stop this from inlining on a
+        // per-descriptor-per-draw path.
+        if (!buffer.Valid()) [[unlikely]] {
             return AmdGpu::Buffer::Null();
         }
         return buffer;
@@ -136,21 +171,31 @@ struct ImageResource {
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
 
+    // An r128 T# is half a sharp and always assembles.
+    void ResolveDirectRead() noexcept {
+        sharp_fetch.ResolveDirect(!is_r128 && post_op == SharpFetchPostOp::None);
+    }
+
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
         AmdGpu::Image image{};
-        if (!Fetch(info.flattened_ud_buf.data(), &image)) {
-            return AmdGpu::Image::Null(is_depth);
+        if (sharp_fetch.direct) [[likely]] {
+            std::memcpy(&image, info.FlatUd() + sharp_fetch.offsets[0], sizeof(image));
+        } else {
+            if (!Fetch(info.FlatUd(), &image)) {
+                return AmdGpu::Image::Null(is_depth);
+            }
+            if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
+                image.type = u64(AmdGpu::ImageType::Color2DArray);
+                image.depth = (image.depth + 1) * 6 - 1;
+            }
         }
-        if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
-            image.type = u64(AmdGpu::ImageType::Color2DArray);
-            image.depth = (image.depth + 1) * 6 - 1;
-        }
-        if (!image.Valid()) {
+        // Unlogged for the same inlining reason as the buffer form above.
+        if (!image.Valid()) [[unlikely]] {
             image = AmdGpu::Image::Null(is_depth);
         } else if (is_depth) {
             const auto data_fmt = image.GetDataFmt();
             if (data_fmt != AmdGpu::DataFormat::Format16 &&
-                data_fmt != AmdGpu::DataFormat::Format32) {
+                data_fmt != AmdGpu::DataFormat::Format32) [[unlikely]] {
                 image = AmdGpu::Image::Null(true);
             }
         }
@@ -170,11 +215,43 @@ struct ImageResource {
         return true;
     }
 
-    u32 NumBindings(const auto& info) const {
-        const AmdGpu::Image tsharp = GetSharp(info);
-        return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
+    // Read-only bind sites take this form to skip the by-value 32-byte stack copy. The returned
+    // reference aliases flat_ud only when sharp_fetch.direct; on every other arm, null fixups
+    // included, scratch holds the value.
+    const AmdGpu::Image& GetSharpRef(const auto& info, AmdGpu::Image& scratch) const noexcept {
+        if (!sharp_fetch.direct) [[unlikely]] {
+            scratch = GetSharp(info);
+            return scratch;
+        }
+        const auto& raw =
+            *reinterpret_cast<const AmdGpu::Image*>(info.FlatUd() + sharp_fetch.offsets[0]);
+        if (!raw.Valid()) [[unlikely]] {
+            scratch = AmdGpu::Image::Null(is_depth);
+            return scratch;
+        }
+        if (is_depth) [[unlikely]] {
+            const auto data_fmt = raw.GetDataFmt();
+            if (data_fmt != AmdGpu::DataFormat::Format16 &&
+                data_fmt != AmdGpu::DataFormat::Format32) [[unlikely]] {
+                scratch = AmdGpu::Image::Null(true);
+                return scratch;
+            }
+        }
+        return raw;
+    }
+
+    // For bind sites already holding the T#; the forwarder below re-reads it per image per draw.
+    u32 NumBindings(const AmdGpu::Image& tsharp) const {
+        // A malformed or rejected T# carries unordered 4-bit level fields; the promoted
+        // subtraction is signed, so an inverted pair would wrap this u32 to ~4e9 descriptors.
+        return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex &&
+                tsharp.last_level >= tsharp.base_level)
                    ? (tsharp.last_level - tsharp.base_level + 1)
                    : 1;
+    }
+
+    u32 NumBindings(const auto& info) const {
+        return NumBindings(GetSharp(info));
     }
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
@@ -183,13 +260,21 @@ struct SamplerResource {
     SharpFetch<AmdGpu::Sampler> sharp_fetch{};
     SharpFetchPostOp post_op{};
     SharpLocation post_op_tsharp_dw3_off{};
-    bool is_depth{};
+    bool is_depth{}; // true for the _C (compare) opcodes
+
+    void ResolveDirectRead() noexcept {
+        sharp_fetch.ResolveDirect(post_op == SharpFetchPostOp::None);
+    }
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
-        sharp_fetch.Fetch(info.flattened_ud_buf.data(), &sampler);
+        if (sharp_fetch.direct) [[likely]] {
+            std::memcpy(&sampler, info.FlatUd() + sharp_fetch.offsets[0], sizeof(sampler));
+            return sampler;
+        }
+        sharp_fetch.Fetch(info.FlatUd(), &sampler);
         if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
-            const u32 tsharp_dw3 = info.flattened_ud_buf[post_op_tsharp_dw3_off];
+            const u32 tsharp_dw3 = info.FlatUd()[post_op_tsharp_dw3_off];
             if (((tsharp_dw3 >> 12) & 0xff) == 0) {
                 sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
