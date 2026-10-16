@@ -325,6 +325,15 @@ if [ "$(readlink -f "$APPIMAGE")" != "$(readlink -f "$DIR/Shadps4-sdl.AppImage")
     put "$APPIMAGE" "$DIR/Shadps4-sdl.AppImage"
     chmod +x "$DIR/Shadps4-sdl.AppImage"
 fi
+# Steam's runtime can lack fusermount, so the launcher runs the extracted build, not the AppImage.
+if [ ! -x "$DIR/app/usr/bin/shadps4" ] || [ "$DIR/Shadps4-sdl.AppImage" -nt "$DIR/app" ]; then
+    rm -rf "$DIR/squashfs-root" "$DIR/app.new"
+    (cd "$DIR" && ./Shadps4-sdl.AppImage --appimage-extract >/dev/null) &&
+        [ -x "$DIR/squashfs-root/usr/bin/shadps4" ] || die "could not extract Shadps4-sdl.AppImage"
+    mv "$DIR/squashfs-root" "$DIR/app.new"
+    rm -rf "$DIR/app"
+    mv "$DIR/app.new" "$DIR/app"
+fi
 if [ "$SRC" != "$DIR" ]; then
     for f in install.sh README.md LICENSE VERSION; do
         if [ -f "$SRC/$f" ]; then put "$SRC/$f" "$DIR/$f"; fi
@@ -481,7 +490,7 @@ launcher="$DIR/$APP_NAME.sh"
     echo '#!/bin/bash'
     echo '# Written by install.sh. The emulator uses ./user, so start it from this folder.'
     echo 'cd "$(dirname "$(readlink -f "$0")")" || exit 1'
-    printf 'exec ./Shadps4-sdl.AppImage %q "$@"\n' "$GAME/eboot.bin"
+    printf 'exec ./app/usr/bin/shadps4 %q "$@"\n' "$GAME/eboot.bin"
 } >"$launcher.new"
 chmod +x "$launcher.new"
 mv -f "$launcher.new" "$launcher"
