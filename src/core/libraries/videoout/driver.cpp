@@ -243,6 +243,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 namespace {
 std::atomic<u64> g_lat_pad_us{0};
+u64 g_lat_flush_us = 0;
 std::mutex g_lat_mutex;
 std::deque<std::pair<u64, u64>> g_lat_guest;
 FILE* g_lat_file = [] {
@@ -299,6 +300,10 @@ void VideoOutDriver::Flip(const Request& req) {
                      static_cast<unsigned long long>(guest.second),
                      static_cast<unsigned long long>(lat_start),
                      static_cast<unsigned long long>(lat_end), queued);
+        if (lat_end - g_lat_flush_us > 1'000'000) {
+            std::fflush(g_lat_file);
+            g_lat_flush_us = lat_end;
+        }
     }
 
     // Update flip status.
