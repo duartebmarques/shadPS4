@@ -4,7 +4,7 @@
     "barrier_tracker": 1,
     "direct_memory_access_enabled": true,
     "draw_pipe": true,
-    "frame_cap": 30,
+    "frame_cap": 0,
     "full_screen": true,
     "full_screen_mode": "Fullscreen",
     "guest_gpu_time_percent": 50,
