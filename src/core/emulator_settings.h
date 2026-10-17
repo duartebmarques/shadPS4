@@ -518,7 +518,9 @@ struct GPUSettings {
     Setting<u32> present_pacing{1};
     // Frame rate cap in fps, 0 for none. After each guest flip the guest thread is held so that
     // its next frame is done just before its slot, instead of being done early and waiting in a
-    // queue, which keeps the input it reads as recent as possible. Read once at boot.
+    // queue, which keeps the input it reads as recent as possible. 0 paces this way at the rate the
+    // game asks for with its flip rate (e.g. a 30 fps lock), and leaves games without one uncapped.
+    // Read once at boot.
     Setting<u32> frame_cap{0};
     // With inplace_guest_memory 2+, copy GPU-written images back into guest memory on the GPU,
     // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a

@@ -556,7 +556,24 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     return true;
 }
 
+void VideoOutDriver::SetFlipRate(VideoOutPort* port, s32 rate) {
+    const bool changed = port->flip_rate != rate;
+    port->flip_rate = rate;
+    if (!changed || present_pacing == 0 || EmulatorSettings.GetFrameCap() != 0) {
+        return;
+    }
+    // The pacer shows frames at the game's flip rate, each just after it is done, instead of
+    // queueing them for a later vblank.
+    const s64 vblank_period_ns = 1'000'000'000 / EmulatorSettings.GetVblankFrequency();
+    std::scoped_lock lk{cap_mutex};
+    cap_from_flip_rate = rate > 0;
+    cap_period_ns = rate > 0 ? vblank_period_ns * (rate + 1) : 0;
+    cap_slot_ns = 0;
+    cap_submitted = cap_ready;
+}
+
 void VideoOutDriver::PaceGuestFlip() {
+    const s64 cap_period_ns = this->cap_period_ns.load(std::memory_order_relaxed);
     if (cap_period_ns == 0) {
         return;
     }
@@ -577,6 +594,7 @@ void VideoOutDriver::PaceGuestFlip() {
 }
 
 s64 VideoOutDriver::NoteFrameReady() {
+    const s64 cap_period_ns = this->cap_period_ns.load(std::memory_order_relaxed);
     if (cap_period_ns == 0) {
         return 0;
     }
@@ -651,6 +669,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     const auto min_flip_interval = vblank_period * 3 / 4;
     auto last_flip = std::chrono::steady_clock::now();
 
+    // Flips the pacer shows at the game's flip rate are taken as they come, like those of a game
+    // without one.
+    const auto vblank_flip_rate = [this] {
+        return cap_from_flip_rate.load(std::memory_order_relaxed) ? 0 : main_port.flip_rate;
+    };
+
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
@@ -665,7 +689,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         const auto wait_start = std::chrono::steady_clock::now();
         const auto wait_end = wait_start + timer.GetTotalWait() - EarlyFlipMargin;
         std::unique_lock lk{mutex};
-        while (main_port.flip_rate == 0 && !DebugState.IsGuestThreadsPaused()) {
+        while (vblank_flip_rate() == 0 && !DebugState.IsGuestThreadsPaused()) {
             const auto now = std::chrono::steady_clock::now();
             if (now >= wait_end) {
                 break;
@@ -703,7 +727,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        if (vblank_status.count % (vblank_flip_rate() + 1) == 0) {
             const bool flipped_recently =
                 std::chrono::steady_clock::now() - last_flip < min_flip_interval;
             const auto request = flipped_recently ? Request{} : receive_request();
@@ -716,7 +740,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
-                Flip(request, main_port.flip_rate != 0 ? SteadyNs() : 0);
+                Flip(request, vblank_flip_rate() != 0 ? SteadyNs() : 0);
                 FRAME_END;
                 last_flip = std::chrono::steady_clock::now();
             }
