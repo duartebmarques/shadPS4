@@ -515,7 +515,9 @@ struct GPUSettings {
     Setting<u32> present_pacing{1};
     // Frame rate cap in fps, 0 for none. After each guest flip the guest thread is held so that
     // its next frame is done just before its slot, instead of being done early and waiting in a
-    // queue, which keeps the input it reads as recent as possible. Read once at boot.
+    // queue, which keeps the input it reads as recent as possible. 0 paces this way at the rate the
+    // game asks for with its flip rate (e.g. a 30 fps lock), and leaves games without one uncapped.
+    // Read once at boot.
     Setting<u32> frame_cap{0};
     // A new pipeline of a pass drawn every frame (its render target drawn to in each of the last 8
     // frames, more than 12 indices, not indirect) compiles on worker threads and its draws are

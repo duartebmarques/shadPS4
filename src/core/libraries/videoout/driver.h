@@ -106,6 +106,8 @@ public:
     /// start for the frame cap.
     void PaceGuestFlip();
 
+    void SetFlipRate(VideoOutPort* port, s32 rate);
+
 private:
     struct Request {
         Vulkan::Frame* frame;
@@ -163,8 +165,9 @@ private:
     u64 display_misses{};
     u64 display_samples{};
     // Frame cap: the display slot of the last frame and how long before its slot a frame is
-    // started.
-    s64 cap_period_ns{};
+    // started. Without a configured cap, a game's flip rate sets it.
+    std::atomic<s64> cap_period_ns{};
+    std::atomic<bool> cap_from_flip_rate{};
     std::mutex cap_mutex;
     s64 cap_slot_ns{};
     s64 cap_lead_ns{};
