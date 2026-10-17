@@ -1400,9 +1400,6 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, Tas
                 MarkPipeDirtyField(regs.cp_strmout_cntl);
             } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                 if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                    if (rasterizer) {
-                        rasterizer->DrainDrawPipe(static_cast<u32>(PM4ItOpcode::EventWrite));
-                    }
                     ++packet_stats.occlusion_events;
                     static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                     static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;

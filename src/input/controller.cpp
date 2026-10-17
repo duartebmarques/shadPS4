@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -334,6 +335,8 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
     float accel_sign[3]{};
     int accel_saturated[3]{};
     // The motion fed to the game, for analysing gestures: log/motion-<time>.csv, G and deg/s.
+    // Only when SHAD_MOTION_LOG is set.
+    const bool log_motion = std::getenv("SHAD_MOTION_LOG") != nullptr;
     std::FILE* csv = nullptr;
     bool touching = false;
     bool clicking = false;
@@ -406,6 +409,9 @@ void DeckImuThread(std::stop_token stop, GameController* controller) {
         const float gyro[3] = {raw[3] * gyro_scale, raw[5] * gyro_scale, -raw[4] * gyro_scale};
         controller->UpdateGyro(gyro);
         controller->UpdateAcceleration(accel);
+        if (!log_motion) {
+            continue;
+        }
         if (!csv) {
             const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
                               fmt::format("motion-{}.csv", std::time(nullptr));
