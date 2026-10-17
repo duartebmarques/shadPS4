@@ -13,7 +13,9 @@ You need your own copy of **inFAMOUS Second Son (CUSA00004)** dumped from your P
    **inFAMOUS Second Son**.
 
 Once, while the game runs: press **...** > Performance, turn on *Use per-game profile*, set
-*Manual GPU clock* to **1600 MHz**, and turn the frame limit **off** (the game is capped at 30 fps).
+*Manual GPU clock* to **1600 MHz**, and turn the frame limit **off**. In the game, set
+**Options > Video > Frame Rate** to **30fps limit**: the emulator now paces the game's own limit
+(lag as low as the old built-in cap, which is gone so faster machines can run Unlimited).
 
 The first start builds shaders, so expect stutter for the first minutes. Shake the Deck to shake
 the controller (graffiti); the trackpads act as the PS4 touchpad.
