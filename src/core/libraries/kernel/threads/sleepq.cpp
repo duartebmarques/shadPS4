@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
-#include <atomic>
-#include <xmmintrin.h>
+#include "common/spin_lock.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/threads/sleepq.h"
 
@@ -15,40 +14,8 @@ static constexpr int HASHSIZE = (1 << HASHSHIFT);
     ((u32)((((uintptr_t)(wchan) >> 3) ^ ((uintptr_t)(wchan) >> (HASHSHIFT + 3))) & (HASHSIZE - 1)))
 #define SC_LOOKUP(wc) &sc_table[SC_HASH(wc)]
 
-// The guest kernel's chain lock is a spin mutex that cannot be preempted while held. Ours can, so
-// a waiter that only spins burns the holder's whole time slice: spin briefly, then sleep on it.
-class ChainLock {
-public:
-    void lock() {
-        for (int i = 0; i < SpinCount; ++i) {
-            u32 expected = Free;
-            if (state.load(std::memory_order_relaxed) == Free &&
-                state.compare_exchange_weak(expected, Locked, std::memory_order_acquire)) {
-                return;
-            }
-            _mm_pause();
-        }
-        while (state.exchange(Contended, std::memory_order_acquire) != Free) {
-            state.wait(Contended, std::memory_order_relaxed);
-        }
-    }
-
-    void unlock() {
-        if (state.exchange(Free, std::memory_order_release) == Contended) {
-            state.notify_one();
-        }
-    }
-
-private:
-    static constexpr int SpinCount = 2048;
-    static constexpr u32 Free = 0;
-    static constexpr u32 Locked = 1;
-    static constexpr u32 Contended = 2;
-    std::atomic<u32> state{Free};
-};
-
 struct SleepQueueChain {
-    ChainLock sc_lock;
+    Common::SpinLock sc_lock;
     SleepqList sc_queues;
     int sc_type;
 };
