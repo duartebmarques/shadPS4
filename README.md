@@ -47,7 +47,11 @@ The patch file still needs internet; without it the game runs, just slower.
 While the game runs, press the **...** button > **Performance** (battery icon):
 - turn on **Use per-game profile** and **Advanced view**;
 - turn on **Manual GPU clock** and set it to **1600 MHz**: heavy fights need it;
-- turn the **Frame limit off**: the emulator caps the game at 30 fps itself, with less input lag.
+- turn the **Frame limit off**: it adds input lag.
+
+In the game: **Options > Video > Frame Rate > 30fps limit**. The emulator paces the game's own
+limit so each frame is shown on time with little input lag. *Unlimited* runs as fast as the
+machine allows (uneven on the Deck, about 34 fps).
 
 ## Good to know
 - **First start:** the emulator builds shaders while you play, so the first minutes stutter. It
@@ -73,6 +77,8 @@ While the game runs, press the **...** button > **Performance** (battery icon):
   `~/Applications/shadPS4-infamous/inFAMOUS Second Son.sh` as a non-Steam game.
 - **Low fps in fights:** check the 1600 MHz GPU clock above. Turn off other overlays and frame
   limiters.
+- **Uneven frame rate or aiming feels laggy:** set the game's Frame Rate option to *30fps limit*
+  (Options > Video) and the Deck's frame limit off.
 - **Reporting a problem:** include `~/Applications/shadPS4-infamous/user/log/shad_log.txt`.
 
 All installer options: `~/Applications/shadPS4-infamous/install.sh --help`.
@@ -81,7 +87,8 @@ All installer options: `~/Applications/shadPS4-infamous/install.sh --help`.
 - **Two-stage draw pipeline** (`draw_pipe`): PM4 decoding and Vulkan command recording run on separate threads.
 - **In-place guest memory** (`inplace_guest_memory` 1–3): honest fences, plus guest memory in dma-buf chunks that the GPU uses directly.
 - **GPU-time timestamps**: guest GPU timestamps count GPU execution time, which fixes the "refocus" flicker.
-- **Present thread and frame cap** (`frame_cap`): steady 30 fps with about a third of the input lag.
+- **Present thread and low-lag pacing**: the game's own 30 fps limit (or a `frame_cap`) is paced so
+  each frame is done just before it is shown: steady 30 fps with less than half the input lag.
 - **Background pipeline compiles** for every-frame passes, and a log-based barrier tracker.
 - **Steam Deck input**: the Deck's own motion sensor (shake past the sensor's limit) and trackpads
   feed the emulated controller.
