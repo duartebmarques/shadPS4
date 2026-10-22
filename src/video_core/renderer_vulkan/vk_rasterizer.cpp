@@ -3298,7 +3298,8 @@ bool Rasterizer::WriteDataOnGpu(VAddr address, const void* data, u32 size) {
         return false;
     }
     texture_cache.InvalidateMemoryFromGPU(address, size);
-    const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, size, true);
+    const auto [buffer, offset] =
+        buffer_cache.ObtainBuffer(address, size, VideoCore::ObtainBufferFlags::IsWritten);
     runtime.UpdateBuffer(buffer, offset, {static_cast<const u8*>(data), size});
     return true;
 }

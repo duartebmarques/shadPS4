@@ -254,8 +254,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     }
 }
 
-bool TextureCache::DownloadImageInPlace(Image& image,
-                                        std::span<vk::BufferImageCopy> buffer_copies,
+bool TextureCache::DownloadImageInPlace(Image& image, std::span<vk::BufferImageCopy> buffer_copies,
                                         u64 copy_size) {
     if (!EmulatorSettings.IsInplaceImageDownloads() || !Vulkan::GuestMemory::Installed()) {
         return false;
@@ -2165,7 +2164,7 @@ void TextureCache::GarbageCollectImages() {
                 image_lru_cache.Touch(image, gc_tick);
                 return false;
             }
-            if (image.SafeToDownload()) {
+            if (image.CanBeDownloaded()) {
                 return false;
             }
             --idle_deletions;
