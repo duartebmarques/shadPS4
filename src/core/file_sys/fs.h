@@ -96,15 +96,16 @@ public:
     /// Normalizes and validates a guest path (resolves dot and dot-dot components).
     static std::optional<std::string> SanitizeGuestPath(std::string_view path);
 
-    const MntPair* GetMountFromHostPath(const std::string& host_path) {
+    // Mounts are returned by value: another thread can mount or unmount while the caller uses it.
+    std::optional<MntPair> GetMountFromHostPath(const std::string& host_path) {
         std::scoped_lock lock{m_mutex};
         const auto it = std::ranges::find_if(m_mnt_pairs, [&](const MntPair& mount) {
             return host_path.starts_with(std::string{fmt::UTF(mount.host_path.u8string()).data});
         });
-        return it == m_mnt_pairs.end() ? nullptr : &*it;
+        return it == m_mnt_pairs.end() ? std::nullopt : std::optional<MntPair>{*it};
     }
 
-    const MntPair* GetMount(std::string_view guest_path) {
+    std::optional<MntPair> GetMount(std::string_view guest_path) {
         std::string normalized;
         if (guest_path.find("..") != std::string_view::npos ||
             guest_path.find("//") != std::string_view::npos) {
@@ -118,9 +119,9 @@ public:
             return guest_path == mount.mount || guest_path.starts_with(mount.mount + "/");
         });
         if (it == m_mnt_pairs.end()) {
-            return nullptr;
+            return std::nullopt;
         }
-        return &*it;
+        return *it;
     }
 
 private:

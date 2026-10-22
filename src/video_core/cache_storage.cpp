@@ -228,6 +228,21 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
     return LoadVector(type, path, data);
 }
 
+bool DataBase::Contains(BlobType type, const std::string& name) const {
+    if (!opened) {
+        return false;
+    }
+
+    auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
+                                                           : cache_path / name;
+    path.replace_extension(GetBlobFileExtension(type));
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        return mz_zip_reader_locate_file(&zip_ar, path.string().c_str(), nullptr, 0) >= 0;
+    }
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+}
+
 void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {
     const auto& ext = GetBlobFileExtension(type);
     if (EmulatorSettings.IsPipelineCacheArchived()) {

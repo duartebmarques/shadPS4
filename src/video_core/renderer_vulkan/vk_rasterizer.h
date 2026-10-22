@@ -7,16 +7,14 @@
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "core/memory.h"
+#include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/texture_cache.h"
-
-namespace AmdGpu {
-struct Liverpool;
-}
 
 namespace Core {
 class MemoryManager;
@@ -52,6 +50,42 @@ public:
         return texture_cache;
     }
 
+    /// The register state draws and dispatches are recorded with: the recording thread's copy
+    /// with the draw pipe, else the command processor's.
+    [[nodiscard]] const AmdGpu::Regs& Regs() const noexcept {
+        return *record_regs;
+    }
+    [[nodiscard]] const AmdGpu::ComputeProgram& CsRegs() const noexcept {
+        return record_view ? record_view->cs : liverpool->GetCsRegs();
+    }
+    [[nodiscard]] u64 GfxStateStamp() const noexcept {
+        return record_view ? record_view->gfx_stamp : liverpool->GetGfxStateStamp();
+    }
+    [[nodiscard]] u64 DynStateStamp() const noexcept {
+        return record_view ? record_view->dyn_stamp : liverpool->GetDynStateStamp();
+    }
+    [[nodiscard]] u64 RtStateStamp() const noexcept {
+        return record_view ? record_view->rt_stamp : liverpool->GetRtStateStamp();
+    }
+    [[nodiscard]] const AmdGpu::CbDbExtent& CbExtent(u32 cb) const noexcept {
+        return record_view ? record_view->cb_extent[cb] : liverpool->last_cb_extent[cb];
+    }
+    [[nodiscard]] const AmdGpu::CbDbExtent& DbExtent() const noexcept {
+        return record_view ? record_view->db_extent : liverpool->last_db_extent;
+    }
+
+    /// The register state pipelines are selected with: the command thread's when the draw pipe
+    /// selects there (SHADPS4_PIPE_SELECT=1), else the recording state above.
+    [[nodiscard]] const AmdGpu::Regs& SelectRegs() const noexcept {
+        return pipe_select ? liverpool->regs : *record_regs;
+    }
+    [[nodiscard]] const AmdGpu::ComputeProgram& SelectCsRegs() const noexcept {
+        return pipe_select ? liverpool->GetCsRegs() : CsRegs();
+    }
+    [[nodiscard]] u64 SelectGfxStateStamp() const noexcept {
+        return pipe_select ? liverpool->GetGfxStateStamp() : GfxStateStamp();
+    }
+
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
@@ -80,6 +114,8 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool TryCpWriteBacking(VAddr addr, const void* data, u64 size);
+    /// WRITE_DATA into memory bound in place, recorded on the GPU. False: write on the CPU.
+    bool WriteDataOnGpu(VAddr address, const void* data, u32 size);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -87,6 +123,11 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     u64 Flush();
+    /// Tick of the batch being recorded: it completes after all work recorded so far.
+    u64 CurrentTick() const;
+    /// Runs `func` on the scheduler's completion thread once the GPU reached `tick`. The tick
+    /// must get submitted eventually (honest fences flush at guest submission ends and waits).
+    void DeferAfterTick(u64 tick, Common::UniqueFunction<void>&& func);
     void Finish();
     /// Submits the open batch for a readback thread waiting on its tick. Runs on the GPU command
     /// thread.
@@ -95,6 +136,8 @@ public:
     /// defers it to the next draw boundary unless forced.
     void FlushRequested(bool force = false);
     void OnSubmit();
+    /// A synchronizing guest packet; see the guest_sync_barriers setting.
+    void NoteGuestSync();
     void OnFence();
 
     // Scopes a guest-copy hold to one packet run: the caller yields to guest
@@ -140,8 +183,135 @@ public:
 #ifdef __linux__
     u32 GetGpuCommandProcessorThreadId();
 #endif
+    /// The GPU command thread or the draw pipe's recording thread (see Liverpool::OnGpuThread).
+    bool IsGpuSideThread() const {
+        return liverpool->OnGpuThread();
+    }
+
+    /// Draw pipe, GPU command thread: waits until the recording thread has recorded every
+    /// packet handed to it. A no-op on other threads and without the draw pipe.
+    void DrainDrawPipe(u32 reason = DrawPipe::ReasonRasterizer) {
+        if (draw_pipe && !draw_pipe->Idle() && AmdGpu::Liverpool::OnCommandThread()) {
+            draw_pipe->Drain(reason);
+        }
+    }
+
+    /// Draw pipe: the recording thread submits queued honest signals after the packets before
+    /// this call (directly here when it is idle).
+    void RequestPipeFlush(bool force = false);
+    /// Draw pipe: an interrupt signalled in order on the recording thread (the flip packet).
+    void QueueIrq(Platform::InterruptId irq);
+    /// Draw pipe: a WRITE_DATA or DMA_DATA packet run in order on the recording thread.
+    void QueuePm4(const void* packet, u32 size);
+    /// Draw pipe: an honest fence recorded in order after the packets before it.
+    void QueueFence(const std::optional<AmdGpu::Liverpool::FenceWrite>& write,
+                    std::optional<Platform::InterruptId> irq);
 
 private:
+    enum class PipeOp : u8 {
+        Draw,
+        DrawIndirect,
+        DispatchDirect,
+        DispatchIndirect,
+        GuestSync,
+        Fence,
+        Flush,
+        Pm4,
+        Submit,
+        Irq,
+    };
+    enum PipeFlags : u8 {
+        PipeReset = 1 << 0,    ///< CLEAR_STATE: defaults first
+        PipeFull = 1 << 1,     ///< the full register file follows the blocks
+        PipeVerify = 1 << 2,   ///< compare the copy with the full file before taking it
+        PipeSelected = 1 << 3, ///< the pipeline and its stages' user data follow the args
+    };
+    struct PipePacket {
+        PipeOp op;
+        u8 flags;
+        u16 num_blocks;
+        u32 pad;
+        u64 gfx_stamp;
+        u64 dyn_stamp;
+        u64 rt_stamp;
+        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;
+        AmdGpu::CbDbExtent db_extent;
+    };
+    struct PipeDraw {
+        bool is_indexed;
+        u32 index_offset;
+    };
+    struct PipeDrawIndirect {
+        bool is_indexed;
+        u16 vertex_sgpr_offset;
+        u16 instance_sgpr_offset;
+        u32 offset;
+        u32 size;
+        u32 max_count;
+        VAddr arg_address;
+        VAddr count_address;
+    };
+    /// A pipeline selected on the command thread, then one PipeStageUd per stage and the
+    /// stages' flattened user data.
+    struct PipeSelection {
+        const Pipeline* pipeline;
+        u32 num_stages;
+        u32 flat_words;
+    };
+    struct PipeStageUd {
+        const Shader::Info* info;
+        VAddr pgm_base;
+        u32 flat_words;
+        u32 pad;
+        std::array<u32, Shader::NUM_USER_DATA_REGS> user_data;
+    };
+    struct PipeFence {
+        AmdGpu::Liverpool::FenceWrite write;
+        bool has_write;
+        bool has_irq;
+        Platform::InterruptId irq;
+    };
+    struct PipeDispatch {
+        AmdGpu::ComputeProgram cs;
+        VAddr address;
+        u32 offset;
+        u32 size;
+    };
+    /// Stage A: hands the dirty register blocks and `args` to the recording thread.
+    void SendPipePacket(PipeOp op, const void* args, u32 args_size,
+                        const Pipeline* selected = nullptr);
+    /// Stage B: installs the selecting draw's user data (Shader::Info::UdSnapshot).
+    void InstallPipeSelection(const u8* data);
+    /// The pipeline the command thread selected for the packet being recorded, else select().
+    template <typename Select>
+    auto SelectedOr(Select&& select) {
+        using Result = decltype(select());
+        if (selected_pipeline) {
+            return static_cast<Result>(selected_pipeline);
+        }
+        if (pipe_select) {
+            NoteMissingSelection();
+            return Result{};
+        }
+        return select();
+    }
+    SHAD_NO_INLINE void NoteMissingSelection();
+    /// Stage B: applies a packet to the register copy and records it.
+    void RunPipePacket(const u8* data, u32 size);
+    void VerifyPipeRegs(const AmdGpu::Regs& expected);
+    void EmitDrawPipeTelemetry();
+    /// End of a guest frame: the census lines (command thread) and the cache ticks (where the
+    /// draws are recorded).
+    void LogPacketStats();
+    void RecordSubmit();
+
+    void RecordDraw(bool is_indexed, u32 index_offset);
+    void RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
+                            u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
+                            u16 instance_sgpr_offset);
+    void RecordDispatchDirect();
+    void RecordDispatchIndirect(VAddr address, u32 offset, u32 size);
+
     // Returns whether the memo it consumed or refilled may certify the next
     // draw's glue (draw_glue_memo); false whenever the glue is off.
     bool PrepareRenderState(const GraphicsPipeline* pipeline);
@@ -443,6 +613,23 @@ private:
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
+    /// The draw pipe's recording thread state: its register copy and the command processor
+    /// state of the packet it records. Null without the draw pipe.
+    struct RecordView {
+        AmdGpu::Regs regs;
+        AmdGpu::ComputeProgram cs;
+        u64 gfx_stamp;
+        u64 dyn_stamp;
+        u64 rt_stamp;
+        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent;
+        AmdGpu::CbDbExtent db_extent;
+    };
+    std::unique_ptr<RecordView> record_view;
+    /// Draw pipe: pipelines are selected on the command thread and handed over.
+    bool pipe_select{};
+    /// Stage B: the pipeline the packet being recorded was selected with, or null.
+    const Pipeline* selected_pipeline{};
+    const AmdGpu::Regs* record_regs;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     // Generation for IsMapped's per-thread interval cache.
@@ -584,6 +771,27 @@ private:
     u64 glue_arms_{};
     u64 glue_div_{};
     bool needs_barrier{};
+
+    // Draw pipe: every pipe_verify_every-th packet carries the full register file
+    // (SHADPS4_PIPE_VERIFY); the first one always does.
+    u32 pipe_verify_every_{};
+    u32 pipe_verify_count_{};
+    bool pipe_full_next_{true};
+    u64 pipe_flush_packets_{};
+    u64 pipe_flushes_{};
+    std::atomic<u64> pipe_verified_{};
+    std::atomic<u64> pipe_mismatches_{};
+    std::atomic<u64> pipe_apply_cycles_{};
+    u64 pipe_last_apply_{};
+    u64 pipe_blocks_same_{};
+    /// Command thread: the register file as the recording thread holds it.
+    std::unique_ptr<AmdGpu::Regs> pipe_sent_regs;
+    u64 pipe_blocks_{};
+    u64 pipe_last_packets_{};
+    u64 pipe_last_busy_{};
+    u64 pipe_last_tsc_{};
+    // Last: the recording thread stops before anything it uses goes.
+    std::unique_ptr<DrawPipe> draw_pipe;
 };
 
 } // namespace Vulkan

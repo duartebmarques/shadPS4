@@ -9,6 +9,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -90,7 +91,10 @@ void Swapchain::SetHDR(bool hdr) {
         return;
     }
 
+    Scheduler::DrainSubmits();
+    std::unique_lock queue_lk{Scheduler::queue_mutex};
     auto result = instance.GetDevice().waitIdle();
+    queue_lk.unlock();
     if (result != vk::Result::eSuccess) {
         LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
                     vk::to_string(result));
@@ -255,7 +259,10 @@ void Swapchain::SetSurfaceProperties() {
 
 void Swapchain::Destroy() {
     vk::Device device = instance.GetDevice();
+    Scheduler::DrainSubmits();
+    std::unique_lock queue_lk{Scheduler::queue_mutex};
     const auto wait_result = device.waitIdle();
+    queue_lk.unlock();
     if (wait_result != vk::Result::eSuccess) {
         LOG_WARNING(Render_Vulkan, "Failed to wait for device to become idle: {}",
                     vk::to_string(wait_result));

@@ -1119,7 +1119,7 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             controller->SetMotionTilt(-1, new_button_state);
             break;
         case MOTION_SHAKE:
-            controller->SetMotionShake(new_button_state);
+            controller->SetShake(new_button_state);
             break;
         default: // is a normal key (hopefully)
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);

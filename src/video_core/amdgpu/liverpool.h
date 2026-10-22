@@ -3,6 +3,11 @@
 
 #pragma once
 
+#include <optional>
+
+#include <deque>
+
+#include <atomic>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -17,6 +22,7 @@
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
+#include "core/platform.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/gfx_state_stamp.h"
 #include "video_core/amdgpu/regs.h"
@@ -30,6 +36,11 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+enum class DataSelect : u32;
+
+struct PM4CmdWaitRegMem;
+struct PM4CmdWriteData;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -68,6 +79,37 @@ struct Liverpool {
     std::array<u64, (Regs::NumRegs - Regs::ContextRegWordOffset) / 64> dyn_reg_mask_{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    /// Draw pipe (vk_draw_pipe.h): the 32-word register blocks written since the last packet
+    /// handed to the recording thread, and whether a CLEAR_STATE reset the file in between.
+    static constexpr u32 PipeBlockWords = 32;
+    std::array<u64, Regs::NumRegs / PipeBlockWords / 64> pipe_dirty{};
+    bool pipe_reset{};
+    bool draw_pipe{};
+
+    void MarkPipeDirty(u32 word, u32 count) {
+        if (!draw_pipe || count == 0) {
+            return;
+        }
+        const u32 last = (word + count - 1) / PipeBlockWords;
+        for (u32 block = word / PipeBlockWords; block <= last; ++block) {
+            pipe_dirty[block / 64] |= u64{1} << (block % 64);
+        }
+    }
+    template <typename T>
+    void MarkPipeDirtyField(const T& field) {
+        const auto offset = reinterpret_cast<const u8*>(&field) -
+                            reinterpret_cast<const u8*>(regs.reg_array.data());
+        MarkPipeDirty(static_cast<u32>(offset / sizeof(u32)),
+                      static_cast<u32>((sizeof(T) + sizeof(u32) - 1) / sizeof(u32)));
+    }
+    /// Marks the registers other threads wrote (SetGsRingSizes) since the last call.
+    void TakeExternalRegWrites() {
+        if (external_reg_writes.load(std::memory_order_relaxed) &&
+            external_reg_writes.exchange(false, std::memory_order_acquire)) {
+            MarkPipeDirtyField(regs.vgt_esgs_ring_size);
+            MarkPipeDirtyField(regs.vgt_gsvs_ring_size);
+        }
+    }
 
 public:
     explicit Liverpool();
@@ -112,8 +154,27 @@ public:
                num_commands.load(std::memory_order_relaxed) != 0;
     }
 
+    /// The GPU command thread, or the draw pipe's recording thread: the threads that own the
+    /// caches and the command recording (one at a time).
     bool OnGpuThread() const noexcept {
-        return std::this_thread::get_id() == gpu_id;
+        return gpu_side_thread;
+    }
+    /// The GPU command thread only.
+    static bool OnCommandThread() noexcept {
+        return command_thread;
+    }
+    static void MarkGpuSideThread() noexcept {
+        gpu_side_thread = true;
+    }
+    /// Draw pipe: the recording thread takes the core reserved for the command thread
+    /// (gpu_thread_core_reserve); SHADPS4_PIPE_PLACEMENT=0 keeps it on the command thread.
+    static bool PipeTakesReservedCore();
+
+    /// Guest thread register write (sceGnmSetGsRingSizes).
+    void SetGsRingSizes(u32 esgs_ring_size, u32 gsvs_ring_size) {
+        regs.vgt_esgs_ring_size = esgs_ring_size;
+        regs.vgt_gsvs_ring_size = gsvs_ring_size;
+        external_reg_writes.store(true, std::memory_order_release);
     }
 
     u64 GetGfxStateStamp() const noexcept {
@@ -194,6 +255,20 @@ public:
         u64 dispatches;       // compute dispatches
         u64 occlusion_events; // ZpassDone events answered with a fake count
         u64 set_predication;  // SET_PREDICATION packets (currently ignored)
+        u64 acb_dispatches;   // compute queue dispatches
+        u64 gfx_to_acb;       // compute queue dispatches right after a graphics draw
+        bool after_draw;      // the last draw or dispatch was a graphics draw
+        // WAIT_REG_MEM on the graphics and compute queues: met by a pending label at the first
+        // test, waits that were not met at once, loop iterations, and waits met by a label
+        // another queue queued meanwhile (draw pipe only).
+        u64 waits_pending;
+        u64 waits;
+        u64 wait_spins;
+        u64 waits_pending_late;
+        u64 acb_waits_pending;
+        u64 acb_waits;
+        u64 acb_wait_spins;
+        u64 acb_waits_pending_late;
     };
     PacketStats packet_stats{};
 
@@ -296,6 +371,57 @@ private:
     // Frozen counter = every query pair differences to zero samples passed:
     // the title's own visibility logic then culls those draws before issue.
     bool occlude_all_{};
+    // inplace_guest_memory >= 1: fence labels, their interrupts and the GPU idle interrupt wait
+    // for the GPU to finish the work recorded before them.
+    bool honest_fences_{};
+    u64 timestamp_clock_base_{};
+    u64 timestamp_perf_base_{};
+    u64 guest_gpu_time_percent_{100};
+
+public:
+    /// A fence label captured when its packet is decoded, written after the GPU finished the
+    /// work recorded before it.
+    struct FenceWrite {
+        VAddr address;
+        u64 value;
+        u32 num_bytes;
+        bool cpu_write = true; ///< False: the GPU writes it; only WAIT_REG_MEM resolution needs it.
+        /// A GPU clock source: the value is taken on the GPU, after the work before it.
+        DataSelect timestamp{};
+        u32 timestamp_slot{};
+        u64 timestamp_session{};
+    };
+    /// Draw pipe recording thread: a WRITE_DATA or DMA_DATA packet handed over in order.
+    void RunPipePm4(const u32* packet);
+    /// Whether queued honest signals wait for work not submitted yet.
+    bool HonestSignalsUnsubmitted() const;
+    /// Draw pipe recording thread: a fence handed over by HonestFence (its label is queued).
+    void RunPipeFence(std::optional<FenceWrite> write, std::optional<Platform::InterruptId> irq);
+
+private:
+    /// Queues a label write and/or interrupt to run once the GPU finished all work recorded so
+    /// far, without submitting: FlushHonestSignals submits at guest submission ends and waits.
+    void QueueHonestSignal(std::optional<FenceWrite> write,
+                           std::optional<Platform::InterruptId> irq, bool label_queued = false);
+    /// An honest fence in stream order: handed to the draw pipe's recording thread
+    /// (SHADPS4_PIPE_FENCES=1), else queued here after the downloads and lane copies.
+    void HonestFence(std::optional<FenceWrite> write, std::optional<Platform::InterruptId> irq);
+    /// Submits the recorded work when it holds queued honest signals.
+    void FlushHonestSignals();
+    /// WRITE_DATA: on the GPU in stream order where it targets memory bound in place.
+    void WriteData(const PM4CmdWriteData* write_data, u32 data_size);
+    void RunDmaData(const struct PM4DmaData* dma_data);
+    /// Whether a queued, not yet written label will make the wait pass (the GPU runs the queues
+    /// in recording order, so the wait is met by stream order).
+    bool PendingLabelSatisfies(const PM4CmdWaitRegMem* wait);
+
+    // Labels queued and not yet written, oldest first; their writes pop them in order.
+    std::mutex pending_labels_mutex_;
+    std::deque<FenceWrite> pending_labels_;
+    // Tick of the newest queued honest signal.
+    std::atomic<u64> honest_signal_tick_{};
+    // SHADPS4_PIPE_FENCES: fences, WRITE_DATA and DMA_DATA run in order on the draw pipe.
+    bool pipe_fences_{};
     bool reg_run_{};
 
     struct ConstantEngine {
@@ -311,6 +437,13 @@ private:
 
     Vulkan::Rasterizer* rasterizer{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
+    std::atomic<bool> external_reg_writes{};
+    static inline thread_local bool gpu_side_thread = false;
+    static inline thread_local bool command_thread = false;
+    // SHADPS4_PIPE_CONSERVATIVE=1: every packet but register writes, draws and dispatches
+    // drains the draw pipe.
+    bool pipe_drain_all_{};
+    bool command_thread_moved_{};
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};

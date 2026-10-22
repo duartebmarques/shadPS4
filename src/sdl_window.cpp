@@ -156,6 +156,13 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // the cached size so the first swapchain and the splashscreen use the real drawable size.
     SDL_GetWindowSizeInPixels(window, &width, &height);
 
+    // Under Steam Input the Steam Deck controls reach the game through Steam's virtual gamepad,
+    // which Steam silences while its overlay is open. SDL's raw Deck driver would bypass that and
+    // overwrite the controller settings Steam relies on, so leave the raw controller to Steam.
+    if (SDL_getenv("SteamVirtualGamepadInfo") ||
+        SDL_getenv("SDL_GAMECONTROLLER_ALLOW_STEAM_VIRTUAL_GAMEPAD")) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAMDECK, "0");
+    }
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 
 #if defined(SDL_PLATFORM_WIN32)

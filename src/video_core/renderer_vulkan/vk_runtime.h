@@ -50,12 +50,24 @@ public:
         return std::exchange(untracked_skips, 0);
     }
 
+    /// guest_sync_barriers telemetry: guest sync points that ordered pending guest accesses, and
+    /// guest writes left without a barrier.
+    std::pair<u64, u64> DrainGuestSyncStats() {
+        return {std::exchange(guest_syncs, 0), std::exchange(relaxed_write_skips, 0)};
+    }
+
+    /// A guest synchronizing packet: every access recorded so far is ordered before what follows.
+    void NoteGuestSync();
+
     void CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                     std::span<const vk::BufferCopy> copies);
 
     void FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value);
 
     void InlineData(VideoCore::Buffer* dst, u64 offset, u32 value);
+
+    /// Writes `data` into `dst` in stream order (vkCmdUpdateBuffer, 4-byte aligned).
+    void UpdateBuffer(const VideoCore::Buffer* dst, u64 offset, std::span<const u8> data);
 
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
@@ -65,6 +77,9 @@ public:
                      std::span<const vk::BufferImageCopy> upload_copies);
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                        std::span<const vk::BufferImageCopy> download_copies);
+    /// Copies an image straight into guest memory held in a GPU-visible chunk.
+    void DownloadImageInPlace(VideoCore::Image* src, vk::Buffer dst,
+                              std::span<const vk::BufferImageCopy> download_copies);
 
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
@@ -85,10 +100,11 @@ public:
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
     void AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                      vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access);
+                      vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                      bool guest_shader = false);
 
     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                          bool check_read_access = false);
+                          bool check_read_access = false, bool guest_shader = false);
 
     void FlushBarriers();
 
@@ -105,6 +121,8 @@ private:
         using AccessList = IntervalList<Interval>;
         AccessList read_ranges;
         AccessList write_ranges;
+        AccessList ordered_read_ranges;
+        AccessList ordered_write_ranges;
     };
     BufferBarriers* resource{};
     std::vector<BufferBarriers> resources;
@@ -115,6 +133,10 @@ private:
     u64 barrier_skips{};
     const VideoCore::Buffer* untracked_buffer{};
     u64 untracked_skips{};
+    bool guest_sync_barriers{};
+    bool guest_accesses_unordered{};
+    u64 guest_syncs{};
+    u64 relaxed_write_skips{};
 };
 
 } // namespace Vulkan

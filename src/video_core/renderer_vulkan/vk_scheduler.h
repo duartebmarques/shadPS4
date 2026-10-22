@@ -6,8 +6,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -527,9 +529,30 @@ public:
         if (work_semaphore.IsFree(tick)) {
             return true;
         }
+        if (tick_query_interval_ns_ != 0) {
+            const u64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+            if (now - last_tick_query_.load(std::memory_order_relaxed) < tick_query_interval_ns_) {
+                return false;
+            }
+            last_tick_query_.store(now, std::memory_order_relaxed);
+        }
         work_semaphore.Refresh();
         return work_semaphore.IsFree(tick);
     }
+
+    /// A GPU timestamp and the session whose command buffer holds it.
+    struct GpuTimestamp {
+        u32 slot;
+        u64 session;
+    };
+
+    /// Records a GPU timestamp at the current point of the command stream, after all earlier
+    /// work. The first call starts timing every later session.
+    GpuTimestamp WriteGpuTimestamp();
+
+    /// GPU execution time, in nanoseconds, from the first timed session up to a timestamp whose
+    /// tick finished. Gaps where the GPU waited for the next submission do not count.
+    u64 ReadGpuBusyNs(const GpuTimestamp& timestamp);
 
     /// Returns the scheduler timeline semaphore.
     [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
@@ -561,7 +584,15 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// Hands this scheduler's plain submits to the shared submit thread (async_submit).
+    void EnableAsyncSubmit();
+
+    /// Returns once the submit thread has passed every queued submit to the driver.
+    static void DrainSubmits();
+
     static std::mutex submit_mutex;
+    /// Guards the graphics queue; the submit thread takes it without submit_mutex.
+    static std::mutex queue_mutex;
 
 private:
     void EndSession();
@@ -571,6 +602,9 @@ private:
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
+    bool async_submit_{};
+    u64 tick_query_interval_ns_{};
+    std::atomic<u64> last_tick_query_{};
     const Instance& instance;
     Semaphore work_semaphore;
     CommandPool command_pool;
@@ -580,7 +614,26 @@ private:
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
+        u64 seq{};
+        u32 span_slot{UINT32_MAX};
     };
+    struct BusySpan {
+        u64 session;
+        u64 tick;
+        u32 slot;
+    };
+    void AccumulateBusy(u64 session_limit, u64 tick_limit);
+    static constexpr u32 TimestampSlots = 4096;
+    vk::QueryPool timestamp_pool{};
+    vk::QueryPool span_pool{};
+    u32 timestamp_next{};
+    u32 span_next{};
+    double timestamp_period{};
+    u64 session_seq{};
+    std::mutex busy_mutex;
+    std::deque<BusySpan> busy_spans;
+    u64 busy_ticks{};
+    u64 busy_prev_end{};
     std::vector<Session> sessions;
     std::condition_variable_any event_cv;
     struct PendingOp {

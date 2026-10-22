@@ -41,6 +41,7 @@ struct Info;
 namespace Vulkan {
 
 class Instance;
+class Rasterizer;
 class Scheduler;
 class ShaderCache;
 
@@ -186,7 +187,8 @@ struct DrawIndirectParams {
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
-                           AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
+                           const Rasterizer& rasterizer, AmdGpu::Liverpool* liverpool,
+                           u32 sparse_page_shift);
     ~PipelineCache();
 
     void WarmUp();
@@ -195,7 +197,8 @@ public:
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage,
-                           Shader::Gcn::FetchShaderData& fetch_out);
+                           Shader::Gcn::FetchShaderData& fetch_out,
+                           Shader::Backend::Bindings& binding);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
@@ -288,6 +291,7 @@ private:
 private:
     const Instance& instance;
     Scheduler& scheduler;
+    const Rasterizer& rasterizer;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
     PipelineLayoutCache layouts; // destroyed after every pipeline
@@ -527,6 +531,7 @@ private:
     // deserialized permutations get signatures). Gates the spec-fingerprint tier and the
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.
     bool spec_fp_cache{};
+    u32 num_unchained_pipelines{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

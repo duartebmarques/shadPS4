@@ -290,6 +290,11 @@ public:
     }
 
     /// Returns the vendor ID of the physical device
+    /// Whether guest direct memory can be allocated as exported dma-buf memory.
+    bool IsGuestMemoryExportSupported() const {
+        return supports_guest_memory_export;
+    }
+
     u32 GetVendorID() const {
         return properties.vendorID;
     }
@@ -475,6 +480,8 @@ public:
 
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
+    /// Usage and the driver's current budget over the same heaps, from one query.
+    void GetDeviceMemoryUsageAndBudget(u64& usage, u64& budget) const;
 
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
@@ -561,6 +568,7 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool supports_memory_budget{};
+    bool supports_guest_memory_export{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

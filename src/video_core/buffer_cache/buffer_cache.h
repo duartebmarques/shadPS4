@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -163,12 +164,39 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// Guest memory in place (inplace_guest_memory 2): whether arena blocks may be bound to the
+    /// guest's own GPU-visible direct memory.
+    [[nodiscard]] bool IsGuestMemoryInPlace() const noexcept {
+        return in_place;
+    }
+
+    /// Queues an unmapped guest range: blocks bound in place are released and rebound to
+    /// whatever is mapped there at their next use. Any thread.
+    void UnmapInPlace(VAddr device_addr, u64 size);
+
+    /// The command processor writes this memory on the CPU (in parse order, not GPU order).
+    /// Returns true when a block already read in place is marked for the first time: work
+    /// queued against it must finish before the write lands.
+    bool NoteCpWrite(VAddr device_addr, u64 size);
+
+    /// Whether every block of the range is bound in place (the GPU reads the guest's bytes).
+    [[nodiscard]] bool IsAllInPlace(VAddr device_addr, u64 size) const {
+        return in_place && size != 0 &&
+               AllInPlace(device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
+    }
+
+    /// Whether any block of the range is bound in place.
+    [[nodiscard]] bool IsAnyInPlace(VAddr device_addr, u64 size) const;
+
     /// residency_bitmap and clean_sync_peek telemetry, reset on read.
     struct FastPathStats {
         u64 resident_checks;
         u64 resident_hits;
         u64 sync_peeks;
         u64 sync_clean;
+        u64 small_in_place;  ///< Small reads bound in place (no copy).
+        u64 small_cp_marked; ///< Small reads copied: the CP wrote that memory at parse time.
+        u64 small_other;     ///< Small reads copied: memory not bound in place.
     };
     FastPathStats DrainFastPathStats() {
         return std::exchange(fast_stats, {});
@@ -244,9 +272,26 @@ private:
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
+    /// Blocks [first, last] are all bound to guest memory in place.
+    bool AllInPlace(u64 first_block, u64 last_block) const;
+    /// Calls func(addr, size) for each part of the range not bound in place.
+    void ForEachNotInPlace(VAddr device_addr, u64 size, auto&& func) const;
+    /// The run of blocks from `block` (before `end`) that can be bound in place: one contiguous
+    /// piece of one chunk. Returns the run length, 0 when `block` cannot.
+    u64 InPlaceRun(u64 block, u64 end, vk::DeviceMemory* memory, u64* memory_block) const;
+    /// Releases the in-place blocks of queued unmapped ranges (GPU thread).
+    void ProcessPendingUnmaps();
+    /// Records a GPU write to in-place memory at the tick being recorded.
+    void NoteInPlaceWrite(VAddr device_addr, u64 size);
+    /// Whether an in-place GPU write to the range may still be pending on the GPU.
+    bool IsInPlaceWritePending(VAddr device_addr, u64 size) const;
+
     /// Streams a read-only range through the copy lane. Returns the stream buffer offset, or
     /// nullopt when the range must be copied inline.
     std::optional<u64> StreamViaLane(VAddr device_addr, u32 size);
+    /// A small read-only range bound in place, or nullopt (the caller copies it).
+    std::optional<std::pair<const Buffer*, u64>> TryInPlaceRead(VAddr device_addr, u32 size);
+    bool IsCpWritten(u64 first_block, u64 last_block) const;
 
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
@@ -309,6 +354,29 @@ private:
     /// One bit per sparse block that has backing (residency_bitmap). Residency only grows, so
     /// EnsureResident sets bits and nothing clears them.
     std::vector<u64> resident_bits;
+    /// One bit per resident_bits word that is all set, so long ranges check in few words.
+    std::vector<u64> resident_full;
+
+    // Guest memory in place (inplace_guest_memory 2).
+    bool in_place{};
+    /// One bit per sparse block bound to guest memory in place.
+    std::vector<u64> in_place_bits;
+    std::vector<u64> in_place_full;
+    std::mutex pending_unmaps_mutex;
+    std::vector<std::pair<VAddr, u64>> pending_unmaps;
+    std::atomic<bool> has_pending_unmaps{};
+    /// Sparse binds made after an unmap wait for the work submitted before it.
+    u64 bind_wait_tick{};
+    /// Newest tick of a GPU write to in-place memory, per 1 MiB of guest address space.
+    static constexpr u32 WriteTickShift = 20;
+    std::unique_ptr<std::atomic<u64>[]> in_place_write_ticks;
+    /// inplace_guest_memory 3: small read-only buffers are read in place too, unless the command
+    /// processor writes their memory while parsing (CE constant dumps, CPU-side WRITE_DATA/DMA):
+    /// queued draws must keep the snapshot those writes would otherwise overtake.
+    bool in_place_small_reads{};
+    /// One bit per sparse block the command processor wrote on the CPU. Sticky.
+    std::unique_ptr<std::atomic<u64>[]> cp_written_bits;
+    u64 cp_written_words{};
     bool clean_sync_peek{};
     FastPathStats fast_stats{};
 

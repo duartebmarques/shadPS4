@@ -212,7 +212,7 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
         return "/";
     }
 
-    const auto* mount = GetMount(corrected_path);
+    const auto mount = GetMount(corrected_path);
     if (!mount) {
         return "";
     }

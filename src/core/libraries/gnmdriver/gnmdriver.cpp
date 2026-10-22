@@ -1775,8 +1775,7 @@ s32 PS4_SYSV_ABI sceGnmSetGsRingSizes(u32 esgs_ring_size, u32 gsvs_ring_size) {
         return 0x08000000;
     }
     if (liverpool) {
-        liverpool->regs.vgt_esgs_ring_size = esgs_ring_size >> 8;
-        liverpool->regs.vgt_gsvs_ring_size = gsvs_ring_size >> 8;
+        liverpool->SetGsRingSizes(esgs_ring_size >> 8, gsvs_ring_size >> 8);
     }
     return ORBIS_OK;
 }

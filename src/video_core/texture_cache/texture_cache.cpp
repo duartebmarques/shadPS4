@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <limits>
 
@@ -21,6 +22,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -208,6 +210,19 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
         return;
     }
     ASSERT(copy_size <= image.info.guest_size);
+    if (!image.info.props.is_tiled && DownloadImageInPlace(image, buffer_copies, copy_size)) {
+        const auto bump = [] { Skipcache::Framework::Instance().BumpMemGen(); };
+        if (is_sync) {
+            const u64 t0 = Common::FencedRDTSC();
+            scheduler.Finish();
+            scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage,
+                                 Common::FencedRDTSC() - t0);
+            bump();
+        } else {
+            scheduler.DeferPriorityOperation(bump);
+        }
+        return;
+    }
     const auto download =
         runtime.GetStagingPool().Request(copy_size, MemoryType::HostCached, 16, !is_sync);
 
@@ -239,6 +254,59 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     }
 }
 
+bool TextureCache::DownloadImageInPlace(Image& image,
+                                        std::span<vk::BufferImageCopy> buffer_copies,
+                                        u64 copy_size) {
+    if (!EmulatorSettings.IsInplaceImageDownloads() || !Vulkan::GuestMemory::Installed()) {
+        return false;
+    }
+    const auto phys = Core::Memory::Instance()->DirectPhysOf(image.info.guest_address, copy_size);
+    if (!phys || (*phys & 15) != 0) {
+        return false;
+    }
+    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    if (!chunk || *phys + copy_size > chunk->phys + chunk->size) {
+        return false;
+    }
+    for (auto& copy : buffer_copies) {
+        copy.bufferOffset += *phys - chunk->phys;
+    }
+    runtime.DownloadImageInPlace(&image, chunk->buffer, buffer_copies);
+    return true;
+}
+
+bool TextureCache::DownloadImageInPlace(Image& image, u32 download_size) {
+    if (!EmulatorSettings.IsInplaceImageDownloads() || !Vulkan::GuestMemory::Installed()) {
+        return false;
+    }
+    const auto phys =
+        Core::Memory::Instance()->DirectPhysOf(image.info.guest_address, download_size);
+    if (!phys || (*phys & 15) != 0) {
+        return false;
+    }
+    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    if (!chunk || *phys + download_size > chunk->phys + chunk->size) {
+        return false;
+    }
+    const vk::BufferImageCopy image_download = {
+        .bufferOffset = *phys - chunk->phys,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    };
+    runtime.DownloadImageInPlace(&image, chunk->buffer, std::span{&image_download, 1});
+    return true;
+}
+
 bool TextureCache::DownloadImageMemoryAsync(ImageId image_id) {
     Image& image = slot_images[image_id];
     // Copies into a buffer need a single-sample image.
@@ -253,6 +321,10 @@ bool TextureCache::DownloadImageMemoryAsync(ImageId image_id) {
     if (download_size == 0 || download_size > image.info.guest_size ||
         download_size > MaxDownloadSize) {
         return false;
+    }
+    if (DownloadImageInPlace(image, download_size)) {
+        scheduler.DeferPriorityOperation([] { Skipcache::Framework::Instance().BumpMemGen(); });
+        return true;
     }
     // Each copy gets its own staging buffer, so no later copy can reuse the bytes before the
     // background writer has read them.
@@ -2032,9 +2104,41 @@ void TextureCache::MarkDirtyIfEdgesModified(Image& image) {
 
 void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+        u64 budget = 0;
+        if (instance.IsIntegrated()) {
+            instance.GetDeviceMemoryUsageAndBudget(total_used_memory, budget);
+        } else {
+            total_used_memory = instance.GetDeviceMemoryUsage();
+        }
+        // On integrated GPUs (Steam Deck) the usage covers the system-memory heaps, which hold
+        // far more than images (the buffers backing guest memory), while the startup budget
+        // keeps only what is left after an 8 GB system reserve (its 2 GB floor on the Deck).
+        // Usage then sat above the critical mark for good, and every submission evicted images
+        // used a few frames ago and uploaded them again. Compare with the driver's current
+        // budget instead. Ported from bbport (deadinside28/bloodborne_pc).
+        if (budget != 0) {
+            trigger_gc_memory = budget / 10 * 7;
+            pressure_gc_memory = budget / 100 * 85;
+            critical_gc_memory = budget / 100 * 95;
+        }
     }
-    if (total_used_memory < trigger_gc_memory) {
+    // Integrated GPUs (Steam Deck): images left unused for IdleSeconds go even below the trigger,
+    // so the textures of areas left behind do not pile up in the shared system memory until the
+    // budget marks are reached. Ported from bbport (deadinside28/bloodborne_pc).
+    constexpr u64 IdleSeconds = 20;
+    u64 idle_tick = 0;
+    if (instance.IsIntegrated()) {
+        const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::steady_clock::now().time_since_epoch())
+                                                .count());
+        if (second != gc_second) {
+            gc_second = second;
+            gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+        }
+        idle_tick = gc_tick_at_second[(second - IdleSeconds) % gc_tick_at_second.size()];
+    }
+    const bool below_trigger = total_used_memory < trigger_gc_memory;
+    if (below_trigger && idle_tick == 0) {
         return;
     }
     lru_lazy_gc_runs_ += lru_lazy_touch;
@@ -2047,6 +2151,30 @@ void TextureCache::GarbageCollectImages() {
         FlushMemoRangeBatch();
         memo_range_batching_ = false;
     };
+    if (below_trigger) {
+        // Idle pass: only images the CPU side can drop without a write-back (GPU-written ones
+        // stay), at most a few per collection and a bounded walk.
+        size_t idle_deletions = 10;
+        u32 visited = 0;
+        image_lru_cache.ForEachItemBelow(idle_tick, [&](Image& image) {
+            if (idle_deletions == 0 || ++visited > 256) {
+                return true;
+            }
+            if (image.gc_tick_accessed_last >= idle_tick) {
+                // Lazy touch mode: the list tick is only a lower bound; relink at gc_tick.
+                image_lru_cache.Touch(image, gc_tick);
+                return false;
+            }
+            if (image.SafeToDownload()) {
+                return false;
+            }
+            --idle_deletions;
+            FreeImage(slot_images.GetSlotId(image));
+            return false;
+        });
+        return;
+    }
+
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;

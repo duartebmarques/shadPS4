@@ -491,6 +491,40 @@ struct GPUSettings {
     // worker thread. Past the wait the draws that need it are skipped until the compile is done:
     // a lower value means shorter hitches and more pop-in. Clamped to 50000.
     Setting<int> pipeline_sync_budget_ms{50};
+    // Guest memory in place (ported from bbport, deadinside28/bloodborne_pc). Read once at boot.
+    // 0: off. 1: honest fences only - EOP/EOS/RELEASE_MEM labels, their interrupts and the GPU
+    // idle interrupt are signalled after the GPU really finished the work recorded before them,
+    // instead of when the packet is decoded. 2: also keep guest direct memory in GPU-visible
+    // system memory (dma-buf) used by the GPU in place, without arena copies (Linux, AMD).
+    // 3: also read small read-only buffers in place instead of copying them to the stream
+    // buffer, except memory the command processor writes on the CPU (constant dumps).
+    Setting<u32> inplace_guest_memory{0};
+    // Order guest shader buffer writes the way the guest GPU does: a write overlapping only
+    // accesses that guest draws and dispatches made since the last synchronizing packet (partial
+    // flushes, cache flushes, ACQUIRE_MEM, waits and end-of-pipe/shader signals) gets no barrier,
+    // as such work may overlap on the guest GPU too. Reads after writes and every access made by
+    // emulator transfers keep their barriers.
+    Setting<bool> guest_sync_barriers{false};
+    // With inplace_guest_memory 2+, copy GPU-written images back into guest memory on the GPU,
+    // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a
+    // CPU copy on the completion thread, which end-of-pipe labels queue behind.
+    Setting<bool> inplace_image_downloads{true};
+    // Two-stage draw pipeline (ported from bbport). The GPU command thread decodes the command
+    // stream and hands draws and dispatches, with the registers they changed, to a recording
+    // thread that keeps its own register copy and records them. Other packets that touch the
+    // caches or the scheduler wait for the recording thread to run dry first. Read once at boot.
+    Setting<bool> draw_pipe{false};
+    // Hand graphics queue submits to a submit thread, so the thread that records commands does
+    // not wait in the driver. Only submits that signal nothing but the scheduler timeline go
+    // there; the others wait for it to run dry and submit in place. Read once at boot.
+    Setting<bool> async_submit{false};
+    // A scheduler tick check that misses queries the GPU timeline (one ioctl) at most once per
+    // this many microseconds; misses in between answer "busy". Waits still query. 0 = always.
+    Setting<u32> tick_query_interval_us{0};
+    // With honest fences, the GPU time guest timestamps count, in percent of the host GPU time.
+    // Games that pick optional effects from their measured GPU frame time switch them on and off
+    // every few frames when the host GPU sits near their budget; below 100 reports a faster GPU.
+    Setting<u32> guest_gpu_time_percent{100};
     // Flush the open graphics batch early when it already holds this many draws and every batch
     // submitted so far has retired (the ring runs dry while the rest of the batch is recorded).
     // Rounded up to a multiple of 32, and ignored unless flush_draw_interval is set larger than
@@ -754,6 +788,12 @@ struct GPUSettings {
             GPU_OVERRIDE(clean_sync_peek),
             GPU_OVERRIDE(readback_offload),
             GPU_OVERRIDE(pipeline_sync_budget_ms),
+            GPU_OVERRIDE(inplace_guest_memory),
+            GPU_OVERRIDE(guest_sync_barriers),
+            GPU_OVERRIDE(inplace_image_downloads),
+            GPU_OVERRIDE(draw_pipe),
+            GPU_OVERRIDE(async_submit),
+            GPU_OVERRIDE(tick_query_interval_us),
             GPU_OVERRIDE(ring_drain_flush_draws),
             GPU_OVERRIDE(pending_pop_throttle),
             GPU_OVERRIDE(stream_copy_workers),
@@ -807,6 +847,7 @@ struct GPUSettings {
             GPU_OVERRIDE(image_fast_state),
             GPU_OVERRIDE(guest_copy_lock_batch),
             GPU_OVERRIDE(spec_mru_perm_probe),
+            GPU_OVERRIDE(guest_gpu_time_percent),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
@@ -847,7 +888,8 @@ struct GPUSettings {
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, fast_shader_math, pipeline_sync_budget_ms, \
-    one_core_gpu_thread_pin
+    one_core_gpu_thread_pin, inplace_guest_memory, guest_sync_barriers, inplace_image_downloads, \
+    draw_pipe, async_submit, tick_query_interval_us, guest_gpu_time_percent
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1189,6 +1231,13 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, CleanSyncPeek, clean_sync_peek)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
     SETTING_FORWARD(m_gpu, PipelineSyncBudgetMs, pipeline_sync_budget_ms)
+    SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
+    SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
+    SETTING_FORWARD_BOOL(m_gpu, InplaceImageDownloads, inplace_image_downloads)
+    SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
+    SETTING_FORWARD_BOOL(m_gpu, AsyncSubmit, async_submit)
+    SETTING_FORWARD(m_gpu, TickQueryIntervalUs, tick_query_interval_us)
+    SETTING_FORWARD(m_gpu, GuestGpuTimePercent, guest_gpu_time_percent)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)

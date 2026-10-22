@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/skipcache/skipcache.h"
@@ -591,7 +592,7 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.SelectRegs();
     const auto BuildCommon = [&](const auto& program) {
         info.props.fp_denorm_mode32 = program.settings.fp_denorm_mode32;
         info.props.fp_denorm_mode16_64 = program.settings.fp_denorm_mode64;
@@ -723,7 +724,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         break;
     }
     case HwStage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
+        const auto& cs_pgm = rasterizer.SelectCsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
         info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
@@ -778,7 +779,7 @@ template <bool Fuse>
 SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __restrict out,
                                                         const u32* __restrict cmp,
                                                         u64* diff) const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.SelectRegs();
     u32 n = 0;
     // Two accumulators: a single OR chain over up to 61 words is a latency
     // chain the core cannot overlap. Words are read from the source through
@@ -849,7 +850,7 @@ SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __re
         break;
     }
     case HwStage::Compute: {
-        const auto& cs = liverpool->GetCsRegs();
+        const auto& cs = rasterizer.SelectCsRegs();
         put(cs.settings);
         put(cs.num_thread_x);
         put(cs.num_thread_y);
@@ -947,8 +948,9 @@ SHAD_NO_INLINE void PipelineCache::ValidateRuntimeInfoMemo(HwStage stage, SwStag
 }
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
-                             AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
-    : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
+                             const Rasterizer& rasterizer_, AmdGpu::Liverpool* liverpool_,
+                             u32 sparse_page_shift)
+    : instance{instance_}, scheduler{scheduler_}, rasterizer{rasterizer_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes}, layouts{instance} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -1142,7 +1144,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // at, not on the one that first stored it.
     if (last_graphics_pipeline && pipe_gen == last_graphics_pipe_gen &&
         graphics_key == last_graphics_key) {
-        last_key_stamp = liverpool->GetGfxStateStamp();
+        last_key_stamp = rasterizer.SelectGfxStateStamp();
         key_is_last = true;
         ++key_refresh_same;
         return last_graphics_pipeline;
@@ -1213,7 +1215,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
     last_graphics_pipeline = it->second.get();
     last_graphics_pipe_gen = pipe_gen;
-    last_key_stamp = liverpool->GetGfxStateStamp();
+    last_key_stamp = rasterizer.SelectGfxStateStamp();
     key_is_last = true;
     return last_graphics_pipeline;
 }
@@ -1357,7 +1359,7 @@ bool PipelineCache::DrawsPhoto() const {
 // refresh. The Fragment runtime-info slot must be stamp-current: its rebuild
 // reads the key's color buffers, which the full refresh has already masked.
 bool PipelineCache::ReuseGraphicsKey(u64 pipe_gen) {
-    const u64 stamp = liverpool->GetGfxStateStamp();
+    const u64 stamp = rasterizer.SelectGfxStateStamp();
     const auto& fs_slot = ri_stamp[static_cast<u32>(SwStage::Fragment)];
     if (!last_graphics_pipeline || pipe_gen != last_graphics_pipe_gen || stamp != last_key_stamp ||
         !fs_slot.valid || fs_slot.stamp != stamp) {
@@ -1602,7 +1604,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     key_is_last = false;
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.SelectRegs();
     auto& key = graphics_key;
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
@@ -1751,7 +1753,7 @@ Shader::ShaderParams PipelineCache::ResolveParams(SwStage l_stage, const Pgm& pg
 }
 
 bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
-    const auto& regs = liverpool->regs;
+    const auto& regs = rasterizer.SelectRegs();
     auto& key = graphics_key;
     fetch_shader_ref = {};
     stage_hash_diff = 0;
@@ -1899,7 +1901,7 @@ bool PipelineCache::RefreshGraphicsStages(bool track_hash_diff) {
 
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = rasterizer.SelectCsRegs();
     const auto cs_params = ResolveParams(SwStage::Compute, cs_pgm);
     // The compute program publishes into slot 0, which the compute lookup
     // dereferences; compute stages carry no fetch shader.
@@ -1957,6 +1959,28 @@ SHAD_FORCE_INLINE u64 PipelineCache::Publish(u32 out_slot, SwStage l_stage,
     return hash;
 }
 
+// A permutation index names the store's entries. The store can hold permutations this session has
+// not loaded, which cached pipeline keys still name; a new one takes the next unused index.
+static size_t FreePermutationIndex(u64 pgm_hash, size_t perm_idx) {
+    while (Storage::DataBase::Instance().Contains(
+        Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", HashCombine(pgm_hash, perm_idx)))) {
+        ++perm_idx;
+    }
+    return perm_idx;
+}
+
+// Every later hit of the program advances the bindings by its info, as the pipeline layout does;
+// a compile whose SPIR-V spans a different range leaves the next stages' bindings undeclared.
+static void CheckBindingSpan(const Shader::Info& info, Shader::Backend::Bindings start,
+                             const Shader::Backend::Bindings& emitted, size_t perm_idx) {
+    info.AddBindings(start);
+    if (start != emitted) {
+        LOG_ERROR(Render_Vulkan,
+                  "{} shader {:#x} permutation {} spans bindings to {}, its layout to {}",
+                  info.hw_stage, info.pgm_hash, perm_idx, emitted.unified, start.unified);
+    }
+}
+
 // The first-ever build of a program: a few hundred calls per session, each
 // carrying a StageSpecialization that must not sit in GetProgram's frame.
 u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
@@ -1967,20 +1991,23 @@ u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
     created_slot = std::make_unique<Program>(stage, l_stage, params);
     auto start = binding;
     auto ri_compile = runtime_info;
-    const auto module = CompileModule(created_slot->info, ri_compile, params.code, 0, binding);
+    const size_t perm_idx = FreePermutationIndex(params.hash, 0);
+    const auto module =
+        CompileModule(created_slot->info, ri_compile, params.code, perm_idx, binding);
+    CheckBindingSpan(created_slot->info, start, binding, perm_idx);
     NoteSharpVerdicts(created_slot->info);
     auto spec = Shader::StageSpecialization(created_slot->info, ri_compile, profile, start);
-    const auto perm_hash = HashCombine(params.hash, 0);
+    const auto perm_hash = HashCombine(params.hash, perm_idx);
 
     if (spec_fp_cache) {
         spec.ComputeSig();
     }
-    RegisterShaderMeta(created_slot->info, spec.fetch_shader_data, spec, perm_hash, 0);
-    created_slot->AddPermut(module, std::move(spec));
+    RegisterShaderMeta(created_slot->info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+    created_slot->InsertPermut(module, std::move(spec), perm_idx);
     id.program = created_slot.get();
     id.program_hash = params.hash;
-    return Publish(out_slot, l_stage, &created_slot->info, module, created_slot.get(), 0u,
-                   perm_hash);
+    return Publish(out_slot, l_stage, &created_slot->info, module, created_slot.get(),
+                   static_cast<u32>(perm_idx), perm_hash);
 }
 
 u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::ShaderParams& params,
@@ -1999,7 +2026,7 @@ u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::Shad
     }
     const bool stampable =
         ri_stamp_gate && (stage == HwStage::Vertex || stage == HwStage::Fragment);
-    const u64 reg_stamp = stampable ? liverpool->GetGfxStateStamp() : 0;
+    const u64 reg_stamp = stampable ? rasterizer.SelectGfxStateStamp() : 0;
     if (!stampable || !ri_slot.valid || ri_slot.stamp != reg_stamp ||
         ri_slot.stage != static_cast<u8>(stage) ||
         (stage == HwStage::Vertex && ri_slot.indirect_key != indirect_key_)) {
@@ -2333,8 +2360,8 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
             // perm_index_by_sig keeps only the first index per sig (AddPermut), so a sig
             // collision still needs the scan.
             for (size_t i = 0; i < program->modules.size(); ++i) {
-                const auto& ms = program->modules[i].spec;
-                if (ms.sig == spec.sig && ms.sig2 == spec.sig2) {
+                const auto& m = program->modules[i];
+                if (m.module && m.spec.sig == spec.sig && m.spec.sig2 == spec.sig2) {
                     hit_idx = i;
                     break;
                 }
@@ -2344,7 +2371,8 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
                 // permutation can go unrecognised by (sig, sig2) while being the same
                 // specialization; compiling it again stores a duplicate the warm-up later
                 // refuses to preload. Settle a miss structurally before compiling.
-                const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+                const auto it = std::ranges::find_if(
+                    program->modules, [&](const auto& m) { return m.module && m.spec == spec; });
                 if (it != program->modules.end()) {
                     hit_idx = static_cast<size_t>(std::distance(program->modules.begin(), it));
                 }
@@ -2364,7 +2392,8 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
             }
         }
         if (hit_idx == std::numeric_limits<size_t>::max()) {
-            const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+            const auto it = std::ranges::find_if(
+                program->modules, [&](const auto& m) { return m.module && m.spec == spec; });
             if (it != program->modules.end()) {
                 hit_idx = static_cast<size_t>(std::distance(program->modules.begin(), it));
             }
@@ -2373,10 +2402,14 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
     if (hit_idx == std::numeric_limits<size_t>::max()) {
         auto new_info = Shader::Info(stage, l_stage, params);
         auto ri_compile = runtime_info;
+        const auto start = binding;
+        perm_idx = FreePermutationIndex(params.hash, perm_idx);
+        perm_hash = HashCombine(params.hash, perm_idx);
         module = CompileModule(new_info, ri_compile, params.code, perm_idx, binding);
+        CheckBindingSpan(info, start, binding, perm_idx);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
         module = program->modules[hit_idx].module;

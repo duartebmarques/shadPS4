@@ -99,6 +99,7 @@ public:
     void UpdateAcceleration(const float acceleration[3]);
     void PollState();
     void ResetOrientation();
+    void SetShake(bool active);
     void SetLightBarRGB(u8 const r, u8 const g, u8 const b);
     void SetLightBarRGB(Colour const c);
     Colour GetLightBarRGB();
@@ -129,6 +130,8 @@ private:
     u64 m_shake_start{};
     float m_synthetic_roll{};
     float m_synthetic_pitch{};
+    bool m_spray_active{};
+    u64 m_spray_start{};
     Colour colour;
     std::optional<Colour> override_colour{};
 

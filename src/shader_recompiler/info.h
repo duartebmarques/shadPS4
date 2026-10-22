@@ -147,17 +147,60 @@ struct Info : InfoPersistent {
         : InfoPersistent(stage_, l_stage_, params.hash), pgm_base{params.Base()},
           user_data{params.user_data} {}
 
+    /// Draw pipe (vk_draw_pipe.h): the per-draw fields below as the draw being recorded saw
+    /// them. The GPU command thread refreshes user_data, flat_ud and pgm_base when it selects
+    /// the next draw's pipeline while the recording thread may still record an earlier draw,
+    /// so that thread installs the selecting draw's copies here and reads them back through
+    /// UserData(), FlatUd() and PgmBase().
+    struct UdSnapshot {
+        const Info* info;
+        const u32* user_data;
+        const u32* flat;
+        VAddr pgm_base;
+    };
+    static constexpr u32 MaxUdSnapshots = 8;
+    static inline thread_local std::array<UdSnapshot, MaxUdSnapshots> ud_snapshots{};
+    static inline thread_local u32 num_ud_snapshots = 0;
+
+    const UdSnapshot* Snapshot() const noexcept {
+        for (u32 i = 0; i < num_ud_snapshots; ++i) {
+            if (ud_snapshots[i].info == this) {
+                return &ud_snapshots[i];
+            }
+        }
+        return nullptr;
+    }
+    std::span<const u32> UserData() const noexcept {
+        if (const auto* snapshot = Snapshot()) {
+            return {snapshot->user_data, NUM_USER_DATA_REGS};
+        }
+        return user_data;
+    }
+    const u32* FlatUd() const noexcept {
+        if (const auto* snapshot = Snapshot()) {
+            return snapshot->flat;
+        }
+        return flat_ud;
+    }
+    VAddr PgmBase() const noexcept {
+        if (const auto* snapshot = Snapshot()) {
+            return snapshot->pgm_base;
+        }
+        return pgm_base;
+    }
+
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(flat_ud + sharp_idx);
+        return *reinterpret_cast<const T*>(FlatUd() + sharp_idx);
     }
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;
-        const u32* base = user_data.data();
+        const auto ud = UserData();
+        const u32* base = ud.data();
         if (ptr_index != IR::NumScalarRegs) {
-            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+            std::memcpy(&base, &ud[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
@@ -166,7 +209,14 @@ struct Info : InfoPersistent {
 
     void AddBindings(Backend::Bindings& bnd) const {
         bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + samplers.size();
+        bnd.unified += buffers.size() + samplers.size();
+        // Must advance as the SPIR-V backend and the pipeline layout do: a mip fallback image
+        // takes one binding per level.
+        for (const auto& image : images) {
+            bnd.unified += image.mip_fallback_mode == MipStorageFallbackMode::DynamicIndex
+                               ? image.NumBindings(*this)
+                               : 1;
+        }
     }
 
     void RefreshFlatBuf() {

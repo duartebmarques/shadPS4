@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -480,6 +482,12 @@ private:
     /// Returns true when a copy was recorded.
     bool DownloadImageMemoryAsync(ImageId image_id);
 
+    /// Copies the image into its guest memory on the GPU when that memory is a GPU-visible
+    /// chunk. Returns false when it is not, and the caller copies through staging.
+    bool DownloadImageInPlace(Image& image, std::span<vk::BufferImageCopy> buffer_copies,
+                              u64 copy_size);
+    bool DownloadImageInPlace(Image& image, u32 download_size);
+
     /// Register image in the page table
     void RegisterImage(ImageId image);
 
@@ -826,6 +834,10 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    // gc_tick at the first collection of each of the last 64 seconds, to age images in seconds
+    // (integrated GPUs evict images unused for a while even below the trigger).
+    std::array<u64, 64> gc_tick_at_second{};
+    u64 gc_second = 0;
     Common::LRUCache<Image> image_lru_cache;
     // Lazy-touch GC-walk accounting; only written with lru_lazy_touch latched on.
     u64 lru_lazy_gc_runs_{};
