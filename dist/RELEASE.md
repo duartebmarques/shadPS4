@@ -1,27 +1,25 @@
-## Install on a Steam Deck (3 steps)
+## inFAMOUS Second Son and First Light on a Steam Deck
 
-You need your own copy of **inFAMOUS Second Son (CUSA00004)** dumped from your PS4, with update
-**1.07**, as folders or `.pkg` files, copied anywhere in your home folder or on the SD card.
+You need your own dumps of the games (folders or `.pkg` files) anywhere in your home folder or on
+the SD card: **Second Son** (CUSA00004, update **1.07**) and/or **First Light** (CUSA00897).
 
-1. **Desktop Mode:** press the Steam button > Power > Switch to Desktop.
-2. **Run the installer:** open **Konsole** (app menu > System), paste this line
-   (right-click > Paste) and press Enter. Answer the questions with Enter.
-   ```
-   bash <(curl -fsSL https://github.com/duartebmarques/shadPS4/releases/latest/download/install.sh)
-   ```
-3. **Play:** double-click "Return to Gaming Mode" on the desktop, then Library > Non-Steam >
-   **inFAMOUS Second Son**.
+1. **Desktop Mode:** Steam button > Power > Switch to Desktop.
+2. **Get the app:** download `shadps4-@TAG@-linux.zip` below and extract it: one folder,
+   `shadPS4-infamous`. Double-click `shadPS4.sh` in it: the first start finds your games, then the
+   game picker opens (choose a game > **Play** or **Patches**).
+3. **Steam:** run `./shadPS4.sh --add-to-steam` in that folder, then in Gaming Mode open
+   Library > Non-Steam > **shadPS4 (inFAMOUS)**.
 
-Once, while the game runs: press **...** > Performance, turn on *Use per-game profile*, set
-*Manual GPU clock* to **1600 MHz**, and turn the frame limit **off**. In the game, set
-**Options > Video > Frame Rate** to **30fps limit**: the emulator now paces the game's own limit
-(lag as low as the old built-in cap, which is gone so faster machines can run Unlimited).
+Or the one line in Konsole (installs into `~/Applications/shadPS4-infamous` and adds Steam shortcuts):
+```
+bash <(curl -fsSL https://github.com/duartebmarques/shadPS4/releases/latest/download/install.sh)
+```
 
-The first start builds shaders, so expect stutter for the first minutes. Shake the Deck to shake
-the controller (graffiti); the trackpads act as the PS4 touchpad.
+Once, while a game runs: press **...** > Performance, turn on *Use per-game profile*, set *Manual
+GPU clock* to **1600 MHz**, and turn the frame limit **off**. In the game, set the frame rate option
+to **30fps limit**.
 
-Already installed? Run `~/Applications/shadPS4-infamous/install.sh --update`. Your saves,
-controls and patch choices are kept.
+Already installed (any version)? Run the one-line install again, or `./shadPS4.sh --update` in the
+app folder. Saves, controls and patch choices are kept.
 
 Full guide and troubleshooting: [README](https://github.com/duartebmarques/shadPS4#readme).
-Without internet: download `shadps4-@TAG@-linux.zip` below, extract it and double-click `install.sh`.
