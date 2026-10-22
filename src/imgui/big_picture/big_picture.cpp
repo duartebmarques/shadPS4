@@ -17,6 +17,7 @@
 #include "imgui/big_picture/big_picture.h"
 #include "imgui/big_picture/imgui_impl_sdl3_big_picture.h"
 #include "imgui/big_picture/imgui_impl_sdlrenderer3.h"
+#include "imgui/big_picture/patches_page.h"
 #include "imgui/big_picture/settings_dialog_imgui.h"
 #include "imgui/imgui_std.h"
 #include "imgui/renderer/font_stack.h"
@@ -28,6 +29,10 @@ constexpr float gameImageSize = 200.f;
 
 bool done = false;
 bool showSettings = false;
+bool showPatches = false;
+int selectedGame = -1;
+bool openGamePage = false;
+std::vector<GamePatch> gamePatches;
 
 std::filesystem::path runEbootPath = "";
 std::vector<IconInfo> gameIcons = {};
@@ -90,10 +95,8 @@ void SetGameIcons(std::vector<IconInfo>& gameIcons) {
         if (id != nullptr) {
             if (ImGui::ImageButton(ButtonNameChar, id,
                                    ImVec2(gameImageSize * uiScale, gameImageSize * uiScale))) {
-                done = true;
-                Core::FileSys::MntPoints::ignore_game_patches =
-                    ImGui::IsKeyDown(ImGuiKey::ImGuiKey_LeftCtrl);
-                runEbootPath = gameIcons[i].ebootPath;
+                selectedGame = i;
+                openGamePage = true;
             }
         }
 
@@ -235,6 +238,17 @@ void scanFolder(std::vector<IconInfo>& icons, std::filesystem::path folderPath, 
 
             if (const auto title_id = psf.GetString("TITLE_ID"); title_id.has_value()) {
                 icon.serial = *title_id;
+            }
+
+            if (const auto version = psf.GetString("APP_VER"); version.has_value()) {
+                icon.version = *version;
+            }
+
+            // Add-on content folders (category "ac") carry a param.sfo too, but are no games.
+            if (const auto category = psf.GetString("CATEGORY");
+                category.has_value() && category->starts_with("ac")) {
+                it.increment(ec);
+                continue;
             }
         } else {
             it.increment(ec);
@@ -453,8 +467,46 @@ void Launch(char* executableName, bool sameProcess) {
             ImGui::EndPopup();
         }
 
+        if (openGamePage) {
+            ImGui::OpenPopup("Game");
+            openGamePage = false;
+        }
+        ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (ImGui::BeginPopupModal("Game", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+            const auto& game = gameIcons[selectedGame];
+            ImGui::Text("%s", game.title.c_str());
+            ImGui::TextDisabled("%s  version %s", game.serial.c_str(), game.version.c_str());
+            ImGui::Separator();
+            if (ImGui::Button("Play", ImVec2(160 * uiScale, 0))) {
+                done = true;
+                Core::FileSys::MntPoints::ignore_game_patches =
+                    ImGui::IsKeyDown(ImGuiKey::ImGuiKey_LeftCtrl);
+                runEbootPath = game.ebootPath;
+                ImGui::CloseCurrentPopup();
+            }
+            if (ImGui::IsWindowAppearing()) {
+                ImGui::SetItemDefaultFocus();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Patches", ImVec2(160 * uiScale, 0))) {
+                gamePatches = LoadGamePatches(game.serial);
+                showPatches = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Back", ImVec2(160 * uiScale, 0))) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         if (showSettings) {
             settingsWindow.DrawSettings(&showSettings, applySettings);
+        }
+
+        if (showPatches) {
+            const auto& game = gameIcons[selectedGame];
+            showPatches = DrawPatchesPage(game.title, game.version, gamePatches, uiScale);
         }
 
         ImGui::PopStyleVar(8);

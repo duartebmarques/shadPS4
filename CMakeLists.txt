@@ -1318,6 +1318,8 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/renderer/texture_manager.h
           src/imgui/big_picture/big_picture.cpp
           src/imgui/big_picture/big_picture.h
+          src/imgui/big_picture/patches_page.cpp
+          src/imgui/big_picture/patches_page.h
           src/imgui/big_picture/settings_dialog_imgui.cpp
           src/imgui/big_picture/settings_dialog_imgui.h
           src/imgui/big_picture/settings_dialog_layer.cpp
