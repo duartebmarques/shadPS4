@@ -197,7 +197,9 @@ def config_add_dir(cfg, path):
     import json
     c = json.load(open(cfg)) if os.path.isfile(cfg) else {}
     dirs = c.setdefault("General", {}).setdefault("install_dirs", [])
-    if not any(d.get("path") == path for d in dirs):
+    # A folder under one already listed is found by the picker's recursive scan.
+    covered = lambda d: d.get("enabled", True) and (path + "/").startswith(d.get("path", "").rstrip("/") + "/")
+    if not any(covered(d) for d in dirs):
         dirs.append({"enabled": True, "path": path})
         tmp = cfg + ".tmp"
         json.dump(c, open(tmp, "w"), indent=4)
