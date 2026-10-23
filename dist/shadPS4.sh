@@ -140,6 +140,11 @@ setup() {
         fi
     fi
     : >"$GAMES_LIST.new"
+    # Other games are listed by the game picker (no tuned settings or patches from us).
+    while IFS=$'\t' read -r _ title game _; do
+        py config-add-dir "$U/config.json" "$(dirname "$game")"
+        info "Also found $title: $game"
+    done < <(awk -F'\t' '$1 == "other" && $3 !~ /-(UPDATE|patch)$/ && !seen[$2]++' "$scan")
     while IFS=$'\t' read -r _ title game ver; do
         grep -q "^$title"$'\t' "$GAMES_LIST.new" && continue
         printf '%s\t%s\n' "$title" "$game" >>"$GAMES_LIST.new"
