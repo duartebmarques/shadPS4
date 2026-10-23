@@ -1,0 +1,71 @@
+# Builds one PGO binary per candidate profile, in parallel, for A/B tests on the Deck.
+# Candidates are <name>.profdata assets of the pgo-candidates release (agent tool: pgo-ci).
+
+name: PGO candidates
+
+on:
+  workflow_dispatch:
+    inputs:
+      names:
+        description: 'JSON array of candidate names (assets <name>.profdata), e.g. ["pgoA","pgoB"]'
+        required: true
+      extra_diff:
+        description: 'Optional diff asset of the pgo-candidates release applied before the build (e.g. pad-cmd.diff)'
+        required: false
+        default: ''
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(inputs.names) }}
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Add LLVM repository
+      run: |
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+        sudo add-apt-repository 'deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main'
+
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt install -y libx11-dev libxext-dev libwayland-dev libdecor-0-dev libxkbcommon-dev libglfw3-dev libgles2-mesa-dev libfuse2 clang-19 mold build-essential libasound2-dev libpulse-dev libopenal-dev libudev-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev
+
+    - name: Cache CMake Build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      env:
+          cache-name: ${{ runner.os }}-sdl-pgo-cache-cmake-build
+      with:
+        append-timestamp: false
+        save: false
+        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    - name: Download the candidate profile and diff
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release download pgo-candidates -R ${{ github.repository }} -p "${{ matrix.name }}.profdata" -D $RUNNER_TEMP
+        mv "$RUNNER_TEMP/${{ matrix.name }}.profdata" "$RUNNER_TEMP/shadps4.profdata"
+        if [ -n "${{ inputs.extra_diff }}" ]; then
+          gh release download pgo-candidates -R ${{ github.repository }} -p "${{ inputs.extra_diff }}" -D $RUNNER_TEMP
+          git apply "$RUNNER_TEMP/${{ inputs.extra_diff }}"
+        fi
+
+    - name: Configure CMake
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-use=${{ runner.temp }}/shadps4.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_CXX_FLAGS="-fprofile-instr-use=${{ runner.temp }}/shadps4.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build
+      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
+
+    - uses: actions/upload-artifact@v7
+      with:
+        name: pgo-candidate-${{ matrix.name }}
+        path: ${{github.workspace}}/build/shadps4

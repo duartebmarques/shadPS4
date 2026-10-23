@@ -93,10 +93,14 @@ index_patches() {
     py patch-index "$U/patches/shadPS4/files.json" "$ROOT/games.json"
 }
 
+find_extractor() {
+    find "$ROOT/tools" "$HOME" /run/media -maxdepth 5 -iname 'pkg_extractor*.AppImage' \
+        -not -path '*/.*' 2>/dev/null | head -1 || true
+}
+
 extract_pkgs() {
     local extractor dest p rc
-    extractor="$(find "$ROOT/tools" "$HOME" /run/media -maxdepth 5 -iname 'pkg_extractor*.AppImage' \
-        -not -path '*/.*' 2>/dev/null | head -1 || true)"
+    extractor="$(find_extractor)"
     if [ -z "$extractor" ] && ask "Download the pkg extractor ($EXTRACTOR_REPO, a few MB)?"; then
         local rel
         rel="$(py latest "$EXTRACTOR_REPO" 'PkgExtractor.*linux\.AppImage$')" ||
@@ -110,6 +114,7 @@ extract_pkgs() {
         dest="$(dirname "$p")"
         rc=0
         "$extractor" "$p" --check-type >/dev/null 2>&1 || rc=$?
+        [ -n "${ONLY_UPDATES:-}" ] && [ "$rc" != 102 ] && continue
         info "Extracting $(basename "$p") (this can take a while)..."
         case "$rc" in
         101 | 102) "$extractor" "$p" "$dest" >/dev/null ;;
@@ -136,6 +141,22 @@ setup() {
         info "No extracted game found, but these pkg files:"
         printf '    %s\n' "${pkgs[@]}"
         if ask "Extract them next to the pkg files?" && extract_pkgs "${pkgs[@]}"; then
+            py scan "$serials" "${roots[@]}" >"$scan" || true
+        fi
+    fi
+    # Update pkgs of games that are extracted but have no update folder yet.
+    mapfile -t pkgs < <(awk -F'\t' '$1 == "game" { g[$2] } $1 == "update" { u[$2] } $1 == "pkg" { p[$3] = $2 }
+        END { for (f in p) if ((p[f] in g) && !(p[f] in u)) print f }' "$scan" | sort)
+    # Without the extractor the type is unknown: it is asked for (and then kept) at extraction.
+    local x; x="$(find_extractor)"
+    if [ -n "$x" ] && [ ${#pkgs[@]} -gt 0 ]; then
+        mapfile -t pkgs < <(for p in "${pkgs[@]}"; do
+            "$x" "$p" --check-type </dev/null >/dev/null 2>&1; [ $? = 102 ] && echo "$p"; done)
+    fi
+    if [ ${#pkgs[@]} -gt 0 ]; then
+        info "Pkg files that may be updates of your games:"
+        printf '    %s\n' "${pkgs[@]}"
+        if ask "Extract the updates next to the pkg files?" && ONLY_UPDATES=1 extract_pkgs "${pkgs[@]}"; then
             py scan "$serials" "${roots[@]}" >"$scan" || true
         fi
     fi
