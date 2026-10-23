@@ -837,6 +837,9 @@ static FfxErrorCode cbDestroyBackendCtx(FfxInterface* I, FfxUInt32 id) {
     if (!I || !I->device) return FFX_ERROR_INVALID_POINTER;
     FfxFsr4VkContext* c = (FfxFsr4VkContext*)I->device;
 
+    /* A host that defines FFX_FSR4_VK_HOST_RETIRES_WORK destroys a context only after the GPU has
+     * finished its work, and other threads may own queues of the device. */
+#if !defined(FFX_FSR4_VK_HOST_RETIRES_WORK)
     // Wait for all GPU work to finish before destroying anything.
     // This prevents "vkDestroyPipeline on in-use" errors when context
     // is recreated while a command buffer is still in flight.
@@ -844,6 +847,7 @@ static FfxErrorCode cbDestroyBackendCtx(FfxInterface* I, FfxUInt32 id) {
         c->jobCount = 0;
         return FFX_ERROR_BACKEND_API_ERROR;
     }
+#endif
 
     // Destroy pipelines
     for (int i=0; i<MAX_PIPELINES; i++) {
