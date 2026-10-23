@@ -56,6 +56,11 @@ s32 PhaseCount(u32 render_width, u32 output_width) {
     return static_cast<s32>(8.0f * std::pow(ratio, 2.0f));
 }
 
+s32 Fsr4PhaseCount(u32 render_width, u32 output_width) {
+    const float ratio = static_cast<float>(output_width) / static_cast<float>(render_width);
+    return std::clamp(static_cast<s32>(std::ceil(8.0f * ratio * ratio)), 1, 256);
+}
+
 Offset PhaseOffset(s32 index, s32 phase_count) {
     const s32 i = (index % phase_count) + 1;
     return {.x = Halton(i, 2) - 0.5f, .y = Halton(i, 3) - 0.5f};

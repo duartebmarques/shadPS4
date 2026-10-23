@@ -114,6 +114,7 @@ struct FrameLog {
     Mode mode{Mode::Stock};
     Kind kind{Kind::Native};
     ContextState context{ContextState::Idle};
+    ContextState fsr4_context{ContextState::Idle};
     vk::Extent2D render_size{};
     vk::Extent2D output_size{};
     float interval_ms{};

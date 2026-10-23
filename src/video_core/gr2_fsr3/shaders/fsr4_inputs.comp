@@ -1,0 +1,55 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+// Copies the FSR 4 inputs of a frame into the images of the FSR 4 context: colour as RGBA16F,
+// motion vectors as RG16F and depth as R32F, all at the render size. The colour is read through
+// its view in the T# format, so an sRGB view gives linear values.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D color_tex;
+layout(set = 0, binding = 1) uniform texture2D mv_tex;
+layout(set = 0, binding = 2) uniform texture2D depth_tex;
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D color_out;
+layout(set = 0, binding = 4, rg16f) uniform writeonly image2D mv_out;
+layout(set = 0, binding = 5, r32f) uniform writeonly image2D depth_out;
+
+layout(push_constant) uniform Fsr4InputsConstants {
+    uvec2 size;
+    uint flags;
+    float near_plane;
+    float far_plane;
+} pc;
+
+const uint INPUTS_ENCODE_SRGB = 1u;
+const uint INPUTS_DEPTH_INVERTED = 2u;
+const uint INPUTS_DEPTH_LINEAR = 4u;
+
+#include "fsr3_color.glsl"
+
+void main() {
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, pc.size))) {
+        return;
+    }
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    vec4 color = texelFetch(color_tex, p, 0);
+    if ((pc.flags & INPUTS_ENCODE_SRGB) != 0u) {
+        color.rgb = Fsr3SrgbEncode(color.rgb);
+    }
+    imageStore(color_out, p, color);
+    imageStore(mv_out, p, vec4(texelFetch(mv_tex, p, 0).rg, 0.0, 0.0));
+    float depth = texelFetch(depth_tex, p, 0).r;
+    if ((pc.flags & INPUTS_DEPTH_LINEAR) != 0u) {
+        // Distance from the camera for a conventional [0, 1] device depth.
+        const float n = pc.near_plane;
+        const float f = pc.far_plane;
+        depth = 2.0 * n * f / (f + n - (2.0 * clamp(depth, 0.0, 1.0) - 1.0) * (f - n));
+    } else if ((pc.flags & INPUTS_DEPTH_INVERTED) != 0u) {
+        depth = 1.0 - depth;
+    }
+    imageStore(depth_out, p, vec4(depth));
+}

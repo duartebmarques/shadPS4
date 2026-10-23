@@ -93,6 +93,9 @@ public:
     ContextState Update(Vulkan::Scheduler& scheduler, const std::optional<ContextKey>& wanted,
                         u64 extra_bytes);
 
+    /// Whether a context exists, is being created, or awaits destruction.
+    bool HoldsMemory() const;
+
     /// Number of contexts that have become ready.
     u64 Generation() const;
 
@@ -114,5 +117,11 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
+
+/// Device memory available for new allocations.
+u64 AvailableDeviceMemory(const Vulkan::Instance& instance);
+
+/// The render and output sizes as "WxH -> WxH".
+std::string FormatSizes(vk::Extent2D render_size, vk::Extent2D output_size);
 
 } // namespace Gr2Fsr3

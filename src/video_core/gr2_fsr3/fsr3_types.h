@@ -35,6 +35,8 @@ constexpr u32 CharacterMaskHistory = 1u << 8;
 constexpr u32 CharacterCameraMotion = 1u << 9;
 constexpr u32 LodBiasExtraHalf = 1u << 10;
 constexpr u32 LodBiasExtraOne = 1u << 11;
+constexpr u32 Fsr4DepthInverted = 1u << 12;
+constexpr u32 Fsr4DepthLinear = 1u << 13;
 } // namespace TestBit
 
 /// Encoding of the colour input as FSR reads it.
@@ -66,6 +68,18 @@ enum class Mode : u8 {
     Fsr,      ///< FSR 3.1 followed by the store pass.
     Fallback, ///< The fallback pass scales the colour input into the history image.
     Debug,    ///< The debug pass writes the history image.
+    Fsr4,     ///< FSR 4 (INT8, experimental) followed by the store pass.
+};
+
+/// Model set of FSR 4. The values are the fsr4Model names; Auto selects by the upscale ratio.
+enum class Fsr4Model : u8 {
+    Auto,
+    Native,
+    Quality,
+    Balanced,
+    Performance,
+    UltraPerformance,
+    Drs,
 };
 
 /// Extent of the Antialias output relative to its colour input.
@@ -75,13 +89,14 @@ enum class Kind : u8 {
     Other,
 };
 
-/// Lifecycle of the FSR context.
+/// Lifecycle of an upscaler context.
 enum class ContextState : u8 {
     Unsupported,
     Idle,
     Creating,
     Ready,
     Failed,
+    Loading, ///< FSR 4 reads and checks its shader and model files.
 };
 
 /// Camera parameters for FSR. The defaults are the game's own camera defaults.

@@ -4,25 +4,18 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
-#include <chrono>
-#include <condition_variable>
-#include <deque>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <stop_token>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
-#include "common/thread.h"
-#include "common/unique_function.h"
 #include "video_core/gr2_fsr3/fsr3_context.h"
+#include "video_core/gr2_fsr3/fsr_worker.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -72,29 +65,6 @@ std::string IssueNames(u64 issues) {
     return names;
 }
 
-std::string FormatSizes(vk::Extent2D render_size, vk::Extent2D output_size) {
-    return fmt::format("{}x{} -> {}x{}", render_size.width, render_size.height, output_size.width,
-                       output_size.height);
-}
-
-u64 AvailableMemory(const Vulkan::Instance& instance) {
-    if (instance.IsIntegrated() && instance.CanReportMemoryUsage()) {
-        // GetTotalMemoryBudget() of an integrated GPU sets part of the shared memory aside for the
-        // system; the current heap budgets of the driver give the headroom there.
-        vk::PhysicalDeviceMemoryBudgetPropertiesEXT heaps{};
-        vk::PhysicalDeviceMemoryProperties2 properties{.pNext = &heaps};
-        instance.GetPhysicalDevice().getMemoryProperties2(&properties);
-        u64 available = 0;
-        for (u32 i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
-            available += heaps.heapBudget[i] - std::min(heaps.heapUsage[i], heaps.heapBudget[i]);
-        }
-        return available;
-    }
-    const u64 budget = instance.GetTotalMemoryBudget();
-    const u64 used = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() : 0;
-    return budget > used ? budget - used : 0;
-}
-
 FfxVkPortableImage Describe(const FsrImage& image) {
     FfxVkPortableImage description{};
     description.structSize = sizeof(description);
@@ -131,8 +101,6 @@ struct Context::Impl {
     bool RecordDispatch(vk::CommandBuffer cmdbuf, const FsrDispatch& dispatch, bool log_issues);
     Created Create(const ContextKey& key) const;
     void EnqueueDestroy(FfxVkPortableUpscaleContext* context);
-    void Enqueue(Common::UniqueFunction<void>&& task);
-    void WorkerLoop(std::stop_token stop_token);
 
     const Vulkan::Instance& instance;
     FfxVkPortableDeviceCapabilities caps{};
@@ -154,12 +122,9 @@ struct Context::Impl {
     std::string notice;
     std::vector<std::pair<FfxVkPortableResult, u64>> reported_failures;
 
-    std::mutex mutex;
-    std::condition_variable_any cv;
-    std::deque<Common::UniqueFunction<void>> tasks;
     // FidelityFX creates contexts through one process-global device copy. Creations and
-    // destructions run on this thread, one at a time.
-    std::jthread thread;
+    // destructions run on this worker, one at a time.
+    Worker worker{"shadPS4:Gr2Fsr3Worker"};
 };
 
 Context::Impl::Impl(const Vulkan::Instance& instance) : instance{instance} {
@@ -187,9 +152,6 @@ Context::Impl::Impl(const Vulkan::Instance& instance) : instance{instance} {
              yes_no(caps.subgroupOperations), yes_no(caps.requiredFsr3StorageFormats),
              yes_no(write_without_format), yes_no(fp16), yes_no(caps.synchronization2),
              yes_no(separate_layouts));
-    if (supported) {
-        thread = std::jthread{[this](std::stop_token stop_token) { WorkerLoop(stop_token); }};
-    }
 }
 
 ContextState Context::Impl::Update(Vulkan::Scheduler& scheduler,
@@ -197,7 +159,7 @@ ContextState Context::Impl::Update(Vulkan::Scheduler& scheduler,
     if (!supported) {
         return ContextState::Unsupported;
     }
-    if (pending.valid() && pending.wait_for(std::chrono::seconds{0}) == std::future_status::ready) {
+    if (IsReady(pending)) {
         const Created created = pending.get();
         if (created.result != FFX_VK_PORTABLE_OK) {
             failed_key = pending_key;
@@ -241,7 +203,7 @@ ContextState Context::Impl::Update(Vulkan::Scheduler& scheduler,
         const u64 output_pixels =
             u64{wanted->max_output_size.width} * wanted->max_output_size.height;
         const u64 needed = 42 * render_pixels + 17 * output_pixels + extra_bytes + 64_MB;
-        const u64 available = AvailableMemory(instance);
+        const u64 available = AvailableDeviceMemory(instance);
         const std::string sizes = FormatSizes(wanted->max_render_size, wanted->max_output_size);
         if (needed > available) {
             failed_key = wanted;
@@ -256,7 +218,7 @@ ContextState Context::Impl::Update(Vulkan::Scheduler& scheduler,
             pending_key = *wanted;
             std::packaged_task<Created()> task{[this, key = *wanted] { return Create(key); }};
             pending = task.get_future();
-            Enqueue(std::move(task));
+            worker.Enqueue(std::move(task));
         }
     }
     if (!wanted) {
@@ -358,7 +320,7 @@ Context::Impl::Created Context::Impl::Create(const ContextKey& key) const {
 }
 
 void Context::Impl::EnqueueDestroy(FfxVkPortableUpscaleContext* context) {
-    Enqueue([this, context] {
+    worker.Enqueue([this, context] {
         const FfxVkPortableResult result = ffxVkPortableUpscaleContextDestroy(context);
         if (result != FFX_VK_PORTABLE_OK) {
             LOG_ERROR(Render_Vulkan, "GR2 FSR3: context destruction failed: {}",
@@ -366,35 +328,6 @@ void Context::Impl::EnqueueDestroy(FfxVkPortableUpscaleContext* context) {
         }
         --destroying;
     });
-}
-
-void Context::Impl::Enqueue(Common::UniqueFunction<void>&& task) {
-    {
-        std::scoped_lock lock{mutex};
-        tasks.push_back(std::move(task));
-    }
-    cv.notify_one();
-}
-
-void Context::Impl::WorkerLoop(std::stop_token stop_token) {
-    Common::SetCurrentThreadName("shadPS4:Gr2Fsr3Worker");
-    // On Linux the thread inherits the affinity of the GPU command thread that starts it.
-    if (const u64 strip = Common::GetExclusionStripMask()) {
-        Common::SetCurrentThreadAffinityMask(~strip);
-    }
-    while (!stop_token.stop_requested()) {
-        Common::UniqueFunction<void> task;
-        {
-            std::unique_lock lock{mutex};
-            cv.wait(lock, stop_token, [this] { return !tasks.empty(); });
-            if (stop_token.stop_requested()) {
-                break;
-            }
-            task = std::move(tasks.front());
-            tasks.pop_front();
-        }
-        task();
-    }
 }
 
 Context::Context(const Vulkan::Instance& instance) : impl{std::make_unique<Impl>(instance)} {}
@@ -418,6 +351,10 @@ ContextState Context::Update(Vulkan::Scheduler& scheduler, const std::optional<C
     return impl->Update(scheduler, wanted, extra_bytes);
 }
 
+bool Context::HoldsMemory() const {
+    return impl->current || impl->pending.valid() || impl->destroying.load() > 0;
+}
+
 u64 Context::Generation() const {
     return impl->generation;
 }
@@ -433,6 +370,29 @@ std::string Context::Notice() const {
 bool Context::RecordDispatch(vk::CommandBuffer cmdbuf, const FsrDispatch& dispatch,
                              bool log_issues) {
     return impl->RecordDispatch(cmdbuf, dispatch, log_issues);
+}
+
+u64 AvailableDeviceMemory(const Vulkan::Instance& instance) {
+    if (instance.IsIntegrated() && instance.CanReportMemoryUsage()) {
+        // GetTotalMemoryBudget() of an integrated GPU sets part of the shared memory aside for the
+        // system; the current heap budgets of the driver give the headroom there.
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT heaps{};
+        vk::PhysicalDeviceMemoryProperties2 properties{.pNext = &heaps};
+        instance.GetPhysicalDevice().getMemoryProperties2(&properties);
+        u64 available = 0;
+        for (u32 i = 0; i < properties.memoryProperties.memoryHeapCount; ++i) {
+            available += heaps.heapBudget[i] - std::min(heaps.heapUsage[i], heaps.heapBudget[i]);
+        }
+        return available;
+    }
+    const u64 budget = instance.GetTotalMemoryBudget();
+    const u64 used = instance.CanReportMemoryUsage() ? instance.GetDeviceMemoryUsage() : 0;
+    return budget > used ? budget - used : 0;
+}
+
+std::string FormatSizes(vk::Extent2D render_size, vk::Extent2D output_size) {
+    return fmt::format("{}x{} -> {}x{}", render_size.width, render_size.height, output_size.width,
+                       output_size.height);
 }
 
 } // namespace Gr2Fsr3

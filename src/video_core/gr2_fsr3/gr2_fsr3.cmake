@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-option(ENABLE_GR2_FSR3 "Build the Gravity Rush 2 FSR 3.1 upscaler module" ON)
+option(ENABLE_GR2_FSR3 "Build the Gravity Rush 2 FSR 3.1 and FSR 4 upscaler module" ON)
 
 if (ENABLE_GR2_FSR3 AND NOT APPLE)
     set(GR2_FSR3_DIR ${CMAKE_CURRENT_LIST_DIR})
@@ -68,6 +68,27 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
         endforeach()
     endif()
 
+    # The source-v07 FSR 4 INT8 provider and the module's C bridge to it. Only C sources include
+    # the provider headers: their FFX type names collide with the SDK headers of FSR 3.1.
+    add_library(gr2_ffx_fsr4_v07 STATIC
+        ${GR2_FFX_ROOT}/src/ffx_vk_fsr4_v07.c
+        ${GR2_FFX_ROOT}/src/ffx_vk_fsr4_v07_assets.c
+        ${GR2_FFX_ROOT}/src/ffx_vk_fsr4_v07_provider.c
+        ${GR2_FFX_ROOT}/src/ffx_vk_fsr4_v07_schedule.c)
+    target_include_directories(gr2_ffx_fsr4_v07 PUBLIC ${GR2_FFX_ROOT}/include)
+    # Other threads own queues of the device, and the module destroys a context only after the
+    # GPU has finished its work.
+    target_compile_definitions(gr2_ffx_fsr4_v07 PRIVATE FFX_FSR4_VK_HOST_RETIRES_WORK=1)
+    target_compile_options(gr2_ffx_fsr4_v07 PRIVATE ${GR2_FFX_NO_WARNINGS})
+    target_link_libraries(gr2_ffx_fsr4_v07 PUBLIC Vulkan::Headers)
+    if (UNIX)
+        target_link_libraries(gr2_ffx_fsr4_v07 PRIVATE m)
+    endif()
+
+    add_library(gr2_fsr4_bridge STATIC ${GR2_FSR3_DIR}/fsr4_v07_bridge.c)
+    target_link_libraries(gr2_fsr4_bridge PUBLIC Vulkan::Headers PRIVATE gr2_ffx_fsr4_v07)
+    set_target_properties(gr2_ffx_fsr4_v07 gr2_fsr4_bridge PROPERTIES C_STANDARD 11)
+
     # Helper shaders, compiled like the host shaders.
     if (TARGET glslang-standalone)
         set(GR2_FSR3_GLSLANG glslang-standalone)
@@ -103,6 +124,7 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
     gr2_fsr3_add_shader(fsr3_store.comp fsr3_store_comp)
     gr2_fsr3_add_shader(fsr3_fallback.comp fsr3_fallback_comp)
     gr2_fsr3_add_shader(fsr3_debug.comp fsr3_debug_comp)
+    gr2_fsr3_add_shader(fsr4_inputs.comp fsr4_inputs_comp)
     add_custom_target(gr2_fsr3_shaders
         DEPENDS ${GR2_FSR3_SHADER_HEADERS}
         SOURCES
@@ -111,9 +133,11 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
             ${GR2_FSR3_DIR}/shaders/fsr3_fallback.comp
             ${GR2_FSR3_DIR}/shaders/fsr3_mask.comp
             ${GR2_FSR3_DIR}/shaders/fsr3_mvcopy.comp
-            ${GR2_FSR3_DIR}/shaders/fsr3_store.comp)
+            ${GR2_FSR3_DIR}/shaders/fsr3_store.comp
+            ${GR2_FSR3_DIR}/shaders/fsr4_inputs.comp)
 
-    # vk_trampolines.cpp defines the Vulkan commands that the FidelityFX libraries call.
+    # vk_trampolines.cpp defines the Vulkan commands that the FidelityFX libraries and the FSR 4 v07
+    # provider call.
     target_sources(shadps4 PRIVATE
         ${GR2_FSR3_DIR}/fsr3_context.cpp
         ${GR2_FSR3_DIR}/fsr3_context.h
@@ -126,11 +150,20 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
         ${GR2_FSR3_DIR}/fsr3_settings.cpp
         ${GR2_FSR3_DIR}/fsr3_settings.h
         ${GR2_FSR3_DIR}/fsr3_types.h
+        ${GR2_FSR3_DIR}/fsr4_assets.cpp
+        ${GR2_FSR3_DIR}/fsr4_assets.h
+        ${GR2_FSR3_DIR}/fsr4_context.cpp
+        ${GR2_FSR3_DIR}/fsr4_context.h
+        ${GR2_FSR3_DIR}/fsr4_device.cpp
+        ${GR2_FSR3_DIR}/fsr4_device.h
+        ${GR2_FSR3_DIR}/fsr4_v07_bridge.h
+        ${GR2_FSR3_DIR}/fsr_worker.cpp
+        ${GR2_FSR3_DIR}/fsr_worker.h
         ${GR2_FSR3_DIR}/gr2_fsr3.cpp
         ${GR2_FSR3_DIR}/gr2_fsr3.h
         ${GR2_FSR3_DIR}/vk_trampolines.cpp)
     target_include_directories(shadps4 PRIVATE ${GR2_FSR3_SHADER_INCLUDE})
     add_dependencies(shadps4 gr2_fsr3_shaders)
-    target_link_libraries(shadps4 PRIVATE gr2_ffx_portable)
+    target_link_libraries(shadps4 PRIVATE gr2_ffx_portable gr2_fsr4_bridge)
     target_compile_definitions(shadps4 PRIVATE ENABLE_GR2_FSR3=1)
 endif()

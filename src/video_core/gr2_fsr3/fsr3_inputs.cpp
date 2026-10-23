@@ -461,7 +461,7 @@ void Inputs::LogFrame(const FrameLog& log) {
              "{:.2f} ms reset {} | camera near {} far {} vertical fov {} valid {} move {:.4f} "
              "turn {:.4f} deg fov delta {:.4f} cut {} repeated {} equal CBs {} | jitter window "
              "{} extent hint {} offset ({:.4f}, {:.4f}) draws eligible {} jittered {} indirect "
-             "{} full-screen {} vertex shaders [{:#x}]",
+             "{} full-screen {} vertex shaders [{:#x}] | fsr4 {}",
              log.frame, magic_enum::enum_name(log.mode), magic_enum::enum_name(log.kind),
              magic_enum::enum_name(log.context), log.render_size.width, log.render_size.height,
              log.output_size.width, log.output_size.height, log.interval_ms, log.reset,
@@ -470,7 +470,8 @@ void Inputs::LogFrame(const FrameLog& log) {
              camera.cut, camera.repeated, impl->equal_cb_frames, jitter.window_opened,
              jitter.extent_hint, jitter.applied.x, jitter.applied.y, jitter.eligible_draws,
              jitter.jittered_draws, jitter.indirect_draws, jitter.fullscreen_draws,
-             fmt::join(std::span<const u64>{jitter.vertex_hashes.data(), num_hashes}, ", "));
+             fmt::join(std::span<const u64>{jitter.vertex_hashes.data(), num_hashes}, ", "),
+             magic_enum::enum_name(log.fsr4_context));
 }
 
 } // namespace Gr2Fsr3

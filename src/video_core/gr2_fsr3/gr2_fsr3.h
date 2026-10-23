@@ -20,9 +20,9 @@ class GraphicsPipeline;
 class Rasterizer;
 } // namespace Vulkan
 
-// FSR 3.1 temporal upscaling for Gravity Rush 2. Every function runs on the GPU command thread
-// except DrawMenu, which runs on the ImGui thread. For other titles a call costs one load and a
-// branch.
+// FSR 3.1 and FSR 4 (INT8, experimental) temporal upscaling for Gravity Rush 2. Every function runs
+// on the GPU command thread except DrawMenu, which runs on the ImGui thread. For other titles a
+// call costs one load and a branch.
 namespace Gr2Fsr3 {
 
 #ifdef ENABLE_GR2_FSR3

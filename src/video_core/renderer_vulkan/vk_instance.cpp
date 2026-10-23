@@ -12,6 +12,7 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/gr2_fsr3/fsr4_device.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -649,6 +650,7 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDevicePresentIdFeaturesKHR>();
         device_chain.unlink<vk::PhysicalDevicePresentWaitFeaturesKHR>();
     }
+    Gr2Fsr3::ExtendDevice(physical_device, device_chain);
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {

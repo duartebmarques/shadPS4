@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -52,11 +53,15 @@ struct Key {
 
 constexpr Settings::Values Defaults{};
 
+constexpr std::array Fsr4ModelNames{
+    "auto", "native", "quality", "balanced", "performance", "ultraperf", "drs",
+};
 constexpr std::array ColorSpaceNames{"linear", "gamma"};
 constexpr std::array DepthSourceNames{"copy", "main"};
 constexpr std::array DebugViewNames{
     "Off", "Motion vectors", "Stencil", "Depth", "Masks", "Reprojection error", "FSR bypass",
 };
+static_assert(Fsr4ModelNames.size() == magic_enum::enum_count<Fsr4Model>());
 static_assert(ColorSpaceNames.size() == magic_enum::enum_count<ColorSpace>());
 static_assert(DepthSourceNames.size() == magic_enum::enum_count<DepthSource>());
 static_assert(DebugViewNames.size() == magic_enum::enum_count<DebugView>());
@@ -72,9 +77,13 @@ constexpr auto TestBitLabels = std::to_array<std::pair<const char*, u32>>({
     {"Bit 9: character camera motion", TestBit::CharacterCameraMotion},
     {"Bit 10: LOD bias -0.5", TestBit::LodBiasExtraHalf},
     {"Bit 11: LOD bias -1.0", TestBit::LodBiasExtraOne},
+    {"Bit 12: FSR 4 depth 1 - z", TestBit::Fsr4DepthInverted},
+    {"Bit 13: FSR 4 linear view depth", TestBit::Fsr4DepthLinear},
 });
 
 std::atomic<u32> g_enable{};
+std::atomic<u32> g_fsr4_enable{};
+std::atomic<u32> g_fsr4_model{};
 std::atomic<u32> g_sharpness{};
 std::atomic<u32> g_reactive_characters{};
 std::atomic<u32> g_reactive_effects{};
@@ -92,6 +101,8 @@ std::atomic<u32> g_test{};
 
 constexpr auto Keys = std::to_array<Key>({
     {"fsr3Enable", Type::Bool, &g_enable, Defaults.enable},
+    {"fsr4Enable", Type::Bool, &g_fsr4_enable, Defaults.fsr4_enable},
+    {"fsr4Model", Type::Name, &g_fsr4_model, static_cast<u32>(Defaults.fsr4_model), Fsr4ModelNames},
     {"fsr3Sharpness", Type::Percent, &g_sharpness, Defaults.sharpness},
     {"fsr3ReactiveCharacters", Type::Percent, &g_reactive_characters, Defaults.reactive_characters},
     {"fsr3ReactiveEffects", Type::Percent, &g_reactive_effects, Defaults.reactive_effects},
@@ -115,6 +126,10 @@ using KeySet = std::array<bool, Keys.size()>;
 // The keys the per-game file holds. Save writes these into it and the others into config.json.
 KeySet g_per_game{};
 std::once_flag g_load_once;
+
+// fsr4AssetDir is a string beside the table. It is read once; Save keeps it as the files hold it.
+constexpr const char* AssetDirKey = "fsr4AssetDir";
+std::filesystem::path g_fsr4_asset_dir;
 
 std::mutex g_status_mutex;
 Settings::Status g_status;
@@ -173,7 +188,8 @@ nlohmann::json Encode(const Key& key, u32 value) {
 }
 
 // Takes the keys of the "GR2Fork" section that no earlier file held.
-void ReadFile(const std::filesystem::path& path, KeySet& taken) {
+void ReadFile(const std::filesystem::path& path, KeySet& taken,
+              std::optional<std::string>& asset_dir) {
     std::ifstream file{path};
     if (!file) {
         return;
@@ -197,6 +213,15 @@ void ReadFile(const std::filesystem::path& path, KeySet& taken) {
                         Common::FS::PathToUTF8String(path));
         }
     }
+    if (!asset_dir && section.contains(AssetDirKey)) {
+        const auto& value = section.at(AssetDirKey);
+        if (value.is_string()) {
+            asset_dir = value.get<std::string>();
+        } else {
+            LOG_WARNING(Config, "GR2 FSR3: ignoring {} = {} in {}", AssetDirKey, value.dump(),
+                        Common::FS::PathToUTF8String(path));
+        }
+    }
 }
 
 void LoadFiles() {
@@ -205,9 +230,18 @@ void LoadFiles() {
     }
     // The per-game file is read first, so a key it holds wins over the same key in config.json.
     KeySet taken{};
-    ReadFile(GameFile(), taken);
+    std::optional<std::string> asset_dir;
+    ReadFile(GameFile(), taken, asset_dir);
     g_per_game = taken;
-    ReadFile(GlobalFile(), taken);
+    ReadFile(GlobalFile(), taken, asset_dir);
+
+    // JSON strings are UTF-8. A relative folder starts from the user folder.
+    const std::filesystem::path& user_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
+    g_fsr4_asset_dir = asset_dir && !asset_dir->empty()
+                           ? user_dir / std::filesystem::path{std::u8string_view{
+                                            reinterpret_cast<const char8_t*>(asset_dir->data()),
+                                            asset_dir->size()}}
+                           : user_dir / "fsr4_v07";
 
     std::string changed;
     for (const Key& key : Keys) {
@@ -215,6 +249,12 @@ void LoadFiles() {
         if (value != key.default_value) {
             changed.append(" ").append(key.name).append("=").append(Encode(key, value).dump());
         }
+    }
+    if (asset_dir) {
+        changed.append(" ")
+            .append(AssetDirKey)
+            .append("=")
+            .append(nlohmann::json(*asset_dir).dump());
     }
     LOG_INFO(Config, "GR2 FSR3: settings{}", changed.empty() ? " at their defaults" : changed);
 }
@@ -295,6 +335,8 @@ Settings::Values Settings::Snapshot() {
     };
     return {
         .enable = load(g_enable) != 0,
+        .fsr4_enable = load(g_fsr4_enable) != 0,
+        .fsr4_model = static_cast<Fsr4Model>(load(g_fsr4_model)),
         .sharpness = static_cast<s32>(load(g_sharpness)),
         .reactive_characters = static_cast<s32>(load(g_reactive_characters)),
         .reactive_effects = static_cast<s32>(load(g_reactive_effects)),
@@ -310,6 +352,11 @@ Settings::Values Settings::Snapshot() {
         .log = load(g_log) != 0,
         .test = load(g_test),
     };
+}
+
+std::filesystem::path Settings::Fsr4AssetDir() {
+    std::call_once(g_load_once, LoadFiles);
+    return g_fsr4_asset_dir;
 }
 
 void Settings::PublishStatus(const Status& status) {
@@ -340,7 +387,9 @@ void DrawMenu() {
         return;
     }
     std::call_once(g_load_once, LoadFiles);
-    EditBool("Enable", g_enable);
+    EditBool("Enable FSR 3.1", g_enable);
+    EditBool("Enable FSR 4 (INT8, experimental)", g_fsr4_enable);
+    EditChoice("FSR 4 model", g_fsr4_model, Fsr4ModelNames);
     EditPercent("Sharpness", g_sharpness);
     EditPercent("Reactive characters", g_reactive_characters);
     EditPercent("Reactive effects", g_reactive_effects);
@@ -370,6 +419,18 @@ void DrawMenu() {
                 magic_enum::enum_name(status.kind).data());
     ImGui::Text("Context: %s, %.1f MiB", magic_enum::enum_name(status.context).data(),
                 static_cast<double>(status.context_bytes) / (1024.0 * 1024.0));
+    const char* fsr4_state = magic_enum::enum_name(status.fsr4_context).data();
+    if (status.fsr4_model[0] != '\0') {
+        ImGui::Text("FSR 4: %s, %s model, %s tier, %.1f MiB", fsr4_state, status.fsr4_model,
+                    status.fsr4_tier, static_cast<double>(status.fsr4_bytes) / (1024.0 * 1024.0));
+    } else {
+        ImGui::Text("FSR 4: %s", fsr4_state);
+    }
+    ImGui::TextWrapped("FSR 4 assets: %s",
+                       Common::FS::PathToUTF8String(Settings::Fsr4AssetDir()).c_str());
+    if (!status.fsr4_notice.empty()) {
+        ImGui::TextWrapped("%s", status.fsr4_notice.c_str());
+    }
     ImGui::Text("Render %ux%u -> output %ux%u", status.render_width, status.render_height,
                 status.output_width, status.output_height);
     ImGui::Text("FSR dispatches: %llu", static_cast<unsigned long long>(status.fsr_dispatches));
