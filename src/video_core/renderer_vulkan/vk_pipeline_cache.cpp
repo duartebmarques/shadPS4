@@ -2475,13 +2475,35 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
     }
     if (module_related_pipelines.contains(module)) {
         auto& pipeline_keys = module_related_pipelines[module];
+        // Recorded draws may still bind the pipelines; they die once the GPU passed them.
         for (auto& key : pipeline_keys) {
             if (std::holds_alternative<GraphicsPipelineKey>(key)) {
                 auto& graphics_key = std::get<GraphicsPipelineKey>(key);
-                graphics_pipelines.erase(graphics_key);
+                if (auto it = graphics_pipelines.find(graphics_key);
+                    it != graphics_pipelines.end()) {
+                    {
+                        std::scoped_lock lk{retired_pipelines_mutex};
+                        retired_pipelines.push_back(std::move(it.value()));
+                    }
+                    scheduler.DeferOperation([this] {
+                        std::scoped_lock lk{retired_pipelines_mutex};
+                        retired_pipelines.pop_front();
+                    });
+                    graphics_pipelines.erase(it);
+                }
             } else if (std::holds_alternative<ComputePipelineKey>(key)) {
                 auto& compute_key = std::get<ComputePipelineKey>(key);
-                compute_pipelines.erase(compute_key);
+                if (auto it = compute_pipelines.find(compute_key); it != compute_pipelines.end()) {
+                    {
+                        std::scoped_lock lk{retired_pipelines_mutex};
+                        retired_pipelines.push_back(std::move(it.value()));
+                    }
+                    scheduler.DeferOperation([this] {
+                        std::scoped_lock lk{retired_pipelines_mutex};
+                        retired_pipelines.pop_front();
+                    });
+                    compute_pipelines.erase(it);
+                }
             }
         }
     }

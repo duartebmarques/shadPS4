@@ -89,6 +89,8 @@ public:
     void dispatch(u32 group_count_x, u32 group_count_y, u32 group_count_z) const;
     void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const;
 
+    void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool query_pool, u32 query) const;
+
     void copyBuffer(vk::Buffer src_buffer, vk::Buffer dst_buffer,
                     vk::ArrayProxy<const vk::BufferCopy> const& regions) const;
     void copyImage(vk::Image src_image, vk::ImageLayout src_image_layout, vk::Image dst_image,
@@ -116,6 +118,9 @@ public:
     void endDebugUtilsLabelEXT() const;
 
 private:
+    /// The current command buffer, read directly from the scheduler for the inline branches.
+    vk::CommandBuffer Raw() const;
+
     Scheduler* scheduler;
 };
 

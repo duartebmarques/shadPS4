@@ -2364,6 +2364,8 @@ void TextureCache::GarbageCollectSamplers() {
         --num_deletions;
         sampler_lru_cache.Free(sampler);
         samplers.erase(sampler.hash);
+        // Recorded descriptor pushes may still name the handle; it dies once the GPU passed them.
+        scheduler.DeferOperation([handle = sampler.ReleaseHandle()] {});
         const auto sampler_id = slot_samplers.GetSlotId(sampler);
         slot_samplers.Erase(sampler_id);
         erased = true;

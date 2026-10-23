@@ -5,8 +5,10 @@
 
 #include <array>
 #include <chrono>
+#include <deque>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -307,6 +309,11 @@ private:
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    // Pipelines ReplaceShader erased, each released by a deferred operation once the GPU passed
+    // the draws binding it; owned here so they die before desc_heap. ReplaceShader pushes from
+    // the devtools thread while the operations pop on the GPU command thread.
+    std::deque<std::unique_ptr<Pipeline>> retired_pipelines;
+    std::mutex retired_pipelines_mutex;
     // Compiles past the sync budget. Their keys enter graphics_pipelines once installed.
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
         pending_graphics_pipelines;
