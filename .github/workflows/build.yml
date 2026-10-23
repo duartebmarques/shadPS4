@@ -34,7 +34,8 @@ jobs:
     - uses: fsfe/reuse-action@v6
 
   clang-format:
-    runs-on: ubuntu-latest
+    # The LLVM apt repo below is for noble, and apt-key is gone from ubuntu-latest (26.04).
+    runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
     - uses: actions/checkout@v6
