@@ -311,9 +311,13 @@ play() {
     run_emu "$game" "$@"
 }
 
-# An executable user/session-hook (optional, e.g. a play recorder) is started detached for each run.
+# An executable user/session-hook (optional, e.g. a play recorder) is started detached for each run,
+# as its own systemd user unit where possible: Steam kills everything under the game when it exits.
 run_emu() {
-    [ -x "$U/session-hook" ] && { setsid nice -n 10 "$U/session-hook" </dev/null >/dev/null 2>&1 & }
+    if [ -x "$U/session-hook" ]; then
+        systemd-run --user --quiet --collect --nice=10 "$U/session-hook" >/dev/null 2>&1 ||
+            { setsid nice -n 10 "$U/session-hook" </dev/null >/dev/null 2>&1 & }
+    fi
     exec "$EMU" "$@"
 }
 
