@@ -308,7 +308,13 @@ play() {
         game="$game/eboot.bin"
     fi
     shift
-    exec "$EMU" "$game" "$@"
+    run_emu "$game" "$@"
+}
+
+# An executable user/session-hook (optional, e.g. a play recorder) is started detached for each run.
+run_emu() {
+    [ -x "$U/session-hook" ] && { setsid nice -n 10 "$U/session-hook" </dev/null >/dev/null 2>&1 & }
+    exec "$EMU" "$@"
 }
 
 cd "$ROOT"
@@ -321,7 +327,7 @@ case "${1:-}" in
 "")
     [ -f "$U/.setup-done" ] || setup
     # The game page's Add to Steam button runs this script.
-    SHADPS4_LAUNCHER="$ROOT/shadPS4.sh" exec "$EMU" --big-picture ;;
+    SHADPS4_LAUNCHER="$ROOT/shadPS4.sh" run_emu --big-picture ;;
 -*) exec "$EMU" "$@" ;;
 *)
     [ -f "$U/.setup-done" ] || setup
