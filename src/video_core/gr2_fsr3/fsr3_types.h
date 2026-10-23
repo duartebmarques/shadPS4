@@ -32,9 +32,6 @@ constexpr u32 CoverageJitter = 1u << 3;
 constexpr u32 CutDetectionOff = 1u << 6;
 constexpr u32 RepeatZeroingOff = 1u << 7;
 constexpr u32 CharacterMaskHistory = 1u << 8;
-constexpr u32 CharacterCameraMotion = 1u << 9;
-constexpr u32 LodBiasExtraHalf = 1u << 10;
-constexpr u32 LodBiasExtraOne = 1u << 11;
 constexpr u32 Fsr4DepthInverted = 1u << 12;
 constexpr u32 Fsr4DepthLinear = 1u << 13;
 } // namespace TestBit
@@ -49,6 +46,13 @@ enum class ColorSpace : u8 {
 enum class DepthSource : u8 {
     Copy, ///< Mip 0 of the R32F device-depth copy that the Velocity pass reads.
     Main, ///< Depth aspect of the scene depth-stencil image.
+};
+
+/// Pixels the store pass smooths with FXAA. The values are the fsr3Fxaa values.
+enum class Fxaa : u8 {
+    Off,
+    Characters, ///< Pixels within one render pixel of a stencil 0x20 pixel.
+    Everything,
 };
 
 /// Debug output written in place of the Antialias result. The values are the fsr3Debug values.

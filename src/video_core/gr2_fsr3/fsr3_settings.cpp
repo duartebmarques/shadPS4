@@ -56,12 +56,15 @@ constexpr Settings::Values Defaults{};
 constexpr std::array Fsr4ModelNames{
     "auto", "native", "quality", "balanced", "performance", "ultraperf", "drs",
 };
+constexpr std::array FxaaNames{"Off", "Characters", "Everything"};
 constexpr std::array ColorSpaceNames{"linear", "gamma"};
 constexpr std::array DepthSourceNames{"copy", "main"};
+constexpr std::array LodBiasExtraNames{"0", "-0.5", "-1.0", "-1.5"};
 constexpr std::array DebugViewNames{
     "Off", "Motion vectors", "Stencil", "Depth", "Masks", "Reprojection error", "FSR bypass",
 };
 static_assert(Fsr4ModelNames.size() == magic_enum::enum_count<Fsr4Model>());
+static_assert(FxaaNames.size() == magic_enum::enum_count<Fxaa>());
 static_assert(ColorSpaceNames.size() == magic_enum::enum_count<ColorSpace>());
 static_assert(DepthSourceNames.size() == magic_enum::enum_count<DepthSource>());
 static_assert(DebugViewNames.size() == magic_enum::enum_count<DebugView>());
@@ -74,9 +77,6 @@ constexpr auto TestBitLabels = std::to_array<std::pair<const char*, u32>>({
     {"Bit 6: camera cut detection off", TestBit::CutDetectionOff},
     {"Bit 7: repeated view zeroing off", TestBit::RepeatZeroingOff},
     {"Bit 8: character mask history", TestBit::CharacterMaskHistory},
-    {"Bit 9: character camera motion", TestBit::CharacterCameraMotion},
-    {"Bit 10: LOD bias -0.5", TestBit::LodBiasExtraHalf},
-    {"Bit 11: LOD bias -1.0", TestBit::LodBiasExtraOne},
     {"Bit 12: FSR 4 depth 1 - z", TestBit::Fsr4DepthInverted},
     {"Bit 13: FSR 4 linear view depth", TestBit::Fsr4DepthLinear},
 });
@@ -85,13 +85,16 @@ std::atomic<u32> g_enable{};
 std::atomic<u32> g_fsr4_enable{};
 std::atomic<u32> g_fsr4_model{};
 std::atomic<u32> g_sharpness{};
+std::atomic<u32> g_fxaa{};
 std::atomic<u32> g_reactive_characters{};
 std::atomic<u32> g_reactive_effects{};
 std::atomic<u32> g_reactive_outline{};
 std::atomic<u32> g_tc_characters{};
+std::atomic<u32> g_character_camera_motion{};
 std::atomic<u32> g_color_space{};
 std::atomic<u32> g_depth_source{};
 std::atomic<u32> g_lod_bias{};
+std::atomic<u32> g_lod_bias_extra{};
 std::atomic<u32> g_fp32{};
 std::atomic<u32> g_fallback_easu{};
 std::atomic<u32> g_debug{};
@@ -104,15 +107,20 @@ constexpr auto Keys = std::to_array<Key>({
     {"fsr4Enable", Type::Bool, &g_fsr4_enable, Defaults.fsr4_enable},
     {"fsr4Model", Type::Name, &g_fsr4_model, static_cast<u32>(Defaults.fsr4_model), Fsr4ModelNames},
     {"fsr3Sharpness", Type::Percent, &g_sharpness, Defaults.sharpness},
+    {"fsr3Fxaa", Type::Index, &g_fxaa, static_cast<u32>(Defaults.fxaa), FxaaNames},
     {"fsr3ReactiveCharacters", Type::Percent, &g_reactive_characters, Defaults.reactive_characters},
     {"fsr3ReactiveEffects", Type::Percent, &g_reactive_effects, Defaults.reactive_effects},
     {"fsr3ReactiveOutline", Type::Percent, &g_reactive_outline, Defaults.reactive_outline},
     {"fsr3TcCharacters", Type::Percent, &g_tc_characters, Defaults.tc_characters},
+    {"fsr3CharacterCameraMotion", Type::Bool, &g_character_camera_motion,
+     Defaults.character_camera_motion},
     {"fsr3ColorSpace", Type::Name, &g_color_space, static_cast<u32>(Defaults.color_space),
      ColorSpaceNames},
     {"fsr3DepthSource", Type::Name, &g_depth_source, static_cast<u32>(Defaults.depth_source),
      DepthSourceNames},
     {"fsr3LodBias", Type::Bool, &g_lod_bias, Defaults.lod_bias},
+    {"fsr3LodBiasExtra", Type::Index, &g_lod_bias_extra, Defaults.lod_bias_extra,
+     LodBiasExtraNames},
     {"fsr3Fp32", Type::Bool, &g_fp32, Defaults.fp32},
     {"fsr3FallbackEasu", Type::Bool, &g_fallback_easu, Defaults.fallback_easu},
     {"fsr3Debug", Type::Index, &g_debug, static_cast<u32>(Defaults.debug), DebugViewNames},
@@ -338,13 +346,16 @@ Settings::Values Settings::Snapshot() {
         .fsr4_enable = load(g_fsr4_enable) != 0,
         .fsr4_model = static_cast<Fsr4Model>(load(g_fsr4_model)),
         .sharpness = static_cast<s32>(load(g_sharpness)),
+        .fxaa = static_cast<Fxaa>(load(g_fxaa)),
         .reactive_characters = static_cast<s32>(load(g_reactive_characters)),
         .reactive_effects = static_cast<s32>(load(g_reactive_effects)),
         .reactive_outline = static_cast<s32>(load(g_reactive_outline)),
         .tc_characters = static_cast<s32>(load(g_tc_characters)),
+        .character_camera_motion = load(g_character_camera_motion) != 0,
         .color_space = static_cast<ColorSpace>(load(g_color_space)),
         .depth_source = static_cast<DepthSource>(load(g_depth_source)),
         .lod_bias = load(g_lod_bias) != 0,
+        .lod_bias_extra = load(g_lod_bias_extra),
         .fp32 = load(g_fp32) != 0,
         .fallback_easu = load(g_fallback_easu) != 0,
         .debug = static_cast<DebugView>(load(g_debug)),
@@ -391,13 +402,16 @@ void DrawMenu() {
     EditBool("Enable FSR 4 (INT8, experimental)", g_fsr4_enable);
     EditChoice("FSR 4 model", g_fsr4_model, Fsr4ModelNames);
     EditPercent("Sharpness", g_sharpness);
+    EditChoice("FXAA", g_fxaa, FxaaNames);
     EditPercent("Reactive characters", g_reactive_characters);
     EditPercent("Reactive effects", g_reactive_effects);
     EditPercent("Reactive outlines", g_reactive_outline);
     EditPercent("T&C characters", g_tc_characters);
+    EditBool("Character camera motion", g_character_camera_motion);
     EditChoice("Colour space", g_color_space, ColorSpaceNames);
     EditChoice("Depth source", g_depth_source, DepthSourceNames);
     EditBool("Texture LOD bias", g_lod_bias);
+    EditChoice("Extra LOD bias", g_lod_bias_extra, LodBiasExtraNames);
     EditBool("FP32 shaders", g_fp32);
     EditBool("EASU fallback", g_fallback_easu);
     EditChoice("Debug view", g_debug, DebugViewNames);

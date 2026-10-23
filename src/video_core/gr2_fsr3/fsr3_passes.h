@@ -47,6 +47,9 @@ struct StoreParams {
     float rcas_stops{-1.0f}; ///< RCAS strength in stops, 0 being the strongest; negative skips it.
     bool linear_input{};     ///< FSR read linear colour, so the store pass encodes to sRGB.
     Fsr4Image source{};      ///< Image the pass reads; a null image reads the FSR 3.1 output.
+    Fxaa fxaa{Fxaa::Off};    ///< RCAS skips the pixels FXAA smooths.
+    vk::ImageView stencil{}; ///< Stencil-aspect view; only Fxaa::Characters reads it.
+    vk::Extent2D render_size{};
 };
 
 /// Inputs of the FSR 4 inputs pass, which copies the FSR 4 inputs of a frame into the images of

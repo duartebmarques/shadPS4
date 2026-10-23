@@ -8,22 +8,36 @@
 #extension GL_ARB_shading_language_420pack : enable
 
 // Writes the FSR output into the guest history image as the Gravity Rush 2 antialias pass writes
-// it: sRGB-encoded colour with the luma of the linear colour in alpha. FSR 1 RCAS sharpens first
-// when enabled.
+// it: sRGB-encoded colour with the luma of the linear colour in alpha. FXAA smooths the edges near
+// characters or everywhere and FSR 1 RCAS sharpens the other pixels, each when enabled.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform texture2D src_tex;
-layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(set = 0, binding = 1) uniform sampler src_sampler;
+layout(set = 0, binding = 2) uniform utexture2D stencil_tex;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D dst;
 
 layout(push_constant) uniform StoreConstants {
     uvec2 size;
     float rcas_stops;
     uint flags;
+    uvec2 render_size;
 } pc;
 
 const uint STORE_RCAS = 1u;
 const uint STORE_LINEAR_INPUT = 2u;
+const uint STORE_FXAA = 4u;
+const uint STORE_FXAA_CHARACTERS = 8u;
+
+const uint STENCIL_CHARACTER = 0x20u;
+
+// FXAA edge thresholds in luma of the gamma-encoded colour, and the strength of its subpixel blend.
+const float FXAA_EDGE_THRESHOLD = 0.125;
+const float FXAA_EDGE_THRESHOLD_MIN = 0.0625;
+const float FXAA_SUBPIXEL = 0.75;
+// Pixels between the successive samples of the search for the ends of an edge.
+const float FXAA_STEPS[12] = float[](1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
 
 #define A_GPU 1
 #define A_GLSL 1
@@ -39,13 +53,130 @@ void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
 
 #include "fsr3_color.glsl"
 
+// Whether a forward character covers the render pixel of output pixel p or one of its neighbours.
+bool NearCharacter(uvec2 p) {
+    const ivec2 q = ivec2(p * pc.render_size / pc.size);
+    const ivec2 last = ivec2(pc.render_size) - 1;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const ivec2 r = clamp(q + ivec2(x, y), ivec2(0), last);
+            if ((texelFetch(stencil_tex, r, 0).r & STENCIL_CHARACTER) != 0u) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// FXAA compares the luma of the gamma-encoded colour.
+float TexelLuma(ivec2 q) {
+    const vec3 c = texelFetch(src_tex, clamp(q, ivec2(0), ivec2(pc.size) - 1), 0).rgb;
+    return Fsr3Luma((pc.flags & STORE_LINEAR_INPUT) != 0u ? Fsr3SrgbEncode(c) : c);
+}
+
+// The bilinear blend of the texel lumas at uv. Luma is linear in gamma-encoded colour, so one
+// bilinear tap blends it; linear colour encodes each of the four texels first.
+float FxaaLuma(vec2 uv) {
+    if ((pc.flags & STORE_LINEAR_INPUT) == 0u) {
+        return Fsr3Luma(textureLod(sampler2D(src_tex, src_sampler), uv, 0.0).rgb);
+    }
+    const vec2 t = uv * vec2(pc.size) - 0.5;
+    const ivec2 q = ivec2(floor(t));
+    const vec2 f = t - vec2(q);
+    return mix(mix(TexelLuma(q), TexelLuma(q + ivec2(1, 0)), f.x),
+               mix(TexelLuma(q + ivec2(0, 1)), TexelLuma(q + ivec2(1, 1)), f.x), f.y);
+}
+
+// Blends c, the colour of pixel p, across the edge through p. Returns false, leaving c unchanged,
+// when the local contrast is too low for an edge.
+bool Fxaa(ivec2 p, inout vec3 c) {
+    const vec2 texel = 1.0 / vec2(textureSize(src_tex, 0));
+    const vec2 uv = (vec2(p) + 0.5) * texel;
+    // The luma of the pixel and of its neighbours; n is the one above.
+    const float m = TexelLuma(p);
+    const float n = TexelLuma(p + ivec2(0, -1));
+    const float s = TexelLuma(p + ivec2(0, 1));
+    const float w = TexelLuma(p + ivec2(-1, 0));
+    const float e = TexelLuma(p + ivec2(1, 0));
+    const float luma_max = max(m, max(max(n, s), max(w, e)));
+    const float range = luma_max - min(m, min(min(n, s), min(w, e)));
+    if (range < max(FXAA_EDGE_THRESHOLD_MIN, luma_max * FXAA_EDGE_THRESHOLD)) {
+        return false;
+    }
+    const float nw = TexelLuma(p + ivec2(-1, -1));
+    const float ne = TexelLuma(p + ivec2(1, -1));
+    const float sw = TexelLuma(p + ivec2(-1, 1));
+    const float se = TexelLuma(p + ivec2(1, 1));
+
+    // The subpixel blend grows with the contrast of the pixel against its neighbourhood.
+    const float average = (2.0 * (n + s + w + e) + nw + ne + sw + se) / 12.0;
+    const float contrast = smoothstep(0.0, 1.0, abs(average - m) / range);
+    const float subpixel_shift = contrast * contrast * FXAA_SUBPIXEL;
+
+    // A horizontal edge separates rows, so its luma changes more between rows than columns.
+    const float row_change =
+        abs(nw + sw - 2.0 * w) + 2.0 * abs(n + s - 2.0 * m) + abs(ne + se - 2.0 * e);
+    const float column_change =
+        abs(nw + ne - 2.0 * n) + 2.0 * abs(w + e - 2.0 * m) + abs(sw + se - 2.0 * s);
+    const bool horizontal = row_change >= column_change;
+    // across is one pixel over the edge to the neighbour with the larger luma step, along one
+    // pixel in the direction of the edge.
+    const float before = horizontal ? n : w;
+    const float after = horizontal ? s : e;
+    const bool backward = abs(before - m) >= abs(after - m);
+    const float neighbour = backward ? before : after;
+    const vec2 across =
+        (backward ? -1.0 : 1.0) * (horizontal ? vec2(0.0, texel.y) : vec2(texel.x, 0.0));
+    const vec2 along = horizontal ? vec2(texel.x, 0.0) : vec2(0.0, texel.y);
+
+    // Searches both ways along the edge, halfway to the neighbour, for its ends: the first
+    // samples whose luma leaves the mean of both sides by a quarter of the luma step.
+    const vec2 start = uv + 0.5 * across;
+    const float edge_luma = 0.5 * (m + neighbour);
+    const float threshold = 0.25 * abs(neighbour - m);
+    float dist_neg = 0.0;
+    float dist_pos = 0.0;
+    float delta_neg = 0.0;
+    float delta_pos = 0.0;
+    bool found_neg = false;
+    bool found_pos = false;
+    for (int i = 0; i < FXAA_STEPS.length() && !(found_neg && found_pos); ++i) {
+        if (!found_neg) {
+            dist_neg += FXAA_STEPS[i];
+            delta_neg = FxaaLuma(start - dist_neg * along) - edge_luma;
+            found_neg = abs(delta_neg) >= threshold;
+        }
+        if (!found_pos) {
+            dist_pos += FXAA_STEPS[i];
+            delta_pos = FxaaLuma(start + dist_pos * along) - edge_luma;
+            found_pos = abs(delta_pos) >= threshold;
+        }
+    }
+
+    // The edge crosses the pixel when the luma at the nearer end lies on the other side of
+    // edge_luma than the pixel's; the nearer that end, the more the pixel blends across.
+    const float delta_end = dist_neg < dist_pos ? delta_neg : delta_pos;
+    const float edge_shift = (delta_end < 0.0) != (m < edge_luma)
+                                 ? 0.5 - min(dist_neg, dist_pos) / (dist_neg + dist_pos)
+                                 : 0.0;
+    const vec2 blended = uv + max(edge_shift, subpixel_shift) * across;
+    c = textureLod(sampler2D(src_tex, src_sampler), blended, 0.0).rgb;
+    return true;
+}
+
 void main() {
     if (any(greaterThanEqual(gl_GlobalInvocationID.xy, pc.size))) {
         return;
     }
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     vec3 c = texelFetch(src_tex, p, 0).rgb;
-    if ((pc.flags & STORE_RCAS) != 0u) {
+    bool smoothed = false;
+    if ((pc.flags & STORE_FXAA) != 0u &&
+        ((pc.flags & STORE_FXAA_CHARACTERS) == 0u || NearCharacter(gl_GlobalInvocationID.xy))) {
+        smoothed = Fxaa(p, c);
+    }
+    // Sharpening the pixels FXAA smooths would undo it.
+    if (!smoothed && (pc.flags & STORE_RCAS) != 0u) {
         AU4 con;
         FsrRcasCon(con, pc.rcas_stops);
         FsrRcasF(c.r, c.g, c.b, gl_GlobalInvocationID.xy, con);

@@ -31,6 +31,8 @@ constexpr u32 MaskUseHistory = 1u << 0;
 constexpr u32 MaskHistoryValid = 1u << 1;
 constexpr u32 StoreRcas = 1u << 0;
 constexpr u32 StoreLinearInput = 1u << 1;
+constexpr u32 StoreFxaa = 1u << 2;
+constexpr u32 StoreFxaaCharacters = 1u << 3;
 constexpr u32 FallbackBilinear = 0;
 constexpr u32 FallbackEasu = 1;
 constexpr u32 DebugHistoryValid = 1u << 0;
@@ -62,7 +64,7 @@ constexpr vk::DescriptorType SamplerBinding = vk::DescriptorType::eSampler;
 // Descriptor set 0 of each shader, in binding order.
 constexpr std::array MaskBindings{SampledImage, StorageImage, StorageImage, StorageImage};
 constexpr std::array CameraMotionBindings{SampledImage, SampledImage, SampledImage, StorageImage};
-constexpr std::array StoreBindings{SampledImage, StorageImage};
+constexpr std::array StoreBindings{SampledImage, SamplerBinding, SampledImage, StorageImage};
 constexpr std::array FallbackBindings{SampledImage, SamplerBinding, StorageImage};
 constexpr std::array DebugBindings{SampledImage, SampledImage,   SampledImage, SampledImage,
                                    SampledImage, SampledImage,   SampledImage, SampledImage,
@@ -100,10 +102,12 @@ struct StoreConstants {
     std::array<u32, 2> size{};
     float rcas_stops{};
     u32 flags{};
+    std::array<u32, 2> render_size{};
 };
-static_assert(sizeof(StoreConstants) == 16);
+static_assert(sizeof(StoreConstants) == 24);
 static_assert(offsetof(StoreConstants, rcas_stops) == 8);
 static_assert(offsetof(StoreConstants, flags) == 12);
+static_assert(offsetof(StoreConstants, render_size) == 16);
 
 struct FallbackConstants {
     std::array<u32, 2> destination_size{};
@@ -559,11 +563,16 @@ void Passes::RecordStore(vk::CommandBuffer cmdbuf, const StoreParams& params) {
         .size = {params.output_size.width, params.output_size.height},
         .rcas_stops = params.rcas_stops,
         .flags = (params.rcas_stops >= 0.0f ? StoreRcas : 0u) |
-                 (params.linear_input ? StoreLinearInput : 0u),
+                 (params.linear_input ? StoreLinearInput : 0u) |
+                 (params.fxaa != Fxaa::Off ? StoreFxaa : 0u) |
+                 (params.fxaa == Fxaa::Characters ? StoreFxaaCharacters : 0u),
+        .render_size = {params.render_size.width, params.render_size.height},
     };
+    // The stencil may be a null descriptor when FXAA does not read it.
     Record(cmdbuf, state.store, StoreBindings,
-           std::array{ImageDescriptor(source.view), ImageDescriptor(params.destination)}, constants,
-           params.output_size);
+           std::array{ImageDescriptor(source.view), state.SamplerDescriptor(),
+                      ImageDescriptor(params.stencil), ImageDescriptor(params.destination)},
+           constants, params.output_size);
 }
 
 void Passes::RecordFallback(vk::CommandBuffer cmdbuf, const FallbackParams& params) {

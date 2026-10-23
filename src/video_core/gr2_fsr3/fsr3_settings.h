@@ -19,14 +19,17 @@ struct Values {
     bool enable{false};
     bool fsr4_enable{false};
     Fsr4Model fsr4_model{Fsr4Model::Auto};
-    s32 sharpness{25};
-    s32 reactive_characters{50};
-    s32 reactive_effects{70};
-    s32 reactive_outline{20};
-    s32 tc_characters{0};
+    s32 sharpness{0};
+    Fxaa fxaa{Fxaa::Off};
+    s32 reactive_characters{100};
+    s32 reactive_effects{100};
+    s32 reactive_outline{100};
+    s32 tc_characters{100};
+    bool character_camera_motion{true};
     ColorSpace color_space{ColorSpace::Linear};
     DepthSource depth_source{DepthSource::Copy};
     bool lod_bias{true};
+    u32 lod_bias_extra{2}; ///< Extra LOD bias in steps of -0.5, from 0 to 3.
     bool fp32{false};
     bool fallback_easu{false};
     DebugView debug{DebugView::Off};

@@ -96,7 +96,8 @@ AcquireRequest RequestFor(Mode mode, const Frame& frame) {
         return {
             .color = true,
             .velocity = true,
-            .stencil = (mode == Mode::Fsr && frame.masks) || frame.camera_motion,
+            .stencil = (mode == Mode::Fsr && frame.masks) || frame.camera_motion ||
+                       frame.settings.fxaa == Fxaa::Characters,
             .depth_copy = !frame.depth_main || frame.camera_motion,
             .depth_main = frame.depth_main,
             .output = true,
@@ -172,6 +173,9 @@ StoreParams StoreOf(const Frame& frame, const FrameImages& images, const Fsr4Ima
         .rcas_stops = sharpness > 0.0f ? 2.0f * (1.0f - sharpness) : -1.0f,
         .linear_input = frame.settings.color_space == ColorSpace::Linear,
         .source = source,
+        .fxaa = frame.settings.fxaa,
+        .stencil = images.stencil.view,
+        .render_size = frame.sizes.render,
     };
 }
 
@@ -326,14 +330,14 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
     frame.camera = inputs.EvaluateCamera(frame.capture_current);
 
     const bool coverage = (settings.test & TestBit::CoverageJitter) != 0;
-    const bool camera_motion_test = (settings.test & TestBit::CharacterCameraMotion) != 0;
     const bool session_fsr = !coverage && !cbresolve && KindOf(*session_sizes) != Kind::Other;
     fsr4_key.reset();
     if (settings.fsr4_enable && session_fsr && !fsr4_passes_failed) {
         fsr4_key = Fsr4KeyFor(session_sizes->render, session_sizes->output, settings.fsr4_model);
     }
-    fsr4_state = fsr4.Update(rasterizer.GetScheduler(), fsr4_key, !context.HoldsMemory(),
-                             Passes::EstimateFsr4Bytes(session_sizes->render, camera_motion_test));
+    fsr4_state = fsr4.Update(
+        rasterizer.GetScheduler(), fsr4_key, !context.HoldsMemory(),
+        Passes::EstimateFsr4Bytes(session_sizes->render, settings.character_camera_motion));
     // FSR 3.1 holds no context while FSR 4 holds one or its files have passed their checks; while
     // the files load, a context FSR 3.1 already has keeps running.
     const bool fsr3_blocked =
@@ -348,14 +352,16 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
             .debug_checking = settings.validate,
         };
     }
-    context_state = context.Update(
-        rasterizer.GetScheduler(), wanted,
-        Passes::EstimateBytes(session_sizes->render, session_sizes->output, camera_motion_test));
+    context_state =
+        context.Update(rasterizer.GetScheduler(), wanted,
+                       Passes::EstimateBytes(session_sizes->render, session_sizes->output,
+                                             settings.character_camera_motion));
 
     frame.masks = settings.reactive_characters > 0 || settings.reactive_effects > 0 ||
                   settings.reactive_outline > 0 || settings.tc_characters > 0 ||
                   (settings.test & TestBit::CharacterMaskHistory) != 0;
-    frame.camera_motion = camera_motion_test && frame.capture_current && capture.cb_valid;
+    frame.camera_motion =
+        settings.character_camera_motion && frame.capture_current && capture.cb_valid;
     // The copy needs this frame's Velocity capture. FSR barriers only the depth aspect of the main
     // depth-stencil image, which is valid only with separateDepthStencilLayouts.
     frame.depth_main = context.IsSeparateDepthStencilLayoutsSupported() &&
@@ -448,10 +454,8 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
             if (frame.kind == Kind::Upscale && settings.lod_bias) {
                 const float ratio = static_cast<float>(frame.sizes.render.width) /
                                     static_cast<float>(frame.sizes.output.width);
-                const float extra =
-                    ((settings.test & TestBit::LodBiasExtraHalf) != 0 ? 0.5f : 0.0f) +
-                    ((settings.test & TestBit::LodBiasExtraOne) != 0 ? 1.0f : 0.0f);
-                plan.lod_bias = std::log2(ratio) - extra;
+                plan.lod_bias =
+                    std::log2(ratio) - 0.5f * static_cast<float>(settings.lod_bias_extra);
             }
         }
     } else if (coverage && executed != Mode::Debug) {
@@ -555,8 +559,7 @@ Mode Module::RecordFsr(vk::CommandBuffer cmdbuf, const Frame& frame, const Frame
                        Vulkan::Scheduler& scheduler) {
     const Settings::Values& settings = frame.settings;
     const auto& [render, output] = frame.sizes;
-    const bool camera_motion_image = (settings.test & TestBit::CharacterCameraMotion) != 0;
-    passes->Resize(scheduler, render, output, camera_motion_image, false);
+    passes->Resize(scheduler, render, output, settings.character_camera_motion, false);
     if (frame.reset) {
         passes->ResetHistory();
     }
@@ -637,7 +640,7 @@ Mode Module::RecordFsr4(vk::CommandBuffer cmdbuf, const Frame& frame, const Fram
                         Vulkan::Scheduler& scheduler) {
     const Settings::Values& settings = frame.settings;
     const auto& [render, output] = frame.sizes;
-    passes->ResizeFsr4(scheduler, render, (settings.test & TestBit::CharacterCameraMotion) != 0);
+    passes->ResizeFsr4(scheduler, render, settings.character_camera_motion);
     if (frame.camera_motion) {
         passes->RecordCameraMotion(cmdbuf, CameraMotionOf(frame, images, inputs.Velocity()));
     }
