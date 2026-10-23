@@ -139,7 +139,7 @@ def vdf_write(items):
     return bytes(b + b"\x08")
 
 def shortcut(vdf, name, exe, start, icon, options=""):
-    # Adds or updates the shortcut and prints its app id (for the grid artwork names).
+    # Adds or updates the shortcut; prints its app id (for the grid artwork names) and added|updated.
     root = [["shortcuts", []]]
     if os.path.isfile(vdf) and os.path.getsize(vdf) > 0:
         with open(vdf, "rb") as f:
@@ -149,6 +149,7 @@ def shortcut(vdf, name, exe, start, icon, options=""):
               "LaunchOptions": options}
     appid = zlib.crc32((fields["Exe"] + name).encode()) | 0x80000000
     lower = {k.lower(): v for k, v in fields.items()}
+    status = "updated"
     for _, entry in sc:
         d = {k.lower(): v for k, v in entry}
         if d.get("exe") == fields["Exe"] and d.get("launchoptions", "") == options:
@@ -158,6 +159,7 @@ def shortcut(vdf, name, exe, start, icon, options=""):
                 appid = d["appid"] & 0xFFFFFFFF
             break
     else:
+        status = "added"
         sc.append([str(len(sc)), [
             ["appid", appid - (1 << 32)], ["AppName", name], ["Exe", fields["Exe"]],
             ["StartDir", fields["StartDir"]], ["icon", icon], ["ShortcutPath", ""],
@@ -170,7 +172,7 @@ def shortcut(vdf, name, exe, start, icon, options=""):
     with open(vdf + ".tmp", "wb") as f:
         f.write(data)
     os.replace(vdf + ".tmp", vdf)
-    print(appid)
+    print(f"{appid}\t{status}")
 
 def latest(repo, pattern=r"-linux\.zip$", tag=""):
     # Prints "tag<TAB>url" of the first asset of the latest release (or of the release tag) whose
