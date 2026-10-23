@@ -157,7 +157,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    CommandBuffer().beginRendering(rendering_info);
+    RawCommandBuffer().beginRendering(rendering_info);
 }
 
 void Scheduler::EndRendering() {
@@ -165,7 +165,7 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    CommandBuffer().endRendering();
+    RawCommandBuffer().endRendering();
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
@@ -518,7 +518,8 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     }
 }
 
-void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+void DynamicState::Commit(const Instance& instance, Scheduler& scheduler) {
+    const vk::CommandBuffer cmdbuf = scheduler.RawCommandBuffer();
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

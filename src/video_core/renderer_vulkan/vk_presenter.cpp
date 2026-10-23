@@ -513,9 +513,9 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
-    Check(draw_scheduler.CommandBuffer().reset());
-    Check(present_scheduler.CommandBuffer().reset());
-    Check(flip_scheduler.CommandBuffer().reset());
+    Check(draw_scheduler.RawCommandBuffer().reset());
+    Check(present_scheduler.RawCommandBuffer().reset());
+    Check(flip_scheduler.RawCommandBuffer().reset());
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -885,7 +885,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     const vk::ImageView swapchain_image_view = swapchain.ImageView();
 
     auto& scheduler = present_scheduler;
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.RawCommandBuffer();
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 

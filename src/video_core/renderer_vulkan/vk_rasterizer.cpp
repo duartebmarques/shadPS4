@@ -3498,7 +3498,7 @@ bool Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
             skipcache->RecordVerifyClean(CacheId::DynState);
         }
     }
-    dynamic_state.Commit(instance, scheduler.CommandBuffer());
+    dynamic_state.Commit(instance, scheduler);
 
     if (probing && !dyn_would_hit) {
         auto& ctr = skipcache->Counters(CacheId::DynState);

@@ -18,6 +18,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "vulkan/vulkan.hpp"
@@ -29,6 +30,7 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+class Scheduler;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -214,8 +216,8 @@ struct DynamicState {
     /// Counts mask changes no pipeline declares dynamic; drained per 300 frames.
     u64 color_write_mask_skips_{};
 
-    /// Commits the dynamic state to the provided command buffer.
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+    /// Commits the dynamic state to the scheduler's current command buffer.
+    void Commit(const Instance& instance, Scheduler& scheduler);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
@@ -514,8 +516,13 @@ public:
         return dynamic_state;
     }
 
+    /// Returns a recorder for the current command buffer.
+    [[nodiscard]] CommandRecorder CommandBuffer() noexcept {
+        return CommandRecorder{*this};
+    }
+
     /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    [[nodiscard]] vk::CommandBuffer RawCommandBuffer() const {
         return sessions.back().primary;
     }
 
