@@ -16,4 +16,16 @@
             <Line Type="mask" Address="C7 00 80 07 00 00 48 8D BD 68 FF FF FF 8B 03 89 43 0C" Offset="2" Value="00050000"/>
         </PatchList>
     </Metadata>
+    <Metadata Title="inFAMOUS First Light"
+              Name="Skip intro movie (1.00)"
+              Note="Game version 1.00: returns from the boot splash movie start, so the game goes straight to the title screen. In-game cutscenes are not affected."
+              Author="duartebmarques"
+              PatchVer="1.0"
+              AppVer="01.00"
+              AppElf="eboot.bin"
+              isEnabled="true">
+        <PatchList>
+            <Line Type="mask" Address="55 48 89 E5 41 57 41 56 53 48 83 EC 18 49 89 FE 4C 8B 3D ?? ?? ?? ?? 49 8B 07 48 89 45 E0 49 8B 46 30" Offset="0" Value="C3"/>
+        </PatchList>
+    </Metadata>
 </Patch>
