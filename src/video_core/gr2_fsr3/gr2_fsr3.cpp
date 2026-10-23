@@ -254,7 +254,10 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
     // Frames of other sizes keep the context of the first sizes and take the non-FSR path of
     // their kind.
     const bool session_frame = frame.sizes == *session_sizes;
-    if (logged_sizes.size() < MaxLoggedSizes && !std::ranges::contains(logged_sizes, frame.sizes)) {
+    // A predicate search: the MSVC STL vectorizes ranges::contains for trivially comparable
+    // elements and fails to compile it for this 16-byte type.
+    const auto same_sizes = [&frame](const SizePair& sizes) { return sizes == frame.sizes; };
+    if (logged_sizes.size() < MaxLoggedSizes && !std::ranges::any_of(logged_sizes, same_sizes)) {
         logged_sizes.push_back(frame.sizes);
         LOG_INFO(Render_Vulkan, "GR2 FSR3: Antialias {}x{} -> {}x{} ({}){}",
                  frame.sizes.render.width, frame.sizes.render.height, frame.sizes.output.width,
