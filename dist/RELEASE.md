@@ -5,12 +5,13 @@ the SD card: **Second Son** (CUSA00004, update **1.07**) and/or **First Light** 
 
 1. **Desktop Mode:** Steam button > Power > Switch to Desktop.
 2. **Get the app:** download `shadps4-@TAG@-linux.zip` below and extract it: one folder,
-   `shadPS4-infamous`. Double-click `shadPS4.sh` in it: the first start finds your games, then the
-   game picker opens (choose a game > **Play** or **Patches**).
-3. **Steam:** run `./shadPS4.sh --add-to-steam` in that folder, then in Gaming Mode open
-   Library > Non-Steam > **shadPS4 (inFAMOUS)**.
+   `shadPS4-infamous`. Double-click `shadPS4.sh` in it: the first start finds your games and adds
+   each one to Steam (its own shortcut, straight into the game), then the game picker opens.
+3. **Play:** in Gaming Mode, Library > Non-Steam > your game.
 
-Or the one line in Konsole (installs into `~/Applications/shadPS4-infamous` and adds Steam shortcuts):
+First Light is a **work in progress**: playable, but heavy fights drop to about 20 fps.
+
+Or the one line in Konsole (installs into `~/Applications/shadPS4-infamous` and adds each game to Steam):
 ```
 bash <(curl -fsSL https://github.com/duartebmarques/shadPS4/releases/latest/download/install.sh)
 ```

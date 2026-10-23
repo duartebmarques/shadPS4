@@ -75,20 +75,9 @@ if [ -f "$DIR/inFAMOUS Second Son.sh" ]; then
     printf '#!/bin/bash\nexec "%s/shadPS4.sh" CUSA00004 "$@"\n' "$DIR" >"$DIR/inFAMOUS Second Son.sh"
 fi
 
+# Setup also adds each game to Steam (playing it directly) unless told not to.
+[ "$STEAM" = 1 ] || export SHADPS4_NO_STEAM=1
 "$DIR/shadPS4.sh" --setup "${YES[@]}"
-
-if [ "$STEAM" = 1 ]; then
-    if pgrep -x steam >/dev/null; then
-        "$DIR/shadPS4.sh" --add-to-steam || true
-        info "Per-game shortcuts with their library art need Steam closed: exit Steam and run"
-        info "  \"$DIR/shadPS4.sh\" --add-to-steam CUSA00004   (or another title id)"
-    else
-        "$DIR/shadPS4.sh" --add-to-steam || true
-        while IFS=$'\t' read -r id _; do
-            "$DIR/shadPS4.sh" --add-to-steam "$id" || true
-        done <"$DIR/user/games.list"
-    fi
-fi
 
 cat <<EOF
 

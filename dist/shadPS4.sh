@@ -4,7 +4,7 @@
 #   ./shadPS4.sh                 game picker (Big Picture): choose a game, its patches, play
 #   ./shadPS4.sh CUSA00004       play a game directly (a title id from games.json, or an eboot.bin)
 #   ./shadPS4.sh --setup         find the supported games again (also their update, DLC and pkg files)
-#   ./shadPS4.sh --add-to-steam  add this app to Steam (one shortcut; with a title id, that game's)
+#   ./shadPS4.sh --add-to-steam  add each game to Steam (plays it directly) and the game picker
 #   ./shadPS4.sh --update        download the latest release over this folder (user/ is kept)
 #
 # Setup runs by itself on the first start: it looks for the games next to this folder, in your
@@ -28,12 +28,20 @@ die() {
 info() { echo "==> $*"; }
 warn() { echo "warning: $*" >&2; }
 notify() { command -v notify-send >/dev/null && notify-send -a shadPS4 "shadPS4" "$*" || true; }
+# Yes/no question: in the terminal, else a desktop dialog (started by double-click), else no.
 ask() {
     [ "$YES" = 1 ] && return 0
-    [ -t 0 ] || return 1
-    local reply
-    read -r -p "$1 [Y/n] " reply
-    [[ -z "$reply" || "$reply" =~ ^[Yy] ]]
+    if [ -t 0 ]; then
+        local reply
+        read -r -p "$1 [Y/n] " reply
+        [[ -z "$reply" || "$reply" =~ ^[Yy] ]]
+    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v kdialog >/dev/null; then
+        kdialog --title shadPS4 --yesno "$1" 2>/dev/null
+    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null; then
+        zenity --question --title shadPS4 --text "$1" 2>/dev/null
+    else
+        return 1
+    fi
 }
 py() { python3 -I "$ROOT/tools/sp4.py" "$@"; }
 
@@ -163,30 +171,24 @@ setup() {
         done
     fi
     touch "$U/.setup-done"
+    # Not from a Steam launch: Steam would close under the game.
+    if [ "$n" != 0 ] && [ -z "${SteamGameId:-}${SHADPS4_NO_STEAM:-}" ] &&
+        [ -d "$HOME/.local/share/Steam/userdata" ]; then
+        add_to_steam || true
+    fi
     [ "$n" -gt 0 ] || warn "no supported game found: copy your game dump (or its pkg files) into your home folder or an SD card and run --setup"
 }
 
-add_to_steam() {
-    local name="shadPS4 (inFAMOUS)" exe="$ROOT/shadPS4.sh" opts="" id="${1:-}" game=""
-    if [ -n "$id" ]; then
-        game="$(awk -F'\t' -v t="$id" '$1 == t { print $2 }' "$GAMES_LIST")"
-        [ -n "$game" ] || die "$id is not set up (run --setup)"
-        name="$(py games "$ROOT/games.json" | awk -F'\t' -v t="$id" 'index("," $3 ",", "," t ",") { print $2 }')"
-        opts="$id"
-    fi
-    if pgrep -x steam >/dev/null && command -v steamos-add-to-steam >/dev/null && [ -z "$id" ]; then
-        steamos-add-to-steam "$exe"
-        info "Sent to Steam: \"$exe\""
-        return
-    fi
-    pgrep -x steam >/dev/null && die "close Steam first (Steam > Exit), then run this again"
-    local steam_dir="$HOME/.local/share/Steam" cfg vdf appid icon="${game:+$game/sce_sys/icon0.png}" n=0
+# Writes one shortcut (name, launch options, artwork folder) into every Steam account; Steam closed.
+steam_shortcut() {
+    local name="$1" opts="$2" game="$3" steam_dir="$HOME/.local/share/Steam" cfg vdf appid n=0
+    local icon="${game:+$game/sce_sys/icon0.png}"
     [ -d "$steam_dir/userdata" ] || steam_dir="$HOME/.steam/steam"
     for cfg in "$steam_dir"/userdata/*/config; do
         [[ "$(basename "$(dirname "$cfg")")" =~ ^[1-9][0-9]*$ ]] || continue
         vdf="$cfg/shortcuts.vdf"
         [ -f "$vdf" ] && cp "$vdf" "$vdf.bak"
-        appid="$(py shortcut "$vdf" "$name" "$exe" "$ROOT" "${icon:-}" "$opts")" || continue
+        appid="$(py shortcut "$vdf" "$name" "$ROOT/shadPS4.sh" "$ROOT" "${icon:-}" "$opts")" || continue
         mkdir -p "$cfg/grid"
         if [ -n "$game" ] && [ -f "$game/sce_sys/pic1.png" ]; then
             cp "$game/sce_sys/pic1.png" "$cfg/grid/${appid}_hero.png"
@@ -198,8 +200,42 @@ add_to_steam() {
         fi
         n=$((n + 1))
     done
-    [ "$n" -gt 0 ] || die "no Steam account found in $steam_dir"
-    info "Steam shortcut \"$name\" added ($n Steam account(s))"
+    [ "$n" -gt 0 ] || { warn "no Steam account found in $steam_dir"; return 1; }
+    info "Steam shortcut \"$name\"${opts:+ (plays $opts)} added"
+}
+
+# Adds a Steam shortcut that starts each game directly (all set-up games without arguments),
+# plus the game picker. Steam rewrites its shortcuts on exit, so it is closed and restarted.
+add_to_steam() {
+    local id game name restart=0 i
+    local ids=("$@")
+    [ "${#ids[@]}" -gt 0 ] || mapfile -t ids < <(cut -f1 "$GAMES_LIST" 2>/dev/null)
+    [ "${#ids[@]}" -gt 0 ] || { warn "no games set up yet (run --setup)"; return 1; }
+    if pgrep -x steam >/dev/null; then
+        if ! ask "Add your games to Steam? Steam closes for a moment and starts again."; then
+            warn "to add them later: \"$ROOT/shadPS4.sh\" --add-to-steam"
+            return 1
+        fi
+        steam -shutdown >/dev/null 2>&1 || true
+        for ((i = 0; i < 60; i++)); do pgrep -x steam >/dev/null || break; sleep 1; done
+        if pgrep -x steam >/dev/null; then
+            warn "Steam did not close; exit it and run --add-to-steam again"
+            return 1
+        fi
+        restart=1
+    fi
+    steam_shortcut "shadPS4 (inFAMOUS)" "" ""
+    for id in "${ids[@]}"; do
+        game="$(awk -F'\t' -v t="$id" '$1 == t { print $2 }' "$GAMES_LIST")"
+        [ -n "$game" ] || { warn "$id is not set up (run --setup)"; continue; }
+        name="$(py games "$ROOT/games.json" |
+            awk -F'\t' -v t="$id" 'index("," $3 ",", "," t ",") { print $2 }')"
+        steam_shortcut "${name:-$id}" "$id" "$game"
+    done
+    # Gaming Mode starts Steam again by itself.
+    if [ "$restart" = 1 ] && [ "${XDG_CURRENT_DESKTOP:-}" != gamescope ]; then
+        setsid steam >/dev/null 2>&1 < /dev/null &
+    fi
 }
 
 update() {
@@ -253,7 +289,7 @@ cd "$ROOT"
 case "${1:-}" in
 -h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
 --setup) shift; [ "${1:-}" = -y ] && YES=1; setup ;;
---add-to-steam) shift; add_to_steam "${1:-}" ;;
+--add-to-steam) shift; [ "${1:-}" = -y ] && { YES=1; shift; }; add_to_steam "$@" ;;
 --update) shift; [ "${1:-}" = -y ] && YES=1; update ;;
 "")
     [ -f "$U/.setup-done" ] || setup
