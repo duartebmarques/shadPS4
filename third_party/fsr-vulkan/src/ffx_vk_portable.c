@@ -245,9 +245,12 @@ FfxVkPortableResult ffxVkPortableQueryDeviceCapabilities(
          * qualifier, so every generated accumulate shader declares
          * StorageImageWriteWithoutFormat. */
         features2.features.shaderStorageImageWriteWithoutFormat;
+    /* A build that defines FFX_VK_PORTABLE_NO_FRAME_GENERATION contains the upscaler only. */
+#if !defined(FFX_VK_PORTABLE_NO_FRAME_GENERATION)
     capabilities->fsr3FrameGenerationPrerequisites =
         capabilities->fsr3ComputePrerequisites &&
         capabilities->timelineSemaphore;
+#endif
     capabilities->fsr4Int8Prerequisites =
         capabilities->hasComputeQueue &&
         capabilities->shaderInt8 &&
@@ -324,6 +327,7 @@ uint64_t ffxVkPortableValidateUpscaleDispatchInfo(
     return issues;
 }
 
+#if !defined(FFX_VK_PORTABLE_NO_FRAME_GENERATION)
 uint64_t ffxVkPortableValidateFrameGenerationCreateInfo(
     const FfxVkPortableFrameGenerationCreateInfo* createInfo)
 {
@@ -441,6 +445,7 @@ uint64_t ffxVkPortableValidateFrameGenerationDispatchInfo(
         infiniteDepth);
     return issues;
 }
+#endif
 
 const char* ffxVkPortableValidationIssueName(uint64_t singleIssueBit)
 {

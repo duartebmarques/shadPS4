@@ -436,6 +436,12 @@ uint32_t findMemoryTypeIndex(
             (memoryProperties & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD))
             continue;
 
+        // Protected memory needs protected command buffers. Vulkan lists a type before its
+        // strict supersets, so a protected type would otherwise be the last match.
+        if ((memoryProperties & VK_MEMORY_PROPERTY_PROTECTED_BIT) &&
+            !(requestedProperties & VK_MEMORY_PROPERTY_PROTECTED_BIT))
+            continue;
+
         if ((memRequirements.memoryTypeBits & (1u << i)) &&
             (memoryProperties & requestedProperties) == requestedProperties) {
 

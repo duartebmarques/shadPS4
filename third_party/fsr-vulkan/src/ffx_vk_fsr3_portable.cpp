@@ -12,10 +12,15 @@
 #pragma GCC diagnostic ignored "-Wunused-variable"
 #endif
 
+/* A build that defines FFX_VK_PORTABLE_NO_FRAME_GENERATION contains the upscaler only. */
 #include <FidelityFX/host/backends/vk/ffx_vk.h>
+#if !defined(FFX_VK_PORTABLE_NO_FRAME_GENERATION)
 #include <FidelityFX/host/ffx_frameinterpolation.h>
+#endif
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
+#if !defined(FFX_VK_PORTABLE_NO_FRAME_GENERATION)
 #include <FidelityFX/host/ffx_opticalflow.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -27,7 +32,9 @@
 namespace {
 
 constexpr uint64_t kContextMagic = UINT64_C(0x46535233564b4354); /* FSR3VKCT */
+#if !defined(FFX_VK_PORTABLE_NO_FRAME_GENERATION)
 constexpr uint64_t kFrameGenerationContextMagic = UINT64_C(0x4653523346474354); /* FSR3FGCT */
+#endif
 constexpr uint32_t kKnownContextFlags =
     FFX_VK_PORTABLE_CONTEXT_HDR_COLOR_INPUT |
     FFX_VK_PORTABLE_CONTEXT_DISPLAY_RESOLUTION_MOTION_VECTORS |
@@ -134,6 +141,7 @@ static uint32_t toFfxContextFlags(uint32_t flags)
     return result;
 }
 
+#if !defined(FFX_VK_PORTABLE_NO_FRAME_GENERATION)
 static uint32_t toFrameInterpolationContextFlags(uint32_t flags)
 {
     uint32_t result = 0;
@@ -165,6 +173,7 @@ static FfxBackbufferTransferFunction toFfxTransferFunction(
         return FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
     }
 }
+#endif
 
 static void ffxMessage(FfxMsgType type, const wchar_t* message)
 {
@@ -189,6 +198,9 @@ static uint32_t findMemoryType(
         const VkMemoryPropertyFlags flags = properties.memoryTypes[index].propertyFlags;
         if (deviceCoherentMemoryEnabled != VK_TRUE &&
             (flags & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD))
+            continue;
+        /* Protected memory needs protected command buffers. */
+        if (flags & VK_MEMORY_PROPERTY_PROTECTED_BIT)
             continue;
         if (fallback == UINT32_MAX)
             fallback = index;
@@ -330,6 +342,7 @@ static FfxResource ownedResource(const OwnedImage& image, bool undefined)
         FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 }
 
+#if !defined(FFX_VK_PORTABLE_NO_FRAME_GENERATION)
 struct BackendState {
     void* scratchAllocation = nullptr;
     size_t scratchSize = 0;
@@ -383,6 +396,7 @@ static void destroyBackendState(BackendState* state)
     std::free(state->scratchAllocation);
     *state = {};
 }
+#endif
 
 } // namespace
 
@@ -642,6 +656,7 @@ extern "C" FfxVkPortableResult ffxVkPortableUpscaleContextDestroy(
     return fromFfxResult(ffxResult);
 }
 
+#if !defined(FFX_VK_PORTABLE_NO_FRAME_GENERATION)
 struct FfxVkPortableFrameGenerationContext {
     uint64_t magic = kFrameGenerationContextMagic;
     FfxVkPortableDeviceInfo deviceInfo{};
@@ -1019,3 +1034,4 @@ extern "C" FfxVkPortableResult ffxVkPortableFrameGenerationContextDestroy(
     delete context;
     return fromFfxResult(ffxResult);
 }
+#endif
