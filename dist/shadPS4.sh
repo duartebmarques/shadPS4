@@ -268,7 +268,8 @@ update() {
     unzip -q "$work/release.zip" -d "$work/r"
     local src
     src="$(dirname "$(find "$work/r" -maxdepth 3 -name shadPS4.sh | head -1)")"
-    [ -f "$src/shadPS4.sh" ] || die "the release has no shadPS4.sh"
+    [ -f "$src/shadPS4.sh" ] && [ -x "$src/app/usr/bin/shadps4" ] ||
+        die "$tag is not a folder app release (older than v1.1); nothing was changed"
     rm -rf "$ROOT/app.prev"
     [ -d "$ROOT/app" ] && mv "$ROOT/app" "$ROOT/app.prev"
     cp -a "$src/app" "$ROOT/app"
