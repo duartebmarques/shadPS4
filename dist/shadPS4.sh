@@ -7,8 +7,9 @@
 #   ./shadPS4.sh --add-to-steam  add this app to Steam (one shortcut; with a title id, that game's)
 #   ./shadPS4.sh --update        download the latest release over this folder (user/ is kept)
 #
-# Setup runs by itself on the first start: it looks for the games in your home folder and on SD
-# cards, links updates and DLC, downloads the community patch files and turns the default ones on.
+# Setup runs by itself on the first start: it looks for the games next to this folder, in your
+# home folder and on SD cards, links updates and DLC, downloads the community patch files and
+# turns the default ones on.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -121,9 +122,10 @@ extract_pkgs() {
     done
 }
 
-# Finds the games of games.json and writes user/games.list ("title id<TAB>game folder").
+# Finds the games of games.json (the folder around this app first, then home and SD cards) and
+# writes user/games.list ("title id<TAB>game folder").
 setup() {
-    local serials scan game title path ver upd other d link n=0 roots=("$HOME" /run/media)
+    local serials scan game title path ver upd other d link n=0 roots=("$(dirname "$ROOT")" "$HOME" /run/media)
     command -v python3 >/dev/null || die "python3 is required"
     install_defaults
     fetch_patches
