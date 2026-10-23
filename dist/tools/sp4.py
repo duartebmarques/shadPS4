@@ -74,12 +74,14 @@ def name_of(tag):
     return m.group(1) if m else None
 
 def patches(new, old, *defaults):
-    # Keeps the patches enabled in the old file (or the defaults on a first install).
+    # Keeps your choices from the old file; patches it does not have yet start as the defaults
+    # (or as the new file sets them).
+    seen, want = set(), set(defaults)
     if os.path.isfile(old):
-        txt = open(old, encoding="utf-8").read()
-        want = {name_of(t) for t in META.findall(txt) if 'isEnabled="true"' in t}
+        tags = META.findall(open(old, encoding="utf-8").read())
+        seen = {name_of(t) for t in tags}
+        want = {name_of(t) for t in tags if 'isEnabled="true"' in t} | (want - seen)
     else:
-        want = set(defaults)
         names = {name_of(t) for t in META.findall(open(new, encoding="utf-8").read())}
         for d in sorted(want - names):
             print(f"warning: patch '{d}' is not in the patch file", file=sys.stderr)
@@ -87,7 +89,9 @@ def patches(new, old, *defaults):
     if "<Patch>" not in txt:
         sys.exit("not a patch file")
     def fix(m):
-        on = "true" if name_of(m.group(0)) in want else "false"
+        name = name_of(m.group(0))
+        on = name in want or (name not in seen and not defaults and 'isEnabled="true"' in m.group(0))
+        on = "true" if on else "false"
         return re.sub(r'isEnabled="[^"]*"', f'isEnabled="{on}"', m.group(0))
     txt = META.sub(fix, txt)
     open(new, "w", encoding="utf-8").write(txt)

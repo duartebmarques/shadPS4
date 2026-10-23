@@ -69,7 +69,10 @@ install_defaults() {
             if [ ! -f "$U/$rel" ]; then put "$f" "$U/$rel"; elif ! cmp -s "$f" "$U/$rel"; then
                 put "$f" "$U/$rel.release"; fi ;;
         patches/*/*.xml)
-            [ -f "$U/$rel" ] || put "$f" "$U/$rel" ;;
+            if [ -f "$U/$rel" ]; then
+                cp "$f" "$U/$rel.new" && py patches "$U/$rel.new" "$U/$rel" >/dev/null &&
+                    mv -f "$U/$rel.new" "$U/$rel"
+            else put "$f" "$U/$rel"; fi ;;
         *) put "$f" "$U/$rel" ;;
         esac
     done < <(find "$d" -type f -print0)
