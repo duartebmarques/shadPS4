@@ -30,7 +30,7 @@ and extract it where you like (right-click > Extract > Extract archive here). Yo
 `shadPS4-infamous`.
 
 **2. Start it.** Double-click `shadPS4.sh` in that folder (choose *Execute* if asked). The first
-start finds your games, their update and DLC, and downloads the patch files. Then the game picker
+start finds your games, their update and DLC, and turns on the Steam Deck patches. Then the game picker
 opens: choose a game, then **Play** or **Patches**.
 
 **3. Add it to Steam** (for Gaming Mode): in a terminal in that folder run
