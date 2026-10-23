@@ -172,10 +172,11 @@ def shortcut(vdf, name, exe, start, icon, options=""):
     os.replace(vdf + ".tmp", vdf)
     print(appid)
 
-def latest(repo, pattern=r"-linux\.zip$"):
-    # Prints "tag<TAB>url" of the first asset of the latest release whose name matches pattern.
+def latest(repo, pattern=r"-linux\.zip$", tag=""):
+    # Prints "tag<TAB>url" of the first asset of the latest release (or of the release tag) whose
+    # name matches pattern.
     import json, urllib.request
-    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    url = f"https://api.github.com/repos/{repo}/releases/" + (f"tags/{tag}" if tag else "latest")
     try:
         with urllib.request.urlopen(url, timeout=30) as r:
             rel = json.load(r)
@@ -201,10 +202,14 @@ def config_add_dir(cfg, path):
     import json
     c = json.load(open(cfg)) if os.path.isfile(cfg) else {}
     dirs = c.setdefault("General", {}).setdefault("install_dirs", [])
+    # Folders that are gone (moved or renamed games) leave the list.
+    before = list(dirs)
+    dirs[:] = [d for d in dirs if os.path.isdir(d.get("path", ""))]
     # A folder under one already listed is found by the picker's recursive scan.
     covered = lambda d: d.get("enabled", True) and (path + "/").startswith(d.get("path", "").rstrip("/") + "/")
     if not any(covered(d) for d in dirs):
         dirs.append({"enabled": True, "path": path})
+    if dirs != before or not os.path.isfile(cfg):
         tmp = cfg + ".tmp"
         json.dump(c, open(tmp, "w"), indent=4)
         os.replace(tmp, cfg)

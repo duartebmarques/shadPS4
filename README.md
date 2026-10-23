@@ -30,16 +30,14 @@ and extract it where you like (right-click > Extract > Extract archive here). Yo
 `shadPS4-infamous`.
 
 **2. Start it.** Double-click `shadPS4.sh` in that folder (choose *Execute* if asked). The first
-start finds your games, their update and DLC, and turns on the Steam Deck patches. It then offers
-to add each game to Steam (Steam closes for a moment and starts again): every game gets its own
-shortcut with its artwork that starts the game directly, plus **shadPS4 (inFAMOUS)** for the game
-picker. Then the game picker opens: choose a game, then **Play** or **Patches**.
+start finds your games, their update and DLC, and turns on the Steam Deck patches. Then the game
+picker opens: choose a game, then **Play**, **Patches** or **Add to Steam**.
 
-**3. Play.** In Gaming Mode, start the game from Library > Non-Steam. Skipped the Steam step, or
-added a game later? Run `./shadPS4.sh --add-to-steam` in that folder.
+**3. Add it to Steam** (for Gaming Mode): on the game's page choose **Add to Steam**. Steam closes
+for a moment and starts again with the game in Library > Non-Steam, with its artwork; that
+shortcut starts the game directly. (`./shadPS4.sh --add-to-steam` adds every game at once.)
 
-Or all of it with one line in Konsole (installs into `~/Applications/shadPS4-infamous` and adds
-each game to Steam):
+Or steps 1 and 2 with one line in Konsole (installs into `~/Applications/shadPS4-infamous`):
 
 ```bash
 bash <(curl -fsSL https://github.com/duartebmarques/shadPS4/releases/latest/download/install.sh)

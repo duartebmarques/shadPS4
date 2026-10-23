@@ -1,5 +1,5 @@
 #!/bin/bash
-# Puts the shadPS4-infamous folder app in place, finds the games and adds Steam shortcuts.
+# Puts the shadPS4-infamous folder app in place and finds the games.
 # The app needs no installing: extracting the release and running shadPS4.sh is enough. This
 # script is the one-line way to get it, and the update path of installs older than the folder app.
 #
@@ -8,18 +8,19 @@
 # Options:
 #   --dir DIR    the app folder (default: ~/Applications/shadPS4-infamous; an older install there
 #                keeps its user folder: saves, controls, patch choices)
-#   --no-steam   do not add Steam shortcuts
+#   --tag TAG    install that release instead of the latest one
 #   -y, --yes    answer yes to every question
 set -euo pipefail
 
 REPO="duartebmarques/shadPS4"
 DIR="$HOME/Applications/shadPS4-infamous"
-STEAM=1
+TAG=""
 YES=()
 SRC="$(cd "$(dirname "$(readlink -f "$0")")" 2>/dev/null && pwd || true)"
 
 # Started from a file manager: reopen in a terminal so the questions can be answered.
-if [ ! -t 0 ] && [ -z "${INFAMOUS_IN_TERM:-}" ] && [ -f "$0" ]; then
+if [ ! -t 0 ] && [ -z "${INFAMOUS_IN_TERM:-}" ] && [ -f "$0" ] && [[ " $* " != *" -y "* ]] &&
+    [[ " $* " != *" --yes "* ]] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     export INFAMOUS_IN_TERM=1
     command -v konsole >/dev/null && exec konsole --hold -e bash "$0" "$@"
 fi
@@ -30,7 +31,7 @@ info() { echo "==> $*"; }
 while [ $# -gt 0 ]; do
     case "$1" in
     --dir) DIR="$2"; shift ;;
-    --no-steam) STEAM=0 ;;
+    --tag) TAG="$2"; shift ;;
     -y | --yes) YES=(-y) ;;
     --update) ;; # installs before the folder app called this with --update
     -h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -46,9 +47,11 @@ if [ -n "$SRC" ] && [ -x "$SRC/shadPS4.sh" ] && [ -d "$SRC/app" ]; then
 else
     command -v curl >/dev/null || die "curl is required"
     command -v unzip >/dev/null || die "unzip is required"
-    url="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |
+    api="https://api.github.com/repos/$REPO/releases/latest"
+    [ -z "$TAG" ] || api="https://api.github.com/repos/$REPO/releases/tags/$TAG"
+    url="$(curl -fsSL "$api" |
         grep -o '"browser_download_url": *"[^"]*-linux\.zip"' | head -1 | cut -d'"' -f4)"
-    [ -n "$url" ] || die "could not find the latest release"
+    [ -n "$url" ] || die "could not find the release ${TAG:-latest}"
     info "Downloading $(basename "$url")..."
     curl -fL --progress-bar -o "$work/release.zip" "$url"
     unzip -q "$work/release.zip" -d "$work"
@@ -75,14 +78,13 @@ if [ -f "$DIR/inFAMOUS Second Son.sh" ]; then
     printf '#!/bin/bash\nexec "%s/shadPS4.sh" CUSA00004 "$@"\n' "$DIR" >"$DIR/inFAMOUS Second Son.sh"
 fi
 
-# Setup also adds each game to Steam (playing it directly) unless told not to.
-[ "$STEAM" = 1 ] || export SHADPS4_NO_STEAM=1
 "$DIR/shadPS4.sh" --setup "${YES[@]}"
 
 cat <<EOF
 
-Done. Start "shadPS4 (inFAMOUS)" (or a game) from Steam (Library > Non-Steam), or run
+Done. Start the game picker with
     "$DIR/shadPS4.sh"
-Choose a game, then Play or Patches (render resolution, skip intro). Update later with
+Choose a game, then Play, Patches (render resolution, skip intro) or Add to Steam (a shortcut
+that starts the game directly, for Gaming Mode). Update later with
     "$DIR/shadPS4.sh" --update
 EOF
