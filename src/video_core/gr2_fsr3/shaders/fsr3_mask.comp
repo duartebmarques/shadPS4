@@ -1,0 +1,66 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+// Reactive and transparency-and-composition masks for FSR from the Gravity Rush 2 scene stencil.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform utexture2D stencil_tex;
+layout(set = 0, binding = 1, r8) uniform writeonly image2D reactive_out;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D tc_out;
+layout(set = 0, binding = 3, r8) uniform image2D character_history;
+
+layout(push_constant) uniform MaskConstants {
+    uvec2 size;
+    float reactive_characters;
+    float reactive_effects;
+    float reactive_outline;
+    float tc_characters;
+    uint flags;
+    int outline_radius;
+} pc;
+
+// Stencil bits of the game: geometry, temporal blend allowed, forward character (motion vector 0).
+const uint STENCIL_GEOMETRY = 0x01u;
+const uint STENCIL_TEMPORAL = 0x08u;
+const uint STENCIL_CHARACTER = 0x20u;
+
+const uint MASK_USE_HISTORY = 1u;
+const uint MASK_HISTORY_VALID = 2u;
+
+const float REACTIVE_MAX = 0.9;
+
+void main() {
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, pc.size))) {
+        return;
+    }
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const uint s = texelFetch(stencil_tex, p, 0).r;
+    const bool character = (s & STENCIL_CHARACTER) != 0u;
+    const bool effect = (s & STENCIL_GEOMETRY) != 0u && (s & STENCIL_TEMPORAL) == 0u && !character;
+
+    // The character ink outlines carry the effect signature; they lie next to a character pixel.
+    bool outline = false;
+    if (effect) {
+        const ivec2 last = ivec2(pc.size) - 1;
+        for (int y = -pc.outline_radius; y <= pc.outline_radius; ++y) {
+            for (int x = -pc.outline_radius; x <= pc.outline_radius; ++x) {
+                const ivec2 q = clamp(p + ivec2(x, y), ivec2(0), last);
+                outline = outline || (texelFetch(stencil_tex, q, 0).r & STENCIL_CHARACTER) != 0u;
+            }
+        }
+    }
+
+    const uint history_flags = MASK_USE_HISTORY | MASK_HISTORY_VALID;
+    const bool previous = pc.flags == history_flags && imageLoad(character_history, p).r > 0.5;
+    const bool covered = character || previous;
+    float reactive = covered ? pc.reactive_characters : 0.0;
+    reactive = max(reactive, outline ? pc.reactive_outline : (effect ? pc.reactive_effects : 0.0));
+    imageStore(reactive_out, p, vec4(min(reactive, REACTIVE_MAX)));
+    imageStore(tc_out, p, vec4(covered ? pc.tc_characters : 0.0));
+    imageStore(character_history, p, vec4(character ? 1.0 : 0.0));
+}

@@ -1536,6 +1536,7 @@ set(HOST_SHADERS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/host_shaders
 add_subdirectory(${HOST_SHADERS_INCLUDE})
 add_dependencies(shadps4 host_shaders)
 target_include_directories(shadps4 PRIVATE ${HOST_SHADERS_INCLUDE})
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/gr2_fsr3/gr2_fsr3.cmake")
 
 # embed resources
 

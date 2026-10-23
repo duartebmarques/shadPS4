@@ -15,6 +15,7 @@
 #include "imgui/imgui_std.h"
 #include "imgui_internal.h"
 #include "options.h"
+#include "video_core/gr2_fsr3/gr2_fsr3.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "widget/frame_dump.h"
 #include "widget/frame_graph.h"
@@ -124,6 +125,7 @@ void L::DrawMenuBar() {
 
                 ImGui::EndMenu();
             }
+            Gr2Fsr3::DrawMenu();
             ImGui::EndMenu();
         }
         if (BeginMenu("Debug")) {

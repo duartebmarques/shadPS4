@@ -1,0 +1,58 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_ARB_shading_language_420pack : enable
+
+// Writes the FSR output into the guest history image as the Gravity Rush 2 antialias pass writes
+// it: sRGB-encoded colour with the luma of the linear colour in alpha. FSR 1 RCAS sharpens first
+// when enabled.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D src_tex;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+
+layout(push_constant) uniform StoreConstants {
+    uvec2 size;
+    float rcas_stops;
+    uint flags;
+} pc;
+
+const uint STORE_RCAS = 1u;
+const uint STORE_LINEAR_INPUT = 2u;
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "../../host_shaders/fsr/ffx_a.h"
+
+#define FSR_RCAS_F 1
+// RCAS expects input in [0, 1].
+AF4 FsrRcasLoadF(ASU2 p) {
+    return clamp(texelFetch(src_tex, clamp(p, ASU2(0), ASU2(pc.size) - 1), 0), 0.0, 1.0);
+}
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "../../host_shaders/fsr/ffx_fsr1.h"
+
+#include "fsr3_color.glsl"
+
+void main() {
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, pc.size))) {
+        return;
+    }
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    vec3 c = texelFetch(src_tex, p, 0).rgb;
+    if ((pc.flags & STORE_RCAS) != 0u) {
+        AU4 con;
+        FsrRcasCon(con, pc.rcas_stops);
+        FsrRcasF(c.r, c.g, c.b, gl_GlobalInvocationID.xy, con);
+    }
+    c = clamp(c, 0.0, 1.0);
+    const bool linear_input = (pc.flags & STORE_LINEAR_INPUT) != 0u;
+    const vec3 encoded = linear_input ? Fsr3SrgbEncode(c) : c;
+    const vec3 linear_color = linear_input ? c : Fsr3SrgbDecode(c);
+    imageStore(dst, p, vec4(encoded, Fsr3Luma(linear_color)));
+}
