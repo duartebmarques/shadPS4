@@ -8,14 +8,13 @@
 #   ./shadPS4.sh --update        download the latest release over this folder (user/ is kept)
 #
 # Setup runs by itself on the first start: it looks for the games next to this folder, in your
-# home folder and on SD cards, links updates and DLC, downloads the community patch files and
-# turns the default ones on.
+# home folder and on SD cards, links updates and DLC, and installs the patch files with the
+# Steam Deck ones on.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 REPO="duartebmarques/shadPS4"
 EXTRACTOR_REPO="AzaharPlus/shadPS4Plus"
-PATCH_BASE="https://raw.githubusercontent.com/shadps4-emu/ps4_cheats/e34463942099072e5d8f5e2bcb3d7d927683b349/PATCHES"
 U="$ROOT/user"
 EMU="$ROOT/app/usr/bin/shadps4"
 GAMES_LIST="$U/games.list"
@@ -78,24 +77,8 @@ install_defaults() {
     done < <(find "$d" -type f -print0)
 }
 
-# The community patch file of each game, with the default patches on (or your earlier choices).
-fetch_patches() {
-    local id name serials update pfile defaults pf on
-    mkdir -p "$U/patches/shadPS4"
-    while IFS=$'\t' read -r id name serials update pfile defaults; do
-        [ "$pfile" != - ] || continue
-        [ "$defaults" != - ] || defaults=""
-        pf="$U/patches/shadPS4/$pfile"
-        IFS='|' read -ra defs <<<"$defaults"
-        if curl -fsSL --max-time 30 -o "$pf.dl" "$PATCH_BASE/$pfile" &&
-            on="$(py patches "$pf.dl" "$pf" "${defs[@]}")"; then
-            mv -f "$pf.dl" "$pf"
-            info "$name patches on: ${on:-none}"
-        else
-            rm -f "$pf.dl"
-            [ -f "$pf" ] || warn "could not download the $name patch file; run --setup when online"
-        fi
-    done < <(py games "$ROOT/games.json")
+# Patch files ship in dist-user/patches (install_defaults); the emulator finds them by serial here.
+index_patches() {
     py patch-index "$U/patches/shadPS4/files.json" "$ROOT/games.json"
 }
 
@@ -131,7 +114,7 @@ setup() {
     local serials scan game title path ver upd other d link n=0 roots=("$(dirname "$ROOT")" "$HOME" /run/media)
     command -v python3 >/dev/null || die "python3 is required"
     install_defaults
-    fetch_patches
+    index_patches
     serials="$(py games "$ROOT/games.json" | cut -f3 | paste -sd,)"
     scan="$(mktemp)"
     trap 'rm -f "$scan"' RETURN
