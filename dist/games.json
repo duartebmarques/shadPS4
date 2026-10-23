@@ -1,0 +1,16 @@
+{
+    "CUSA00004": {
+        "name": "inFAMOUS Second Son",
+        "serials": ["CUSA00004", "CUSA00223", "CUSA00305", "CUSA00309"],
+        "update": "01.07",
+        "patch_file": "InfamousSecondSon.xml",
+        "default_patches": ["Skip intro movie", "Render resolution 1280x720"]
+    },
+    "CUSA00897": {
+        "name": "inFAMOUS First Light",
+        "serials": ["CUSA00897", "CUSA00575", "CUSA00996", "CUSA01064"],
+        "update": null,
+        "patch_file": "InfamousFirstLight.xml",
+        "default_patches": ["Skip intro movie", "Render resolution 1280x720"]
+    }
+}

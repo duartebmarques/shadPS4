@@ -63,7 +63,10 @@
 
 #define KEY_TOGGLE 0x00200000
 #define MOUSE_GYRO_ROLL_MODE 0x00400000
-#define MOTION_SHAKE 0x00800000
+#define MOTION_TILT_LEFT 0x00800000
+#define MOTION_TILT_RIGHT 0x01000000
+#define MOTION_SHAKE 0x02000000
+#define MOUSE_GYRO_HOLD 0x04000000
 
 #define HOTKEY_FULLSCREEN 0xf0000001
 #define HOTKEY_PAUSE 0xf0000002
@@ -167,6 +170,9 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"touchpad_two_finger", SDL_GAMEPAD_BUTTON_TOUCHPAD_TWO_FINGER},
     {"leftjoystick_halfmode", LEFTJOYSTICK_HALFMODE},
     {"rightjoystick_halfmode", RIGHTJOYSTICK_HALFMODE},
+    {"motion_tilt_left", MOTION_TILT_LEFT},
+    {"motion_tilt_right", MOTION_TILT_RIGHT},
+    {"motion_shake", MOTION_SHAKE},
 
     // this is only for input
     {"back", SDL_GAMEPAD_BUTTON_BACK},
@@ -176,7 +182,7 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"rpaddle_high", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
     {"rpaddle_low", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2},
     {"mouse_gyro_roll_mode", MOUSE_GYRO_ROLL_MODE},
-    {"motion_shake", MOTION_SHAKE},
+    {"mouse_gyro_hold", MOUSE_GYRO_HOLD},
     {"qam", SDL_GAMEPAD_BUTTON_MISC1},
     {"r4", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
     {"l4", SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
@@ -567,14 +573,14 @@ public:
 
 class ControllerAllOutputs {
 public:
-    static constexpr u64 output_count = 52;
+    static constexpr u64 output_count = 55;
     std::array<ControllerOutput, output_count> data = {
         // Important: these have to be the first, or else they will update in the wrong order
         ControllerOutput(LEFTJOYSTICK_HALFMODE),
         ControllerOutput(RIGHTJOYSTICK_HALFMODE),
         ControllerOutput(KEY_TOGGLE),
         ControllerOutput(MOUSE_GYRO_ROLL_MODE),
-        ControllerOutput(MOTION_SHAKE),
+        ControllerOutput(MOUSE_GYRO_HOLD),
 
         // Button mappings
         ControllerOutput(SDL_GAMEPAD_BUTTON_NORTH),           // Triangle
@@ -600,6 +606,11 @@ public:
         ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_DOWN),  // Down
         ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_LEFT),  // Left
         ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_RIGHT), // Right
+
+        // Synthetic motion for controllers without motion sensors
+        ControllerOutput(MOTION_TILT_LEFT),
+        ControllerOutput(MOTION_TILT_RIGHT),
+        ControllerOutput(MOTION_SHAKE),
 
         // Axis mappings
         // ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTX, false),

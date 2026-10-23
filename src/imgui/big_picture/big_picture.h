@@ -17,6 +17,7 @@ struct IconInfo {
     std::filesystem::path ebootPath;
     std::string title;
     std::string serial;
+    std::string version;
     bool focusState;
 };
 

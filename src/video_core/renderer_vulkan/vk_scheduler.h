@@ -435,9 +435,7 @@ public:
     /// counter pair per site, summed on the waiting thread.
     enum class WaitSite : u8 {
         Finish,
-        StreamRing,
         FaultBuffer,
-        DownloadBuffer,
         DownloadImage,
         Count,
     };
@@ -480,6 +478,9 @@ public:
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
+
+    /// Executes every operation whose tick the GPU has caught up with, without throttling.
+    void DrainPendingOperations();
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
@@ -583,14 +584,6 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
-    using SubmitHook = void (*)(void*);
-    /// Runs on the submitting thread before the queue submit; the rasterizer
-    /// arms its pending read watchers there.
-    void SetSubmitHook(SubmitHook hook, void* user) {
-        submit_hook_ = hook;
-        submit_hook_user_ = user;
-    }
-
     /// Hands this scheduler's plain submits to the shared submit thread (async_submit).
     void EnableAsyncSubmit();
 
@@ -609,8 +602,6 @@ private:
     void PriorityPendingOpsThread(std::stop_token stoken);
 
 private:
-    SubmitHook submit_hook_{};
-    void* submit_hook_user_{};
     bool async_submit_{};
     u64 tick_query_interval_ns_{};
     std::atomic<u64> last_tick_query_{};

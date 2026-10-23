@@ -298,6 +298,7 @@ set(AUDIO_LIB src/core/libraries/audio/audioin.cpp
               src/core/libraries/audio/sdl_audio_in.cpp
               src/core/libraries/voice/voice.cpp
               src/core/libraries/voice/voice.h
+              src/core/libraries/voice/voice_error.h
               src/core/libraries/audio/audioout.cpp
               src/core/libraries/audio/audioout.h
               src/core/libraries/audio/audioout_backend.h
@@ -687,8 +688,9 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/trophy_ui.h
             src/core/libraries/np/np_party.cpp
             src/core/libraries/np/np_party.h
-            src/core/libraries/np/np_auth.cpp
-            src/core/libraries/np/np_auth.h
+            src/core/libraries/np/np_auth/np_auth.cpp
+            src/core/libraries/np/np_auth/np_auth.h
+            src/core/libraries/np/np_auth/np_auth_ctx.h
             src/core/libraries/np/np_sns_facebook_dialog.cpp
             src/core/libraries/np/np_sns_facebook_dialog.h
             src/core/libraries/np/np_partner.cpp
@@ -697,6 +699,7 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_handler/np_handler.cpp
             src/core/libraries/np/np_handler/np_handler.h
             src/core/libraries/np/np_handler/np_handler_friends.cpp
+            src/core/libraries/np/np_handler/np_handler_auth.cpp
             src/core/libraries/np/np_handler/np_handler_invitation.cpp
             src/core/libraries/np/np_handler/np_handler_score.cpp
             src/core/libraries/np/np_handler/np_handler_trophy.cpp
@@ -851,6 +854,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/error.h
            src/common/fixed_value.h
            src/common/func_traits.h
+           src/common/gravity_rush.h
            src/common/native_clock.cpp
            src/common/native_clock.h
            src/common/path_util.cpp
@@ -878,6 +882,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/stb.h
            src/common/string_literal.h
            src/common/string_util.cpp
+           src/common/stream_copy.h
            src/common/string_util.h
            src/common/thread.cpp
            src/common/thread.h
@@ -1206,6 +1211,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/fault_manager.h
                src/video_core/buffer_cache/memory_tracker.h
                src/video_core/buffer_cache/range_set.h
+               src/video_core/buffer_cache/readback_lane.cpp
+               src/video_core/buffer_cache/readback_lane.h
                src/video_core/buffer_cache/region_definitions.h
                src/video_core/buffer_cache/region_manager.h
                src/video_core/buffer_cache/stream_copy_lane.cpp
@@ -1311,6 +1318,8 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/renderer/texture_manager.h
           src/imgui/big_picture/big_picture.cpp
           src/imgui/big_picture/big_picture.h
+          src/imgui/big_picture/patches_page.cpp
+          src/imgui/big_picture/patches_page.h
           src/imgui/big_picture/settings_dialog_imgui.cpp
           src/imgui/big_picture/settings_dialog_imgui.h
           src/imgui/big_picture/settings_dialog_layer.cpp

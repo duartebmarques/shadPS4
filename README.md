@@ -3,44 +3,46 @@ SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-# inFAMOUS Second Son on Steam Deck
+# inFAMOUS on Steam Deck
 
-A shadPS4 fork tuned to play **inFAMOUS Second Son** on the Steam Deck: about 30 fps (the game's
-cap), working graffiti shake and trackpads, and one installer that sets up everything, including
-the Steam shortcut.
+A shadPS4 fork tuned to play the **inFAMOUS** games on the Steam Deck, packed as one folder: no
+installer needed. Pick a game, switch its patches (render resolution, skip intro) and play, all
+with the Deck's controls.
 
-## Install (3 steps, about 5 minutes)
+| Game | Title id | Version | State on the Deck OLED |
+|---|---|---|---|
+| inFAMOUS Second Son | CUSA00004 (+ other regions) | update 1.07 | about 30 fps (the game's cap), graffiti shake and trackpads work |
+| inFAMOUS First Light | CUSA00897 (+ other regions) | 1.00 (1.04 works too) | about 28 fps at the start of the game; tuned settings +22% over plain shadPS4 |
+
+More games are added through `games.json` (see [Adding a game](#adding-a-game)).
+
+## Install (about 5 minutes)
 
 **What you need**
 - A Steam Deck (made and tested on the OLED) connected to the internet.
-- Your own copy of the game, dumped from your PS4: **CUSA00004** plus update **1.07** (DLC
-  optional), as extracted folders or `.pkg` files. Copy it anywhere in your home folder or on the
-  SD card, for example `~/Games`. This project does not provide game files.
+- Your own copy of the games, dumped from your PS4, as extracted folders or `.pkg` files, anywhere
+  in your home folder or on the SD card (for example `~/Games`). This project does not provide
+  game files.
 
-**1. Switch to Desktop Mode.** Press the Steam button > Power > Switch to Desktop.
+**1. Get the app.** In Desktop Mode (Steam button > Power > Switch to Desktop), download
+`shadps4-<version>-linux.zip` from [Releases](https://github.com/duartebmarques/shadPS4/releases)
+and extract it where you like (right-click > Extract > Extract archive here). You get one folder,
+`shadPS4-infamous`.
 
-**2. Run the installer.** Open **Konsole** (app menu > System > Konsole), paste this line
-(right-click > Paste) and press Enter:
+**2. Start it.** Double-click `shadPS4.sh` in that folder (choose *Execute* if asked). The first
+start finds your games, their update and DLC, and turns on the Steam Deck patches. Then the game picker
+opens: choose a game, then **Play** or **Patches**.
+
+**3. Add it to Steam** (for Gaming Mode): in a terminal in that folder run
+`./shadPS4.sh --add-to-steam`, or add `shadPS4.sh` as a non-Steam game yourself. In Gaming Mode
+start **shadPS4 (inFAMOUS)** from Library > Non-Steam.
+
+Or all of it with one line in Konsole (installs into `~/Applications/shadPS4-infamous`, adds the
+app and each game to Steam):
 
 ```bash
 bash <(curl -fsSL https://github.com/duartebmarques/shadPS4/releases/latest/download/install.sh)
 ```
-
-It asks a few questions; press Enter to accept each one. It downloads the emulator, finds the
-game, its update and DLC (and extracts `.pkg` files if that's what you have), turns on the
-patches, and adds **inFAMOUS Second Son** to Steam. Steam closes for a moment and starts again.
-
-**3. Play.** Double-click **Return to Gaming Mode** on the desktop, then open Library >
-Non-Steam > **inFAMOUS Second Son**.
-
-<details>
-<summary>No internet, or you'd rather not paste commands?</summary>
-
-Download `shadps4-<version>-linux.zip` from
-[Releases](https://github.com/duartebmarques/shadPS4/releases), extract it (right-click >
-Extract > Extract archive here), and double-click `install.sh` (choose *Execute* if asked).
-The patch file still needs internet; without it the game runs, just slower.
-</details>
 
 ## Set once in Gaming Mode (recommended)
 
@@ -60,28 +62,37 @@ machine allows (uneven on the Deck, about 34 fps).
   (graffiti spray cans). The trackpads act as the PS4 touchpad (swipes, the two-finger press for the
   car push). On a pad without motion, map the keyboard keys **Home** (shake) and **T**
   (two-finger press) to spare buttons in the game's controller settings.
-- **Saves** are in `~/Applications/shadPS4-infamous/user/home/1000/savedata/`. Saves from an
-  earlier shadPS4 setup are copied there on install (the originals are left alone).
-- **Update:** in Desktop Mode, run `~/Applications/shadPS4-infamous/install.sh --update`. Your
-  saves, controls and patch choices are kept.
-- **Uninstall:** delete `~/Applications/shadPS4-infamous` (back up the saves first) and remove the
-  shortcut in Steam (game > gear > Manage > Remove non-Steam game).
+- **Everything stays in the app folder:** saves in `user/home/1000/savedata/`, settings in
+  `user/`. Saves from an earlier shadPS4 setup are copied there on the first start (the originals
+  are left alone). Move or back up the folder as a whole.
+- **Patches:** in the game picker choose a game > **Patches**. The Deck defaults are the 1280x720
+  render patch and skip intro; on a stronger PC turn the resolution patch off (or pick a higher
+  one) for a sharper image.
+- **Update:** run `./shadPS4.sh --update` in the app folder. Your saves, controls and patch choices
+  are kept; the previous build stays in `app.prev`.
+- **Uninstall:** delete the app folder (back up the saves first) and remove its shortcuts in Steam
+  (game > gear > Manage > Remove non-Steam game).
 
 ## Troubleshooting
-- **"CUSA00004 not found":** the search looks in your home folder and on the SD card, up to six
-  folders deep. Point it at the folder that has `eboot.bin`:
-  `~/Applications/shadPS4-infamous/install.sh --game "/path/to/CUSA00004"`.
-- **"no update found":** put the 1.07 update folder next to the game as `CUSA00004-UPDATE` (or
-  `-patch`), or let the installer link it when it asks.
-- **The shortcut is missing:** run the installer again with Steam open in Desktop Mode, or add
-  `~/Applications/shadPS4-infamous/inFAMOUS Second Son.sh` as a non-Steam game.
+- **A game is missing from the picker:** the first start looks in your home folder and on SD cards,
+  up to six folders deep, skipping hidden folders. Copy the game folder (the one with `eboot.bin`)
+  or its `.pkg` files there and run `./shadPS4.sh --setup` in a terminal (it can extract pkg files).
+- **No update found:** put the update folder next to the game as `<game folder>-UPDATE` (or
+  `-patch`) and run `--setup` again.
 - **Low fps in fights:** check the 1600 MHz GPU clock above. Turn off other overlays and frame
   limiters.
 - **Uneven frame rate or aiming feels laggy:** set the game's Frame Rate option to *30fps limit*
   (Options > Video) and the Deck's frame limit off.
-- **Reporting a problem:** include `~/Applications/shadPS4-infamous/user/log/shad_log.txt`.
+- **Reporting a problem:** include `user/log/shad_log.txt` from the app folder.
 
-All installer options: `~/Applications/shadPS4-infamous/install.sh --help`.
+All options: `./shadPS4.sh --help`.
+
+## Adding a game
+1. Add it to `dist/games.json`: its title ids (all regions), the update it needs, its patch file in
+   [ps4_cheats](https://github.com/shadps4-emu/ps4_cheats) and the patches to turn on by default.
+2. Tuned settings go in `dist/user/custom_configs/<title id>.json`; patches the community file
+   lacks (other game versions) go in `dist/user/patches/infamous-deck/` with its `files.json`.
+3. Measure it with the bench tools (`agent/TOOLS.md`: `title-ab`, `game-run`, `pad-session`).
 
 ## What's different from shadPS4
 - **Two-stage draw pipeline** (`draw_pipe`): PM4 decoding and Vulkan command recording run on separate threads.
@@ -100,17 +111,15 @@ patch, GPU at 1600 MHz).
 <details>
 <summary>Manual setup</summary>
 
-- Unzip the release for your platform. Start the emulator from that folder, because it uses the
+- `app/usr/bin/shadps4` is the emulator. Start it from the app folder, because it uses the
   `user` folder in the directory it starts in. Without one, it falls back to
   `~/.local/share/shadPS4` or `%APPDATA%\shadPS4`, and the tuned settings are not used.
+  `--big-picture` opens the game picker; a game's `eboot.bin` as the argument starts it.
 - Put the update next to the game as `<game folder>-UPDATE` (or `-patch`). Put DLC folders in
-  `user/addcont/CUSA00004/`.
-- Put the patch file in `user/patches/shadPS4/` and set `isEnabled="true"` on the two patches
-  above.
-- Run `Shadps4-sdl.AppImage <game folder>/eboot.bin`.
+  `user/addcont/<title id>/`.
 - Releases are Linux only. Other platforms need a build from source and are untested:
   `inplace_guest_memory` 2 and 3 need Linux and an AMD GPU with RADV (elsewhere they fall back to
-  mode 1), and `draw_pipe` / `async_submit` may need `false` in `user/custom_configs/CUSA00004.json`.
+  mode 1), and `draw_pipe` / `async_submit` may need `false` in `user/custom_configs/<title id>.json`.
 </details>
 
 ## Build
@@ -121,9 +130,10 @@ cmake --build build
 ```
 See [`CLAUDE.md`](CLAUDE.md) for the exact toolchain (Ubuntu 24.04 distrobox, clang-19).
 
-To cut a release, push a tag: `git tag v1.0 && git push origin v1.0`. CI publishes a zip
-(the PGO AppImage, `user/`, `LICENSE`, `README.md`, `install.sh`), `install.sh` on its own (the
-one-line install), and the notes from `dist/RELEASE.md`. To try a CI build, pass its AppImage to the installer with `--appimage FILE`.
+To cut a release, push a tag: `git tag v1.0 && git push origin v1.0`. CI publishes a zip with the
+`shadPS4-infamous` folder (the extracted PGO build in `app/`, `shadPS4.sh`, `games.json`, `tools/`,
+the default user files in `dist-user/`), `install.sh` on its own (the one-line install), and the
+notes from `dist/RELEASE.md`.
 
 ## Credits
 - [shadPS4](https://github.com/shadps4-emu/shadPS4): the emulator ([website](https://shadps4.net/)).

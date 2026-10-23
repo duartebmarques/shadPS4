@@ -546,17 +546,14 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU textureLruLazyTouch: {}", EmulatorSettings.IsTextureLruLazyTouch());
     LOG_INFO(Config, "GPU gatherInputMemo: {}", EmulatorSettings.IsGatherInputMemo());
     LOG_INFO(Config, "GPU trackerLockSpinRounds: {}", EmulatorSettings.GetTrackerLockSpinRounds());
-    LOG_INFO(Config, "GPU gpuThreadCoreReserve: {}", EmulatorSettings.IsGpuThreadCoreReserve());
-    LOG_INFO(Config, "GPU oneThreadPerCore: {}", EmulatorSettings.IsOneThreadPerCore());
-    if (EmulatorSettings.IsOneThreadPerCore()) {
-        Common::RestrictProcessToOneThreadPerCore();
-    }
+    LOG_INFO(Config, "GPU oneCoreGpuThreadPin: {}", EmulatorSettings.IsOneCoreGpuThreadPin());
     LOG_INFO(Config, "GPU vertexLayoutMemo: {}", EmulatorSettings.IsVertexLayoutMemo());
     LOG_INFO(Config, "GPU coveredRangeSkip: {}", EmulatorSettings.IsCoveredRangeSkip());
     LOG_INFO(Config, "GPU residencyBitmap: {}", EmulatorSettings.IsResidencyBitmap());
     LOG_INFO(Config, "GPU streamBarrierSkip: {}", EmulatorSettings.IsStreamBarrierSkip());
     LOG_INFO(Config, "GPU cleanSyncPeek: {}", EmulatorSettings.IsCleanSyncPeek());
     LOG_INFO(Config, "GPU readbackOffload: {}", EmulatorSettings.IsReadbackOffload());
+    LOG_INFO(Config, "GPU pipelineSyncBudgetMs: {}", EmulatorSettings.GetPipelineSyncBudgetMs());
     LOG_INFO(Config, "GPU inplaceGuestMemory: {}", EmulatorSettings.GetInplaceGuestMemory());
     LOG_INFO(Config, "GPU guestSyncBarriers: {}", EmulatorSettings.IsGuestSyncBarriers());
     LOG_INFO(Config, "GPU barrierTracker: {}", EmulatorSettings.GetBarrierTracker());
@@ -573,6 +570,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU userfaultfdTracking: {}", EmulatorSettings.IsUserfaultfdTracking());
 #endif
     LOG_INFO(Config, "GPU inlineFetchShader: {}", EmulatorSettings.IsInlineFetchShader());
+    LOG_INFO(Config, "GPU fastShaderMath: {}", EmulatorSettings.IsFastShaderMath());
     LOG_INFO(Config, "Vulkan gpuId: {}", EmulatorSettings.GetGpuId());
     LOG_INFO(Config, "Vulkan vkValidation: {}", EmulatorSettings.IsVkValidationEnabled());
     LOG_INFO(Config, "Vulkan vkValidationCore: {}", EmulatorSettings.IsVkValidationCoreEnabled());
@@ -688,12 +686,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Mounting temp folders
     const auto& mount_temp_dir = Common::FS::GetUserPath(Common::FS::PathType::TempDataDir) / id;
-    if (std::filesystem::exists(mount_temp_dir)) {
-        // Temp folder should be cleared on each boot.
-        std::filesystem::remove_all(mount_temp_dir);
-    }
     std::filesystem::create_directory(mount_temp_dir);
-    mnt->Mount(mount_temp_dir, "/temp0");
     mnt->Mount(mount_temp_dir, "/temp");
 
     const auto& mount_download_dir =

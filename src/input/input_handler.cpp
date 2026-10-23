@@ -700,7 +700,7 @@ void ParseInputConfig(const std::string game_id = "") {
                     {"rightjoystick", rightjoystick_deadzone},
                     {"l2", lefttrigger_deadzone},
                     {"r2", righttrigger_deadzone},
-                };
+            };
             output_gamepad_id = output_gamepad_id == -1 ? 1 : output_gamepad_id;
 
             if (auto it = deadzone_map.find(device); it != deadzone_map.end()) {
@@ -1106,6 +1106,15 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case MOUSE_GYRO_ROLL_MODE:
             SetMouseGyroRollMode(new_button_state);
+            break;
+        case MOUSE_GYRO_HOLD:
+            SetMouseGyroHold(new_button_state);
+            break;
+        case MOTION_TILT_LEFT:
+            controller->SetMotionTilt(1, new_button_state);
+            break;
+        case MOTION_TILT_RIGHT:
+            controller->SetMotionTilt(-1, new_button_state);
             break;
         case MOTION_SHAKE:
             controller->SetShake(new_button_state);

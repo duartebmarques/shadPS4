@@ -89,6 +89,13 @@ public:
         VideoOut,
     };
 
+    enum class DownloadMemoryFlags : u32 {
+        None = 0,
+        Sync = 1 << 0,
+        Priority = 1 << 1,
+        DiscardBufferCache = 1 << 2,
+    };
+
     struct ImageDesc {
         // Lazy for shader-resource bindings, materialized by Info() only on routes that reach
         // FindImage. Target ctors (CB/DB/VideoOut) stay eager: FindRenderTarget and FindDepthTarget
@@ -178,7 +185,7 @@ public:
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                  Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
-                 PageManager& tracker);
+                 PageManager& page_manager);
     ~TextureCache();
 
     TileManager& GetTileManager() noexcept {
@@ -196,6 +203,9 @@ public:
 
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+
+    /// Marks all images as maybe GPU dirty within the provided range.
+    void MarkAsMaybeGpuDirty(VAddr addr, size_t size);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -459,8 +469,13 @@ private:
         }
     }
 
+    /// Hashes guest memory through the never-protected backing view, so GPU modified pages are
+    /// read without a readback. Returns 0 when part of the range has no backing.
+    u64 HashGuestMemory(VAddr addr, u64 size);
+
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    void DownloadImageMemory(ImageId image_id,
+                             DownloadMemoryFlags flags = DownloadMemoryFlags::None);
 
     /// readback_linear_images_async: records the copy of one queued image into its own staging
     /// buffer; a background thread writes the pixels to guest memory once the GPU finishes.
@@ -469,6 +484,8 @@ private:
 
     /// Copies the image into its guest memory on the GPU when that memory is a GPU-visible
     /// chunk. Returns false when it is not, and the caller copies through staging.
+    bool DownloadImageInPlace(Image& image, std::span<vk::BufferImageCopy> buffer_copies,
+                              u64 copy_size);
     bool DownloadImageInPlace(Image& image, u32 download_size);
 
     /// Register image in the page table
@@ -510,6 +527,9 @@ private:
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
 
+    /// Marks the image CPU dirty if the guest wrote to its untracked head or tail page.
+    void MarkDirtyIfEdgesModified(Image& image);
+
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
     void RegisterMeta(VAddr address, MetaDataInfo info);
@@ -522,6 +542,13 @@ private:
     /// With texture_lru_lazy_touch only the gc tick is stamped; the garbage collector
     /// walk relinks the entry when it meets it.
     void TouchImage(Image& image) {
+        // Image is still valid
+        if (True(image.flags & ImageFlagBits::MaybeGpuDirty)) {
+            // The guest fault paths set the CPU dirty bits under the image mutex.
+            std::scoped_lock lk{image.mutex};
+            image.flags &= ~ImageFlagBits::MaybeGpuDirty;
+            image.gpu_hash = 0;
+        }
         if (lru_lazy_touch) {
             image.gc_tick_accessed_last = gc_tick;
             return;
@@ -671,6 +698,10 @@ public:
     bool BindNoopMemo() const noexcept {
         return bind_noop;
     }
+    /// Whether linear images are read back, after the per-title overrides.
+    bool ReadbackLinearImages() const noexcept {
+        return readback_linear_images;
+    }
     bool MemoFirst() const noexcept {
         return memo_first;
     }
@@ -785,7 +816,7 @@ private:
     Vulkan::Runtime& runtime;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
-    PageManager& tracker;
+    PageManager& page_manager;
     PageTable page_table;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
@@ -972,5 +1003,6 @@ private:
         }
     }
 };
+DECLARE_ENUM_FLAG_OPERATORS(TextureCache::DownloadMemoryFlags)
 
 } // namespace VideoCore

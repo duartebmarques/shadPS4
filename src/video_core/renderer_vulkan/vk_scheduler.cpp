@@ -242,13 +242,21 @@ void Scheduler::PopPendingOperations() {
     }
     // While an op waits out its GPU tick the queue stays non-empty and every
     // draw would otherwise take the lock and issue a SYNCOBJ_QUERY ioctl;
-    // the ops are latency-tolerant (deferred frees - urgent writebacks ride
-    // the priority queue), so attempt the pop once per N non-empty polls
-    // instead. An op retires at most N draws late. A 0 setting latches as 1.
+    // the ops polled here are latency-tolerant (deferred frees; writebacks
+    // that must land first go through DrainPendingOperations), so attempt the
+    // pop once per N non-empty polls instead. An op retires at most N draws
+    // late. A 0 setting latches as 1.
     if (++pop_poll_counter_ < pop_poll_throttle_) {
         return;
     }
     pop_poll_counter_ = 0;
+    DrainPendingOperations();
+}
+
+void Scheduler::DrainPendingOperations() {
+    if (pending_ops_count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::unique_lock lk(pending_ops_mutex);
     work_semaphore.Refresh();
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
@@ -305,6 +313,18 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
+    // Every batch ends with a device-to-host memory barrier, so the host may read the GPU writes
+    // of a batch out of a host visible arena once its tick passes.
+    const vk::MemoryBarrier2 barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    session.primary.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
     if (session.span_slot != UINT32_MAX) {
         session.primary.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, span_pool,
                                         session.span_slot * 2 + 1);
@@ -379,11 +399,6 @@ u64 Scheduler::ReadGpuBusyNs(const GpuTimestamp& timestamp) {
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
-    // Every submit of this scheduler runs on the GPU command thread, which is
-    // where the hook's state lives.
-    if (submit_hook_) {
-        submit_hook_(submit_hook_user_);
-    }
     // Every stream-lane byte this command buffer reads must be in place
     // before the queue submit.
     VideoCore::StreamCopyLane::Instance().DrainProducer();

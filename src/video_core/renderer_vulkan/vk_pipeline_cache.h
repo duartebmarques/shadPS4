@@ -4,9 +4,10 @@
 #pragma once
 
 #include <array>
-#include <condition_variable>
+#include <chrono>
+#include <future>
 #include <memory>
-#include <mutex>
+#include <optional>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "common/assert.h"
@@ -199,8 +200,7 @@ public:
                            Shader::Gcn::FetchShaderData& fetch_out,
                            Shader::Backend::Bindings& binding);
 
-    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
-                                                bool indirect = false);
+    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
     const ComputePipeline* GetComputePipeline();
 
@@ -223,8 +223,8 @@ public:
         return profile;
     }
 
-    /// Runs before every inline pipeline compile; the rasterizer drops its
-    /// guest-copy hold there so a compile never holds the memory map open.
+    /// Runs before the GPU thread compiles or waits for a new pipeline; the rasterizer
+    /// drops its guest-copy hold there so a compile never holds the memory map open.
     void SetPreCompileHook(void (*hook)(void*), void* user) {
         pre_compile_hook_ = hook;
         pre_compile_user_ = user;
@@ -247,6 +247,33 @@ private:
     bool RefreshGraphicsStages(bool track_hash_diff);
     bool ReuseGraphicsKey(u64 pipe_gen);
     bool RefreshComputeKey();
+
+    /// A graphics pipeline compiling on a worker thread. The worker reads the copies held here,
+    /// never the members the following lookups overwrite.
+    struct PendingGraphicsPipeline {
+        std::future<std::unique_ptr<GraphicsPipeline>> future;
+        std::chrono::steady_clock::time_point start;
+        u64 hash{};
+        GraphicsPipeline::SerializationSupport sdata{};
+        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+        std::array<const Shader::Info*, MaxShaderStages> copied_infos{};
+        std::array<std::optional<Shader::Info>, MaxShaderStages> info_copies{};
+        /// The user data the copies read their sharps from.
+        std::array<std::array<u32, Shader::NUM_USER_DATA_REGS>, MaxShaderStages> user_data{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+        VertexInputs<AmdGpu::Buffer> vertex_sharps{};
+        bool photo_waited{}; ///< A photo draw has waited for the compile once
+        bool slow_logged{};
+        bool abandoned{};
+    };
+    std::unique_ptr<PendingGraphicsPipeline> StartGraphicsPipeline(
+        u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
+    bool IsCompileDone(PendingGraphicsPipeline& pending, std::chrono::milliseconds wait);
+    void InstallGraphicsPipeline(PendingGraphicsPipeline& pending);
+    std::chrono::milliseconds SyncBudget(bool photo) const;
+    bool DrawsPhoto() const;
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
@@ -279,9 +306,10 @@ private:
     u32 indirect_key_{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
-    using GraphicsPipelineMap =
-        tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>>;
-    GraphicsPipelineMap graphics_pipelines;
+    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    // Compiles past the sync budget. Their keys enter graphics_pipelines once installed.
+    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
+        pending_graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
@@ -456,45 +484,6 @@ private:
     alignas(64) std::array<u8, 4096> key_scratch{};
     u64 lookup_pipe_gen_{}; // pipe_gen of the current pipeline lookup
     void (*pre_compile_hook_)(void*){};
-    // Background compiles: a new pipeline of a pass drawn every frame compiles on worker threads
-    // and its draws are skipped until it is ready, instead of the GPU thread waiting for it.
-    struct BackgroundPipeline {
-        GraphicsPipelineKey key{};
-        std::array<const Shader::Info*, MaxShaderStages> infos{};
-        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
-        std::array<vk::ShaderModule, MaxShaderStages> modules{};
-        Shader::Gcn::FetchShaderData fetch{};
-        bool has_fetch{};
-        GraphicsPipeline::SerializationSupport sdata{};
-        std::unique_ptr<GraphicsPipeline> pipeline;
-        std::mutex mutex;
-        std::condition_variable cv;
-        bool done{};
-    };
-    struct TargetStreak {
-        u32 frames{};
-        u32 last_frame{~0U};
-    };
-    class BackgroundCompiler;
-    GraphicsPipelineMap::iterator CompileGraphicsPipeline();
-    const Shader::Gcn::FetchShaderData* ResolveFetchShader(
-        Shader::Gcn::FetchShaderData& live_fetch);
-    u64 DrawTarget() const;
-    void NoteDrawTarget();
-    bool BackgroundSkippable(bool indirect) const;
-    bool TakeBackgroundPipeline(bool indirect);
-    bool background_compiles{};
-    std::unique_ptr<BackgroundCompiler> background_compiler;
-    tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<BackgroundPipeline>> pending_graphics;
-    tsl::robin_map<u64, TargetStreak> target_streaks;
-    u32 bg_frame{~0U};
-    u32 bg_logged_frame{};
-    u64 bg_frame_start_draws{};
-    u64 bg_last_frame_draws{};
-    u64 bg_target{};
-    u64 bg_started{};
-    u64 bg_skipped{};
-    u64 bg_waited{};
     void* pre_compile_user_{};
     u8 spec_fp_canonical{};
     bool spec_fp_validate{}; // ValidateOnly mode: every hit is rebuilt and compared

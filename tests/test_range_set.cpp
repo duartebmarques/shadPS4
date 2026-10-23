@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <random>
-#include <span>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <gtest/gtest.h>
@@ -12,104 +10,83 @@
 
 namespace {
 
-using Tree = VideoCore::BasicRangeSet<VideoCore::RangeSetsAllocator>;
-using Flat = VideoCore::FlatRangeSet;
-using Dumped = std::vector<std::pair<VAddr, VAddr>>;
+using Map = VideoCore::RangeMap<u64>;
+using Dumped = std::vector<std::tuple<VAddr, VAddr, u64>>;
+using Gaps = std::vector<std::pair<VAddr, u64>>;
 
-struct Range {
-    VAddr addr;
-    u64 size;
-};
-
-template <class Set>
-Dumped Dump(const Set& set) {
+Dumped Dump(const Map& map) {
     Dumped out;
-    set.ForEach([&](VAddr lo, VAddr hi) { out.emplace_back(lo, hi); });
+    map.ForEach([&](VAddr lo, VAddr hi, u64 tick) { out.emplace_back(lo, hi, tick); });
     return out;
 }
 
-template <class Set>
-Dumped DumpInRange(const Set& set, VAddr addr, u64 size) {
+Dumped DumpInRange(const Map& map, VAddr addr, u64 size) {
     Dumped out;
-    set.ForEachInRange(addr, size, [&](VAddr lo, VAddr hi) { out.emplace_back(lo, hi); });
+    map.ForEachInRange(addr, size,
+                       [&](VAddr lo, VAddr hi, u64 tick) { out.emplace_back(lo, hi, tick); });
     return out;
 }
 
 } // namespace
 
-TEST(FlatRangeSet, TouchingIntervalsJoin) {
-    Flat flat;
-    flat.Add(0x100, 0x100);
-    flat.Add(0x200, 0x100);
-    EXPECT_EQ(Dump(flat), (Dumped{{0x100, 0x300}}));
-    EXPECT_TRUE(flat.Contains(0x100, 0x200));
-    EXPECT_TRUE(flat.Contains(0x2FF, 0));
-    EXPECT_FALSE(flat.Intersects(0x2FF, 0));
-    EXPECT_FALSE(flat.Intersects(0x300, 0x10));
-    EXPECT_TRUE(flat.Intersects(0x2FF, 0x10));
+TEST(RangeMap, SetJoinsEqualValues) {
+    Map map;
+    map.Set(0x100, 0x100, 1);
+    map.Set(0x200, 0x100, 1);
+    EXPECT_EQ(Dump(map), (Dumped{{0x100, 0x300, 1}}));
+    EXPECT_EQ(map.Size(), 1u);
+    EXPECT_TRUE(map.Contains(0x100, 0x200));
+    EXPECT_FALSE(map.Intersects(0x300, 0x10));
+    EXPECT_TRUE(map.Intersects(0x2FF, 0x10));
 }
 
-TEST(FlatRangeSet, SubtractSplitsAndClips) {
-    Flat flat;
-    flat.Add(0x100, 0x400);
-    flat.Subtract(0x200, 0x100); // strictly inside: split
-    EXPECT_EQ(Dump(flat), (Dumped{{0x100, 0x200}, {0x300, 0x500}}));
-    flat.Subtract(0x000, 0x180); // head clip of the first
-    flat.Subtract(0x480, 0x100); // tail clip of the second
-    EXPECT_EQ(Dump(flat), (Dumped{{0x180, 0x200}, {0x300, 0x480}}));
-    flat.Subtract(0x180, 0);      // no-op
-    flat.Subtract(0x000, 0x1000); // everything
-    EXPECT_EQ(Dump(flat), Dumped{});
-    EXPECT_EQ(flat.Size(), 0u);
+TEST(RangeMap, SetOverwritesTheOverlap) {
+    Map map;
+    map.Set(0x100, 0x400, 1);
+    map.Set(0x200, 0x100, 2); // strictly inside: the newer value splits the old range
+    EXPECT_EQ(Dump(map), (Dumped{{0x100, 0x200, 1}, {0x200, 0x300, 2}, {0x300, 0x500, 1}}));
+    map.Set(0x000, 0x180, 3); // head overlap
+    map.Set(0x480, 0x100, 3); // tail overlap
+    EXPECT_EQ(Dump(map), (Dumped{{0x000, 0x180, 3},
+                                 {0x180, 0x200, 1},
+                                 {0x200, 0x300, 2},
+                                 {0x300, 0x480, 1},
+                                 {0x480, 0x580, 3}}));
+    map.Set(0x000, 0x1000, 4); // everything
+    EXPECT_EQ(Dump(map), (Dumped{{0x000, 0x1000, 4}}));
 }
 
-TEST(FlatRangeSet, MatchesIntervalSet) {
-    std::mt19937_64 rng{12345};
-    Tree tree;
-    Flat flat;
-    const auto rnd = [&](u64 n) { return static_cast<u64>(rng() % n); };
-    // Queries never use an empty interval: the interval set asserts on one in
-    // debug builds, and the emulator never asks it. Adds and subtracts do.
-    for (int step = 0; step < 20000; ++step) {
-        const VAddr a = static_cast<VAddr>(rnd(4096));
-        const u64 op = rnd(6);
-        const u64 s = op >= 3 ? 1 + rnd(64) : rnd(65);
-        switch (op) {
-        case 0:
-            tree.Add(a, s);
-            flat.Add(a, s);
-            break;
-        case 1: {
-            std::vector<Range> batch(1 + rnd(32));
-            for (auto& r : batch) {
-                r = Range{static_cast<VAddr>(rnd(4096)), rnd(65)};
-            }
-            std::ranges::sort(batch, {}, [](const Range& r) { return std::pair{r.addr, r.size}; });
-            const auto dup = std::ranges::unique(batch, [](const Range& x, const Range& y) {
-                return x.addr == y.addr && x.size == y.size;
-            });
-            batch.erase(dup.begin(), dup.end());
-            auto hint = tree.End();
-            for (const Range& r : batch) {
-                hint = tree.Add(hint, r.addr, r.size);
-            }
-            flat.AddSortedBatch(std::span<const Range>{batch});
-            break;
-        }
-        case 2:
-            tree.Subtract(a, s);
-            flat.Subtract(a, s);
-            break;
-        case 3:
-            EXPECT_EQ(tree.Contains(a, s), flat.Contains(a, s)) << "step " << step;
-            break;
-        case 4:
-            EXPECT_EQ(tree.Intersects(a, s), flat.Intersects(a, s)) << "step " << step;
-            break;
-        default:
-            EXPECT_EQ(DumpInRange(tree, a, s), DumpInRange(flat, a, s)) << "step " << step;
-            break;
-        }
-        ASSERT_EQ(Dump(tree), Dump(flat)) << "step " << step;
-    }
+TEST(RangeMap, SetInsideAnEqualValueKeepsOneRange) {
+    Map map;
+    map.Set(0x100, 0x400, 1);
+    map.Set(0x200, 0x100, 1);
+    map.Set(0x100, 0x400, 1);
+    EXPECT_EQ(Dump(map), (Dumped{{0x100, 0x500, 1}}));
+    map.Set(0x200, 0, 2); // empty: no-op
+    EXPECT_EQ(Dump(map), (Dumped{{0x100, 0x500, 1}}));
+}
+
+TEST(RangeMap, SubtractSplitsAndClips) {
+    Map map;
+    map.Set(0x100, 0x400, 1);
+    map.Subtract(0x200, 0x100); // strictly inside: split
+    EXPECT_EQ(Dump(map), (Dumped{{0x100, 0x200, 1}, {0x300, 0x500, 1}}));
+    map.Subtract(0x000, 0x180); // head clip of the first
+    map.Subtract(0x480, 0x100); // tail clip of the second
+    EXPECT_EQ(Dump(map), (Dumped{{0x180, 0x200, 1}, {0x300, 0x480, 1}}));
+    map.Subtract(0x000, 0x1000); // everything
+    EXPECT_EQ(Dump(map), Dumped{});
+    EXPECT_EQ(map.Size(), 0u);
+}
+
+TEST(RangeMap, ForEachInRangeClipsToTheQuery) {
+    Map map;
+    map.Set(0x100, 0x100, 1);
+    map.Set(0x300, 0x100, 2);
+    EXPECT_EQ(DumpInRange(map, 0x180, 0x200), (Dumped{{0x180, 0x200, 1}, {0x300, 0x380, 2}}));
+    EXPECT_EQ(DumpInRange(map, 0x200, 0x100), Dumped{});
+    Gaps gaps;
+    map.ForEachNotInRange(0x000, 0x500,
+                          [&](VAddr addr, u64 size) { gaps.emplace_back(addr, size); });
+    EXPECT_EQ(gaps, (Gaps{{0x000, 0x100}, {0x200, 0x100}, {0x400, 0x100}}));
 }

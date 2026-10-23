@@ -70,8 +70,8 @@ private:
 
 // One descriptor set layout and pipeline layout per distinct binding list,
 // shared by every pipeline of that shape. Filled by the pipeline preload
-// before the first draw and afterwards by the GPU thread and the background
-// pipeline compiles.
+// before the first draw, then by the GPU thread and the graphics pipeline
+// compile workers.
 class PipelineLayoutCache final {
 public:
     explicit PipelineLayoutCache(const Instance& instance_) : instance{instance_} {}
@@ -83,7 +83,8 @@ public:
     Layouts Acquire(std::span<const vk::DescriptorSetLayoutBinding> bindings,
                     vk::DescriptorSetLayoutCreateFlags flags,
                     const vk::PushConstantRange& push_constants, std::string_view debug_name);
-    size_t NumLayouts() const noexcept {
+    size_t NumLayouts() const {
+        std::scoped_lock lock{mutex};
         return layouts.size();
     }
 
@@ -93,7 +94,7 @@ private:
         vk::UniquePipelineLayout pipeline;
     };
     const Instance& instance;
-    std::mutex mutex;
+    mutable std::mutex mutex;
     tsl::robin_map<std::string, Entry> layouts;
 };
 

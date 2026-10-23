@@ -356,6 +356,7 @@ struct InputSettings {
     Setting<s32> camera_id{-1};
     Setting<bool> use_mice_as_mice{false};
     Setting<bool> use_keyboard_as_keyboard{false};
+    Setting<bool> vibration_enabled{true}; // specific
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -379,7 +380,8 @@ struct InputSettings {
             make_override<InputSettings>("camera_id", &InputSettings::camera_id),
             make_override<InputSettings>("use_mice_as_mice", &InputSettings::use_mice_as_mice),
             make_override<InputSettings>("use_keyboard_as_keyboard",
-                                         &InputSettings::use_keyboard_as_keyboard)};
+                                         &InputSettings::use_keyboard_as_keyboard),
+            make_override<InputSettings>("vibration_enabled", &InputSettings::vibration_enabled)};
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_timeout,
@@ -388,7 +390,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_time
                                    gyro_invert_x, gyro_invert_roll, use_unified_input_config,
                                    default_controller_id, background_controller_input,
                                    ime_accessibility_enabled, ime_url_mail_short_panel, camera_id,
-                                   is_circle_enter, use_mice_as_mice, use_keyboard_as_keyboard)
+                                   is_circle_enter, use_mice_as_mice, use_keyboard_as_keyboard,
+                                   vibration_enabled)
 // -------------------------------
 // Audio settings
 // -------------------------------
@@ -462,12 +465,7 @@ struct GPUSettings {
     // 5 s. Without it the OS can park a busy thread on the command thread's sibling hyperthread,
     // which costs it a quarter to a third of its speed. Hosts with fewer than 6 logical CPUs or
     // 4 physical cores are left alone.
-    Setting<bool> gpu_thread_core_reserve{true};
-    // Windows only. Restrict the whole process to the first logical CPU of every physical core,
-    // the same thing as ticking only the even CPUs in Task Manager: no two emulator or guest
-    // threads can then share a core. Windows otherwise packs busy threads onto both hyperthreads
-    // of a few cores while others idle. Works together with gpu_thread_core_reserve.
-    Setting<bool> one_thread_per_core{false};
+    Setting<bool> one_core_gpu_thread_pin{false};
     // Rebuild the vertex input layout only when the pipeline, the instance step rates or an
     // attribute's format or stride changed, instead of on every draw.
     Setting<bool> vertex_layout_memo{true};
@@ -484,10 +482,15 @@ struct GPUSettings {
     // Look at the CPU modified bits of a read-only bind before taking the tracker lock, and skip
     // the locked walk over them when none is set.
     Setting<bool> clean_sync_peek{true};
-    // The GPU command thread submits a readback download without waiting for it; the faulting
-    // thread waits and writes the bytes back. A GPU write marked in the window meanwhile keeps
-    // the window GPU modified for the next fault.
+    // The faulting thread performs its readback and the GPU command thread never waits for it:
+    // retired GPU writes are read straight out of a host visible arena, otherwise a copy lane with
+    // a queue of its own copies them; a GPU write marked in the window meanwhile keeps its pages
+    // GPU modified.
     Setting<bool> readback_offload{false};
+    // Milliseconds the GPU command thread waits for a new graphics pipeline, which compiles on a
+    // worker thread. Past the wait the draws that need it are skipped until the compile is done:
+    // a lower value means shorter hitches and more pop-in. Clamped to 50000.
+    Setting<int> pipeline_sync_budget_ms{50};
     // Guest memory in place (ported from bbport, deadinside28/bloodborne_pc). Read once at boot.
     // 0: off. 1: honest fences only - EOP/EOS/RELEASE_MEM labels, their interrupts and the GPU
     // idle interrupt are signalled after the GPU really finished the work recorded before them,
@@ -519,11 +522,6 @@ struct GPUSettings {
     // game asks for with its flip rate (e.g. a 30 fps lock), and leaves games without one uncapped.
     // Read once at boot.
     Setting<u32> frame_cap{0};
-    // A new pipeline of a pass drawn every frame (its render target drawn to in each of the last 8
-    // frames, more than 12 indices, not indirect) compiles on worker threads and its draws are
-    // skipped until it is ready, instead of the GPU thread waiting for the compile. Needs
-    // VK_EXT_vertex_input_dynamic_state.
-    Setting<bool> async_pipelines{true};
     // With inplace_guest_memory 2+, copy GPU-written images back into guest memory on the GPU,
     // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a
     // CPU copy on the completion thread, which end-of-pipe labels queue behind.
@@ -559,7 +557,7 @@ struct GPUSettings {
     // mid-play. 2 runs the hardened path, safe everywhere. Both modes drain
     // through worker threads, two unless stream_copy_lane_threads says
     // otherwise, fenced before every submit.
-    Setting<u32> stream_copy_workers{1};
+    Setting<u32> stream_copy_workers{0};
     // Resolves shader permutations through an address-masked specialization
     // fingerprint: a hit skips the StageSpecialization rebuild and the deep
     // permutation compares entirely.
@@ -772,6 +770,7 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
+    Setting<bool> fast_shader_math{false};
 
 #define GPU_OVERRIDE(field) make_override<GPUSettings>(#field, &GPUSettings::field)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -798,20 +797,19 @@ struct GPUSettings {
             GPU_OVERRIDE(texture_lru_lazy_touch),
             GPU_OVERRIDE(gather_input_memo),
             GPU_OVERRIDE(tracker_lock_spin_rounds),
-            GPU_OVERRIDE(gpu_thread_core_reserve),
-            GPU_OVERRIDE(one_thread_per_core),
+            GPU_OVERRIDE(one_core_gpu_thread_pin),
             GPU_OVERRIDE(vertex_layout_memo),
             GPU_OVERRIDE(covered_range_skip),
             GPU_OVERRIDE(residency_bitmap),
             GPU_OVERRIDE(stream_barrier_skip),
             GPU_OVERRIDE(clean_sync_peek),
             GPU_OVERRIDE(readback_offload),
+            GPU_OVERRIDE(pipeline_sync_budget_ms),
             GPU_OVERRIDE(inplace_guest_memory),
             GPU_OVERRIDE(guest_sync_barriers),
             GPU_OVERRIDE(barrier_tracker),
             GPU_OVERRIDE(present_pacing),
             GPU_OVERRIDE(frame_cap),
-            GPU_OVERRIDE(async_pipelines),
             GPU_OVERRIDE(inplace_image_downloads),
             GPU_OVERRIDE(draw_pipe),
             GPU_OVERRIDE(async_submit),
@@ -875,6 +873,7 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
+            make_override<GPUSettings>("fast_shader_math", &GPUSettings::fast_shader_math),
         };
     }
 #undef GPU_OVERRIDE
@@ -905,13 +904,13 @@ struct GPUSettings {
     pending_pop_throttle, stream_copy_workers, dyn_state_memo, bind_write_plan, \
     findimg_memo_first, findimg_slot_hint, bind_image_lean, desc_delta_flat, \
     draw_glue_memo, image_fast_state, guest_copy_lock_batch, spec_fp_cache, \
-    runtime_info_stamp_gate, userfaultfd, gpu_thread_core_reserve, one_thread_per_core, \
+    runtime_info_stamp_gate, userfaultfd, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
-    clean_sync_peek, readback_offload, inplace_guest_memory, guest_sync_barriers, \
-    inplace_image_downloads, draw_pipe, async_submit, tick_query_interval_us, \
-    guest_gpu_time_percent, barrier_tracker, present_pacing, \
-    frame_cap, async_pipelines
+    clean_sync_peek, readback_offload, fast_shader_math, pipeline_sync_budget_ms, \
+    one_core_gpu_thread_pin, inplace_guest_memory, guest_sync_barriers, inplace_image_downloads, \
+    draw_pipe, async_submit, tick_query_interval_us, guest_gpu_time_percent, barrier_tracker, \
+    present_pacing, frame_cap
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1245,20 +1244,19 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, TextureLruLazyTouch, texture_lru_lazy_touch)
     SETTING_FORWARD_BOOL(m_gpu, GatherInputMemo, gather_input_memo)
     SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
-    SETTING_FORWARD_BOOL(m_gpu, GpuThreadCoreReserve, gpu_thread_core_reserve)
-    SETTING_FORWARD_BOOL(m_gpu, OneThreadPerCore, one_thread_per_core)
+    SETTING_FORWARD_BOOL(m_gpu, OneCoreGpuThreadPin, one_core_gpu_thread_pin)
     SETTING_FORWARD_BOOL(m_gpu, VertexLayoutMemo, vertex_layout_memo)
     SETTING_FORWARD_BOOL(m_gpu, CoveredRangeSkip, covered_range_skip)
     SETTING_FORWARD_BOOL(m_gpu, ResidencyBitmap, residency_bitmap)
     SETTING_FORWARD_BOOL(m_gpu, StreamBarrierSkip, stream_barrier_skip)
     SETTING_FORWARD_BOOL(m_gpu, CleanSyncPeek, clean_sync_peek)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
+    SETTING_FORWARD(m_gpu, PipelineSyncBudgetMs, pipeline_sync_budget_ms)
     SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
     SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
     SETTING_FORWARD(m_gpu, BarrierTracker, barrier_tracker)
     SETTING_FORWARD(m_gpu, PresentPacing, present_pacing)
     SETTING_FORWARD(m_gpu, FrameCap, frame_cap)
-    SETTING_FORWARD_BOOL(m_gpu, AsyncPipelines, async_pipelines)
     SETTING_FORWARD_BOOL(m_gpu, InplaceImageDownloads, inplace_image_downloads)
     SETTING_FORWARD_BOOL(m_gpu, DrawPipe, draw_pipe)
     SETTING_FORWARD_BOOL(m_gpu, AsyncSubmit, async_submit)
@@ -1338,6 +1336,7 @@ public:
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, FastShaderMath, fast_shader_math)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {
@@ -1374,6 +1373,7 @@ public:
     SETTING_FORWARD_BOOL(m_input, CircleEnter, is_circle_enter)
     SETTING_FORWARD_BOOL(m_input, MiceUsedAsMice, use_mice_as_mice)
     SETTING_FORWARD_BOOL(m_input, KeyboardUsedAsKeyboard, use_keyboard_as_keyboard)
+    SETTING_FORWARD_BOOL(m_input, VibrationEnabled, vibration_enabled)
 
     // Vulkan settings
     SETTING_FORWARD(m_vulkan, GpuId, gpu_id)

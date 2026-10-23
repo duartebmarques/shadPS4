@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -70,9 +71,6 @@ struct GraphicsPipelineKey {
 
 class GraphicsPipeline : public Pipeline {
 public:
-    /// Set on the threads that compile pipelines in the background.
-    static inline thread_local bool compiling_in_background = false;
-
     struct SerializationSupport {
         VertexInputs<vk::VertexInputAttributeDescription> vertex_attributes{};
         VertexInputs<vk::VertexInputBindingDescription> vertex_bindings{};
@@ -93,7 +91,7 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, std::span<const AmdGpu::Buffer> vertex_sharps = {});
     ~GraphicsPipeline();
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
@@ -102,6 +100,12 @@ public:
 
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
+    }
+
+    /// Points the stages at these infos. A pipeline built on a compile worker from copies of the
+    /// infos is pointed at the live ones, whose sharps each draw reads.
+    void SetStages(std::span<const Shader::Info* const, MaxShaderStages> infos) noexcept {
+        std::ranges::copy(infos, stages.begin());
     }
 
     /// Gets the attributes and bindings for vertex inputs.
