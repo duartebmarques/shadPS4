@@ -4,8 +4,10 @@
 #   ./shadPS4.sh                 game picker (Big Picture): choose a game, its patches, play
 #   ./shadPS4.sh CUSA00004       play a game directly (a title id from games.json, or an eboot.bin)
 #   ./shadPS4.sh --setup         find the supported games again (also their update, DLC and pkg files)
-#   ./shadPS4.sh --add-to-steam  add this app to Steam (one shortcut; with a title id, that game's)
-#   ./shadPS4.sh --update        download the latest release over this folder (user/ is kept)
+#   ./shadPS4.sh --add-to-steam  add each game to Steam (plays it directly) and the game picker;
+#                                the game page's Add to Steam button does it for one game
+#   ./shadPS4.sh --update [tag]  download the latest release (or that one) over this folder
+#                                (user/ is kept)
 #
 # Setup runs by itself on the first start: it looks for the games next to this folder, in your
 # home folder and on SD cards, links updates and DLC, and installs the patch files with the
@@ -28,12 +30,20 @@ die() {
 info() { echo "==> $*"; }
 warn() { echo "warning: $*" >&2; }
 notify() { command -v notify-send >/dev/null && notify-send -a shadPS4 "shadPS4" "$*" || true; }
+# Yes/no question: in the terminal, else a desktop dialog (started by double-click), else no.
 ask() {
     [ "$YES" = 1 ] && return 0
-    [ -t 0 ] || return 1
-    local reply
-    read -r -p "$1 [Y/n] " reply
-    [[ -z "$reply" || "$reply" =~ ^[Yy] ]]
+    if [ -t 0 ]; then
+        local reply
+        read -r -p "$1 [Y/n] " reply
+        [[ -z "$reply" || "$reply" =~ ^[Yy] ]]
+    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v kdialog >/dev/null; then
+        kdialog --title shadPS4 --yesno "$1" 2>/dev/null
+    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null; then
+        zenity --question --title shadPS4 --text "$1" 2>/dev/null
+    else
+        return 1
+    fi
 }
 py() { python3 -I "$ROOT/tools/sp4.py" "$@"; }
 
@@ -67,6 +77,7 @@ install_defaults() {
         input_config/*)
             if [ ! -f "$U/$rel" ]; then put "$f" "$U/$rel"; elif ! cmp -s "$f" "$U/$rel"; then
                 put "$f" "$U/$rel.release"; fi ;;
+        art/*) ;; # read in place by steam_shortcut
         patches/*/*.xml)
             if [ -f "$U/$rel" ]; then
                 cp "$f" "$U/$rel.new" && py patches "$U/$rel.new" "$U/$rel" >/dev/null &&
@@ -148,7 +159,7 @@ setup() {
             [ -n "$d" ] || continue
             mkdir -p "$U/addcont/$title"
             link="$U/addcont/$title/$(basename "$d")"
-            [ -e "$link" ] || ln -s "$d" "$link"
+            [ "$(readlink "$link")" = "$d" ] || ln -sfn "$d" "$link"
         done < <(awk -F'\t' -v t="$title" '$1 == "dlc" && $2 == t { print $3 }' "$scan")
         n=$((n + 1))
     done < <(grep '^game' "$scan")
@@ -166,40 +177,77 @@ setup() {
     [ "$n" -gt 0 ] || warn "no supported game found: copy your game dump (or its pkg files) into your home folder or an SD card and run --setup"
 }
 
-add_to_steam() {
-    local name="shadPS4 (inFAMOUS)" exe="$ROOT/shadPS4.sh" opts="" id="${1:-}" game=""
-    if [ -n "$id" ]; then
-        game="$(awk -F'\t' -v t="$id" '$1 == t { print $2 }' "$GAMES_LIST")"
-        [ -n "$game" ] || die "$id is not set up (run --setup)"
-        name="$(py games "$ROOT/games.json" | awk -F'\t' -v t="$id" 'index("," $3 ",", "," t ",") { print $2 }')"
-        opts="$id"
-    fi
-    if pgrep -x steam >/dev/null && command -v steamos-add-to-steam >/dev/null && [ -z "$id" ]; then
-        steamos-add-to-steam "$exe"
-        info "Sent to Steam: \"$exe\""
-        return
-    fi
-    pgrep -x steam >/dev/null && die "close Steam first (Steam > Exit), then run this again"
-    local steam_dir="$HOME/.local/share/Steam" cfg vdf appid icon="${game:+$game/sce_sys/icon0.png}" n=0
+# Writes one shortcut (name, launch options = title id, game folder) into every Steam account,
+# with the library art shipped in dist-user/art/<title id> (else the game's own); Steam closed.
+steam_shortcut() {
+    local name="$1" opts="$2" game="$3" steam_dir="$HOME/.local/share/Steam" cfg vdf appid n=0
+    local art="$ROOT/dist-user/art/${opts:-none}" sce="${game:+$game/sce_sys}" icon="" f
     [ -d "$steam_dir/userdata" ] || steam_dir="$HOME/.steam/steam"
+    if [ -f "$art/icon.png" ]; then
+        icon="$art/icon.png"
+    elif [ -n "$sce" ]; then
+        icon="$sce/icon0.png"
+    fi
     for cfg in "$steam_dir"/userdata/*/config; do
         [[ "$(basename "$(dirname "$cfg")")" =~ ^[1-9][0-9]*$ ]] || continue
         vdf="$cfg/shortcuts.vdf"
         [ -f "$vdf" ] && cp "$vdf" "$vdf.bak"
-        appid="$(py shortcut "$vdf" "$name" "$exe" "$ROOT" "${icon:-}" "$opts")" || continue
+        appid="$(py shortcut "$vdf" "$name" "$ROOT/shadPS4.sh" "$ROOT" "$icon" "$opts")" || continue
         mkdir -p "$cfg/grid"
-        if [ -n "$game" ] && [ -f "$game/sce_sys/pic1.png" ]; then
-            cp "$game/sce_sys/pic1.png" "$cfg/grid/${appid}_hero.png"
-            cp "$game/sce_sys/pic1.png" "$cfg/grid/${appid}.png"
-        fi
-        if [ -n "$icon" ] && [ -f "$icon" ]; then
-            cp "$icon" "$cfg/grid/${appid}_icon.png"
-            cp "$icon" "$cfg/grid/${appid}p.png"
+        if [ -d "$art" ]; then
+            # Steam's names: <id>.png grid, <id>p.png portrait, _hero, _logo (+ .json position), _icon.
+            for f in grid: portrait:p hero:_hero logo:_logo icon:_icon; do
+                [ -f "$art/${f%%:*}.png" ] && cp "$art/${f%%:*}.png" "$cfg/grid/${appid}${f#*:}.png"
+            done
+            [ -f "$art/logo.json" ] && cp "$art/logo.json" "$cfg/grid/$appid.json"
+        elif [ -n "$sce" ]; then
+            if [ -f "$sce/pic1.png" ]; then
+                cp "$sce/pic1.png" "$cfg/grid/${appid}_hero.png"
+                cp "$sce/pic1.png" "$cfg/grid/${appid}.png"
+            fi
+            if [ -f "$sce/icon0.png" ]; then
+                cp "$sce/icon0.png" "$cfg/grid/${appid}_icon.png"
+                cp "$sce/icon0.png" "$cfg/grid/${appid}p.png"
+            fi
         fi
         n=$((n + 1))
     done
-    [ "$n" -gt 0 ] || die "no Steam account found in $steam_dir"
-    info "Steam shortcut \"$name\" added ($n Steam account(s))"
+    [ "$n" -gt 0 ] || { warn "no Steam account found in $steam_dir"; return 1; }
+    info "Steam shortcut \"$name\"${opts:+ (plays $opts)} added"
+}
+
+# Adds a Steam shortcut that starts each given game directly (without arguments: every set-up
+# game, plus the game picker). Steam rewrites its shortcuts on exit, so it is closed and restarted.
+add_to_steam() {
+    local id game name restart=0 i
+    local ids=("$@") picker=0
+    [ "${#ids[@]}" -gt 0 ] || { picker=1; mapfile -t ids < <(cut -f1 "$GAMES_LIST" 2>/dev/null); }
+    [ "${#ids[@]}" -gt 0 ] || { warn "no games set up yet (run --setup)"; return 1; }
+    if pgrep -x steam >/dev/null; then
+        if ! ask "Add your games to Steam? Steam closes for a moment and starts again."; then
+            warn "to add them later: \"$ROOT/shadPS4.sh\" --add-to-steam"
+            return 1
+        fi
+        steam -shutdown >/dev/null 2>&1 || true
+        for ((i = 0; i < 60; i++)); do pgrep -x steam >/dev/null || break; sleep 1; done
+        if pgrep -x steam >/dev/null; then
+            warn "Steam did not close; exit it and run --add-to-steam again"
+            return 1
+        fi
+        restart=1
+    fi
+    [ "$picker" = 0 ] || steam_shortcut "shadPS4 (inFAMOUS)" "" ""
+    for id in "${ids[@]}"; do
+        game="$(awk -F'\t' -v t="$id" '$1 == t { print $2 }' "$GAMES_LIST")"
+        [ -n "$game" ] || { warn "$id is not set up (run --setup)"; continue; }
+        name="$(py games "$ROOT/games.json" |
+            awk -F'\t' -v t="$id" 'index("," $3 ",", "," t ",") { print $2 }')"
+        steam_shortcut "${name:-$id}" "$id" "$game"
+    done
+    # Gaming Mode starts Steam again by itself.
+    if [ "$restart" = 1 ] && [ "${XDG_CURRENT_DESKTOP:-}" != gamescope ]; then
+        setsid steam >/dev/null 2>&1 < /dev/null &
+    fi
 }
 
 update() {
@@ -207,7 +255,7 @@ update() {
     command -v curl >/dev/null || die "curl is required"
     command -v unzip >/dev/null || die "unzip is required"
     running && die "a game is running; close it first"
-    rel="$(py latest "$REPO" '-linux\.zip$')" || die "could not look up the latest release"
+    rel="$(py latest "$REPO" '-linux\.zip$' "${1:-}")" || die "could not look up the release"
     tag="${rel%%$'\t'*}"
     url="${rel#*$'\t'}"
     if [ "$(cat "$ROOT/VERSION" 2>/dev/null)" = "$tag" ] && ! ask "Already on $tag. Reinstall it?"; then
@@ -232,6 +280,7 @@ update() {
     cp -a "$src/tools/." "$ROOT/tools/"
     chmod +x "$ROOT/shadPS4.sh" "$ROOT/app/usr/bin/shadps4"
     info "Updated to $tag (the previous build is in app.prev)"
+    if [ "$YES" = 1 ]; then exec "$ROOT/shadPS4.sh" --setup -y; fi
     exec "$ROOT/shadPS4.sh" --setup
 }
 
@@ -241,6 +290,11 @@ play() {
         game="$target"
     else
         game="$(awk -F'\t' -v t="$target" '$1 == t { print $2 }' "$GAMES_LIST" 2>/dev/null)"
+        if [ ! -f "$game/eboot.bin" ]; then
+            # Moved or renamed since the last setup: look again.
+            setup
+            game="$(awk -F'\t' -v t="$target" '$1 == t { print $2 }' "$GAMES_LIST" 2>/dev/null)"
+        fi
         [ -n "$game" ] || die "$target not found (run ./shadPS4.sh --setup)"
         game="$game/eboot.bin"
     fi
@@ -251,13 +305,14 @@ play() {
 cd "$ROOT"
 [ -x "$EMU" ] || die "app/usr/bin/shadps4 is missing: extract the whole release folder"
 case "${1:-}" in
--h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+-h | --help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
 --setup) shift; [ "${1:-}" = -y ] && YES=1; setup ;;
---add-to-steam) shift; add_to_steam "${1:-}" ;;
---update) shift; [ "${1:-}" = -y ] && YES=1; update ;;
+--add-to-steam) shift; [ "${1:-}" = -y ] && { YES=1; shift; }; add_to_steam "$@" ;;
+--update) shift; [ "${1:-}" = -y ] && { YES=1; shift; }; update "${1:-}" ;;
 "")
     [ -f "$U/.setup-done" ] || setup
-    exec "$EMU" --big-picture ;;
+    # The game page's Add to Steam button runs this script.
+    SHADPS4_LAUNCHER="$ROOT/shadPS4.sh" exec "$EMU" --big-picture ;;
 -*) exec "$EMU" "$@" ;;
 *)
     [ -f "$U/.setup-done" ] || setup

@@ -12,7 +12,7 @@ with the Deck's controls.
 | Game | Title id | Version | State on the Deck OLED |
 |---|---|---|---|
 | inFAMOUS Second Son | CUSA00004 (+ other regions) | update 1.07 | about 30 fps (the game's cap), graffiti shake and trackpads work |
-| inFAMOUS First Light | CUSA00897 (+ other regions) | 1.00 (1.04 works too) | about 28 fps at the start of the game; tuned settings +22% over plain shadPS4 |
+| inFAMOUS First Light | CUSA00897 (+ other regions) | 1.00 (1.04 works too) | **work in progress**: playable, about 26-30 fps outside fights, heavy fights drop to about 20 fps |
 
 More games are added through `games.json` (see [Adding a game](#adding-a-game)).
 
@@ -30,15 +30,14 @@ and extract it where you like (right-click > Extract > Extract archive here). Yo
 `shadPS4-infamous`.
 
 **2. Start it.** Double-click `shadPS4.sh` in that folder (choose *Execute* if asked). The first
-start finds your games, their update and DLC, and turns on the Steam Deck patches. Then the game picker
-opens: choose a game, then **Play** or **Patches**.
+start finds your games, their update and DLC, and turns on the Steam Deck patches. Then the game
+picker opens: choose a game, then **Play**, **Patches** or **Add to Steam**.
 
-**3. Add it to Steam** (for Gaming Mode): in a terminal in that folder run
-`./shadPS4.sh --add-to-steam`, or add `shadPS4.sh` as a non-Steam game yourself. In Gaming Mode
-start **shadPS4 (inFAMOUS)** from Library > Non-Steam.
+**3. Add it to Steam** (for Gaming Mode): on the game's page choose **Add to Steam**. Steam closes
+for a moment and starts again with the game in Library > Non-Steam, with its artwork; that
+shortcut starts the game directly. (`./shadPS4.sh --add-to-steam` adds every game at once.)
 
-Or all of it with one line in Konsole (installs into `~/Applications/shadPS4-infamous`, adds the
-app and each game to Steam):
+Or steps 1 and 2 with one line in Konsole (installs into `~/Applications/shadPS4-infamous`):
 
 ```bash
 bash <(curl -fsSL https://github.com/duartebmarques/shadPS4/releases/latest/download/install.sh)

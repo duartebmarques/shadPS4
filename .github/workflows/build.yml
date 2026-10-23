@@ -521,19 +521,7 @@ jobs:
         src=$(ls -d ./artifacts/shadps4-linux-sdl-pgo-2*/ 2>/dev/null | head -1)
         [ -n "$src" ] || src=$(ls -d ./artifacts/shadps4-linux-sdl-2*/ | head -1)
         echo "AppImage from $src"
-        # One folder: the extracted build (Steam's runtime can lack fusermount for AppImages),
-        # shadPS4.sh, the games manifest and helpers, and the default user files.
-        dir=./stage/shadPS4-infamous
-        mkdir -p "$dir"
-        chmod a+x "$src"Shadps4-sdl.AppImage
-        (cd ./stage && "$GITHUB_WORKSPACE/$src"Shadps4-sdl.AppImage --appimage-extract >/dev/null)
-        mv ./stage/squashfs-root "$dir"/app
-        cp -r dist/user "$dir"/dist-user
-        cp -r dist/tools "$dir"/tools
-        cp dist/shadPS4.sh dist/games.json dist/install.sh LICENSE README.md "$dir"/
-        echo "$TAG" > "$dir"/VERSION
-        chmod a+x "$dir"/shadPS4.sh "$dir"/install.sh "$dir"/tools/sp4.py
-        (cd ./stage && zip -qry "$GITHUB_WORKSPACE/shadps4-${TAG}-linux.zip" shadPS4-infamous)
+        dist/package.sh "$src"Shadps4-sdl.AppImage "$TAG" "$GITHUB_WORKSPACE"
         cp dist/install.sh ./install.sh
         sed "s/@TAG@/$TAG/g" dist/RELEASE.md > ./release-notes.md
         ls -la ./*.zip
@@ -545,3 +533,5 @@ jobs:
           ./*.zip
           ./install.sh
         body_path: ./release-notes.md
+        # Published as a pre-release; agent/tools/release-smoke makes it the latest after the VM test.
+        prerelease: true

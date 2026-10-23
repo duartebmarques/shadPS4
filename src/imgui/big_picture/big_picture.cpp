@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <bit>
 #include <fstream>
+#ifndef _WIN32
+#include <spawn.h>
+#endif
 #include <stb_image.h>
 
 #include "common/logging/log.h"
@@ -38,6 +41,32 @@ std::filesystem::path runEbootPath = "";
 std::vector<IconInfo> gameIcons = {};
 
 float uiScale = 1.0f;
+
+#ifndef _WIN32
+extern "C" char** environ;
+#endif
+
+// The launcher script that started us (SHADPS4_LAUNCHER) can add a game to Steam; it closes and
+// restarts Steam, so it runs in its own session.
+static const char* SteamLauncher() {
+#ifdef _WIN32
+    return nullptr;
+#else
+    return std::getenv("SHADPS4_LAUNCHER");
+#endif
+}
+
+static void AddToSteam(const std::string& serial) {
+#ifndef _WIN32
+    const std::string script{SteamLauncher()};
+    const char* argv[] = {"setsid", "-f",           script.c_str(), "--add-to-steam",
+                          "-y",     serial.c_str(), nullptr};
+    pid_t pid;
+    if (posix_spawnp(&pid, "setsid", nullptr, nullptr, const_cast<char**>(argv), environ) != 0) {
+        LOG_ERROR(ImGui, "Could not start {} --add-to-steam", script);
+    }
+#endif
+}
 SDL_Renderer* renderer;
 
 namespace {
@@ -493,9 +522,34 @@ void Launch(char* executableName, bool sameProcess) {
                 showPatches = true;
                 ImGui::CloseCurrentPopup();
             }
+            if (SteamLauncher()) {
+                ImGui::SameLine();
+                if (ImGui::Button("Add to Steam", ImVec2(160 * uiScale, 0))) {
+                    ImGui::OpenPopup("Add to Steam");
+                }
+            }
             ImGui::SameLine();
             if (ImGui::Button("Back", ImVec2(160 * uiScale, 0))) {
                 ImGui::CloseCurrentPopup();
+            }
+            ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+            if (ImGui::BeginPopupModal("Add to Steam", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("Adds %s to your Steam library: it starts the game directly.\n"
+                            "Steam closes for a moment and starts again.",
+                            game.title.c_str());
+                ImGui::Separator();
+                if (ImGui::Button("OK", ImVec2(120 * uiScale, 0))) {
+                    AddToSteam(game.serial);
+                    ImGui::CloseCurrentPopup();
+                }
+                if (ImGui::IsWindowAppearing()) {
+                    ImGui::SetItemDefaultFocus();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(120 * uiScale, 0))) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
             }
             ImGui::EndPopup();
         }
