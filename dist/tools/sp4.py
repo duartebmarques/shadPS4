@@ -25,7 +25,7 @@ def sfo(path):
 
 def scan(titles, *roots):
     # Prints "kind<TAB>title<TAB>path<TAB>version" for games (gd), updates (gp), DLC (ac) and pkgs
-    # of any of the comma separated title ids.
+    # of any of the comma separated title ids, and "other" for every other game found.
     titles = set(titles.split(","))
     skip = {"steamapps", "compatdata", "shadercache", "node_modules"}
     seen = set()
@@ -57,9 +57,12 @@ def scan(titles, *roots):
                 continue
             p = sfo(os.path.join(cur, "sce_sys", "param.sfo"))
             title = p.get("TITLE_ID")
-            if title not in titles:
-                continue
             cat, ver = str(p.get("CATEGORY", "")), p.get("APP_VER", "")
+            if title not in titles:
+                # Any other game (dumps merged with their update say gp): the game picker lists it.
+                if title and cat[:2] in ("gd", "gp") and os.path.isfile(os.path.join(cur, "eboot.bin")):
+                    print(f"other\t{title}\t{cur}\t{ver}")
+                continue
             if cat.startswith("gd") and os.path.isfile(os.path.join(cur, "eboot.bin")):
                 print(f"game\t{title}\t{cur}\t{ver}")
             elif cat.startswith("gp"):
