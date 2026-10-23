@@ -506,7 +506,11 @@ void Launch(char* executableName, bool sameProcess) {
             ImGui::Text("%s", game.title.c_str());
             ImGui::TextDisabled("%s  version %s", game.serial.c_str(), game.version.c_str());
             ImGui::Separator();
-            if (ImGui::Button("Play", ImVec2(160 * uiScale, 0))) {
+            // One width for the row, wide enough for the longest label at any UI scale.
+            const ImVec2 button{std::max(160 * uiScale, ImGui::CalcTextSize("Add to Steam").x +
+                                                            ImGui::GetStyle().FramePadding.x * 4),
+                                0};
+            if (ImGui::Button("Play", button)) {
                 done = true;
                 Core::FileSys::MntPoints::ignore_game_patches =
                     ImGui::IsKeyDown(ImGuiKey::ImGuiKey_LeftCtrl);
@@ -517,19 +521,19 @@ void Launch(char* executableName, bool sameProcess) {
                 ImGui::SetItemDefaultFocus();
             }
             ImGui::SameLine();
-            if (ImGui::Button("Patches", ImVec2(160 * uiScale, 0))) {
+            if (ImGui::Button("Patches", button)) {
                 gamePatches = LoadGamePatches(game.serial);
                 showPatches = true;
                 ImGui::CloseCurrentPopup();
             }
             if (SteamLauncher()) {
                 ImGui::SameLine();
-                if (ImGui::Button("Add to Steam", ImVec2(160 * uiScale, 0))) {
+                if (ImGui::Button("Add to Steam", button)) {
                     ImGui::OpenPopup("Add to Steam");
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button("Back", ImVec2(160 * uiScale, 0))) {
+            if (ImGui::Button("Back", button)) {
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));

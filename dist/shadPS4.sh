@@ -180,7 +180,7 @@ setup() {
 # Writes one shortcut (name, launch options = title id, game folder) into every Steam account,
 # with the library art shipped in dist-user/art/<title id> (else the game's own); Steam closed.
 steam_shortcut() {
-    local name="$1" opts="$2" game="$3" steam_dir="$HOME/.local/share/Steam" cfg vdf appid n=0
+    local name="$1" opts="$2" game="$3" steam_dir="$HOME/.local/share/Steam" cfg vdf appid out n=0
     local art="$ROOT/dist-user/art/${opts:-none}" sce="${game:+$game/sce_sys}" icon="" f
     [ -d "$steam_dir/userdata" ] || steam_dir="$HOME/.steam/steam"
     if [ -f "$art/icon.png" ]; then
@@ -192,7 +192,8 @@ steam_shortcut() {
         [[ "$(basename "$(dirname "$cfg")")" =~ ^[1-9][0-9]*$ ]] || continue
         vdf="$cfg/shortcuts.vdf"
         [ -f "$vdf" ] && cp "$vdf" "$vdf.bak"
-        appid="$(py shortcut "$vdf" "$name" "$ROOT/shadPS4.sh" "$ROOT" "$icon" "$opts")" || continue
+        out="$(py shortcut "$vdf" "$name" "$ROOT/shadPS4.sh" "$ROOT" "$icon" "$opts")" || continue
+        appid="${out%%$'\t'*}"
         mkdir -p "$cfg/grid"
         if [ -d "$art" ]; then
             # Steam's names: <id>.png grid, <id>p.png portrait, _hero, _logo (+ .json position), _icon.
@@ -213,7 +214,9 @@ steam_shortcut() {
         n=$((n + 1))
     done
     [ "$n" -gt 0 ] || { warn "no Steam account found in $steam_dir"; return 1; }
-    info "Steam shortcut \"$name\"${opts:+ (plays $opts)} added"
+    info "Steam shortcut \"$name\"${opts:+ (plays $opts)} ${out#*$'\t'}"
+    # Started from the game page there is no terminal to read this.
+    [ -t 1 ] || notify "$name: Steam shortcut ${out#*$'\t'} (Library > Non-Steam)"
 }
 
 # Adds a Steam shortcut that starts each given game directly (without arguments: every set-up
