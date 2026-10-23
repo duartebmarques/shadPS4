@@ -557,7 +557,7 @@ struct GPUSettings {
     // mid-play. 2 runs the hardened path, safe everywhere. Both modes drain
     // through worker threads, two unless stream_copy_lane_threads says
     // otherwise, fenced before every submit.
-    Setting<u32> stream_copy_workers{1};
+    Setting<u32> stream_copy_workers{0};
     // Resolves shader permutations through an address-masked specialization
     // fingerprint: a hit skips the StageSpecialization rebuild and the deep
     // permutation compares entirely.
