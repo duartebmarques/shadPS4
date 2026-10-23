@@ -77,19 +77,21 @@ static FfxErrorCode trackedCreateBackendContext(
 
 static FfxVkPortableResult fromFfxResult(FfxErrorCode result)
 {
+    /* Under the MSVC ABI FfxErrorCodes has the underlying type int, so the codes from 0x80000000
+     * up are negative there; each label is converted to uint32_t like the operand. */
     switch (static_cast<uint32_t>(result)) {
-    case FFX_OK:
+    case static_cast<uint32_t>(FFX_OK):
         return FFX_VK_PORTABLE_OK;
-    case FFX_ERROR_INVALID_POINTER:
-    case FFX_ERROR_NULL_DEVICE:
+    case static_cast<uint32_t>(FFX_ERROR_INVALID_POINTER):
+    case static_cast<uint32_t>(FFX_ERROR_NULL_DEVICE):
         return FFX_VK_PORTABLE_ERROR_INVALID_POINTER;
-    case FFX_ERROR_INVALID_SIZE:
-    case FFX_ERROR_INVALID_ENUM:
-    case FFX_ERROR_INVALID_ARGUMENT:
-    case FFX_ERROR_OUT_OF_RANGE:
+    case static_cast<uint32_t>(FFX_ERROR_INVALID_SIZE):
+    case static_cast<uint32_t>(FFX_ERROR_INVALID_ENUM):
+    case static_cast<uint32_t>(FFX_ERROR_INVALID_ARGUMENT):
+    case static_cast<uint32_t>(FFX_ERROR_OUT_OF_RANGE):
         return FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
-    case FFX_ERROR_OUT_OF_MEMORY:
-    case FFX_ERROR_INSUFFICIENT_MEMORY:
+    case static_cast<uint32_t>(FFX_ERROR_OUT_OF_MEMORY):
+    case static_cast<uint32_t>(FFX_ERROR_INSUFFICIENT_MEMORY):
         return FFX_VK_PORTABLE_ERROR_OUT_OF_MEMORY;
     default:
         return FFX_VK_PORTABLE_ERROR_BACKEND;
