@@ -15,6 +15,7 @@
 #include "video_core/gr2_fsr3/shaders/fsr3_mvcopy_comp.h"
 #include "video_core/gr2_fsr3/shaders/fsr3_store_comp.h"
 #include "video_core/gr2_fsr3/shaders/fsr4_inputs_comp.h"
+#include "video_core/gr2_fsr3/shaders/grr_camera_motion_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -33,6 +34,7 @@ constexpr u32 StoreRcas = 1u << 0;
 constexpr u32 StoreLinearInput = 1u << 1;
 constexpr u32 StoreFxaa = 1u << 2;
 constexpr u32 StoreFxaaCharacters = 1u << 3;
+constexpr u32 StoreAlphaOne = 1u << 4;
 constexpr u32 FallbackBilinear = 0;
 constexpr u32 FallbackEasu = 1;
 constexpr u32 DebugHistoryValid = 1u << 0;
@@ -71,6 +73,7 @@ constexpr std::array DebugBindings{SampledImage, SampledImage,   SampledImage, S
                                    StorageImage, SamplerBinding, StorageImage};
 constexpr std::array Fsr4InputsBindings{SampledImage, SampledImage, SampledImage,
                                         StorageImage, StorageImage, StorageImage};
+constexpr std::array GrrCameraMotionBindings{SampledImage, StorageImage, StorageImage};
 
 // Push constant blocks of the shaders.
 struct MaskConstants {
@@ -81,11 +84,17 @@ struct MaskConstants {
     float tc_characters{};
     u32 flags{};
     s32 outline_radius{};
+    u32 character_stencil{};
+    u32 geometry_stencil{};
+    u32 temporal_stencil{};
 };
-static_assert(sizeof(MaskConstants) == 32);
+static_assert(sizeof(MaskConstants) == 44);
 static_assert(offsetof(MaskConstants, reactive_characters) == 8);
 static_assert(offsetof(MaskConstants, flags) == 24);
 static_assert(offsetof(MaskConstants, outline_radius) == 28);
+static_assert(offsetof(MaskConstants, character_stencil) == 32);
+static_assert(offsetof(MaskConstants, geometry_stencil) == 36);
+static_assert(offsetof(MaskConstants, temporal_stencil) == 40);
 
 struct CameraMotionConstants {
     std::array<float, 16> matrix{};
@@ -98,16 +107,31 @@ static_assert(offsetof(CameraMotionConstants, inverse_view) == 64);
 static_assert(offsetof(CameraMotionConstants, size) == 80);
 static_assert(offsetof(CameraMotionConstants, inv_size) == 88);
 
+struct GrrCameraMotionConstants {
+    std::array<std::array<float, 4>, 3> scene{};
+    std::array<std::array<float, 4>, 3> sky{};
+    std::array<float, 2> jitter{};
+    std::array<u32, 2> size{};
+};
+static_assert(sizeof(GrrCameraMotionConstants) == 112);
+static_assert(offsetof(GrrCameraMotionConstants, sky) == 48);
+static_assert(offsetof(GrrCameraMotionConstants, jitter) == 96);
+static_assert(offsetof(GrrCameraMotionConstants, size) == 104);
+
 struct StoreConstants {
     std::array<u32, 2> size{};
     float rcas_stops{};
     u32 flags{};
     std::array<u32, 2> render_size{};
+    u32 character_stencil{};
+    u32 components{};
 };
-static_assert(sizeof(StoreConstants) == 24);
+static_assert(sizeof(StoreConstants) == 32);
 static_assert(offsetof(StoreConstants, rcas_stops) == 8);
 static_assert(offsetof(StoreConstants, flags) == 12);
 static_assert(offsetof(StoreConstants, render_size) == 16);
+static_assert(offsetof(StoreConstants, character_stencil) == 24);
+static_assert(offsetof(StoreConstants, components) == 28);
 
 struct FallbackConstants {
     std::array<u32, 2> destination_size{};
@@ -126,13 +150,17 @@ struct DebugConstants {
     float near_plane{};
     float far_plane{};
     std::array<float, 2> motion_vector_scale{};
+    std::array<u32, 3> stencil_bits{};
+    u32 components{};
 };
-static_assert(sizeof(DebugConstants) == 40);
+static_assert(sizeof(DebugConstants) == 56);
 static_assert(offsetof(DebugConstants, view) == 16);
 static_assert(offsetof(DebugConstants, flags) == 20);
 static_assert(offsetof(DebugConstants, near_plane) == 24);
 static_assert(offsetof(DebugConstants, far_plane) == 28);
 static_assert(offsetof(DebugConstants, motion_vector_scale) == 32);
+static_assert(offsetof(DebugConstants, stencil_bits) == 40);
+static_assert(offsetof(DebugConstants, components) == 52);
 
 struct Fsr4InputsConstants {
     std::array<u32, 2> size{};
@@ -172,6 +200,12 @@ bool Take(vk::ResultValue<T>&& created, T& target, const char* pass, const char*
 
 vk::DescriptorImageInfo ImageDescriptor(vk::ImageView view) {
     return {.imageView = view, .imageLayout = vk::ImageLayout::eGeneral};
+}
+
+// One byte per component, the order Fsr3Reorder of fsr3_color.glsl takes.
+u32 PackComponents(const std::array<u8, 4>& components) {
+    return u32{components[0]} | u32{components[1]} << 8 | u32{components[2]} << 16 |
+           u32{components[3]} << 24;
 }
 
 FsrImage Describe(const HostImage& host_image, bool written) {
@@ -344,7 +378,7 @@ struct Passes::Impl {
     /// Gives every host image its extent; an empty extent releases the image.
     void ResizeImages(Vulkan::Scheduler& scheduler, vk::Extent2D mask_size,
                       vk::Extent2D output_size, vk::Extent2D camera_motion_size,
-                      vk::Extent2D debug_size) {
+                      vk::Extent2D debug_size, vk::Extent2D depth_copy_size) {
         ResizeImage(scheduler, reactive, vk::Format::eR8Unorm, mask_size, "GR2 FSR3 reactive mask");
         ResizeImage(scheduler, tc, vk::Format::eR8Unorm, mask_size, "GR2 FSR3 transparency mask");
         if (ResizeImage(scheduler, character_history, vk::Format::eR8Unorm, mask_size,
@@ -356,6 +390,8 @@ struct Passes::Impl {
                     "GR2 FSR3 output");
         ResizeImage(scheduler, camera_mv, vk::Format::eR16G16Sfloat, camera_motion_size,
                     "GR2 FSR3 camera motion vectors");
+        ResizeImage(scheduler, depth_copy, vk::Format::eR32Sfloat, depth_copy_size,
+                    "GR2 FSR3 depth copy");
         for (HostImage& history : debug_history) {
             if (ResizeImage(scheduler, history, vk::Format::eR16G16B16A16Sfloat, debug_size,
                             "GR2 FSR3 debug history")) {
@@ -376,12 +412,14 @@ struct Passes::Impl {
     Pass store{};
     Pass fallback{};
     Pass debug{};
-    Pass fsr4_inputs{}; ///< Built by InitFsr4.
+    Pass fsr4_inputs{};       ///< Built by InitFsr4.
+    Pass grr_camera_motion{}; ///< Built by InitGrr.
     HostImage reactive{};
     HostImage tc{};
     HostImage character_history{};
     HostImage output{};
     HostImage camera_mv{};
+    HostImage depth_copy{};
     std::array<HostImage, 2> debug_history{};
     bool history_valid{};
     bool character_history_initialized{};
@@ -389,6 +427,7 @@ struct Passes::Impl {
     u32 debug_index{};
     bool mask_written{};
     bool camera_written{};
+    bool depth_written{};
 };
 
 Passes::Passes(const Vulkan::Instance& instance) : impl{std::make_unique<Impl>(instance)} {}
@@ -428,16 +467,25 @@ bool Passes::InitFsr4() {
                                             "FSR 4 inputs");
 }
 
-void Passes::Resize(Vulkan::Scheduler& scheduler, vk::Extent2D render_size,
-                    vk::Extent2D output_size, bool camera_motion, bool debug_history) {
-    impl->ResizeImages(scheduler, render_size, output_size,
-                       camera_motion ? render_size : vk::Extent2D{},
-                       debug_history ? render_size : vk::Extent2D{});
+bool Passes::InitGrr() {
+    Impl& state = *impl;
+    return state.grr_camera_motion.pipeline ||
+           state.Build<GrrCameraMotionConstants>(state.grr_camera_motion, GrrCameraMotionBindings,
+                                                 GRR_CAMERA_MOTION_COMP, "GRR camera motion");
 }
 
-void Passes::ResizeFsr4(Vulkan::Scheduler& scheduler, vk::Extent2D render_size,
-                        bool camera_motion) {
-    impl->ResizeImages(scheduler, {}, {}, camera_motion ? render_size : vk::Extent2D{}, {});
+void Passes::Resize(Vulkan::Scheduler& scheduler, vk::Extent2D render_size,
+                    vk::Extent2D output_size, bool camera_motion, bool debug_history,
+                    bool depth_copy) {
+    impl->ResizeImages(
+        scheduler, render_size, output_size, camera_motion ? render_size : vk::Extent2D{},
+        debug_history ? render_size : vk::Extent2D{}, depth_copy ? render_size : vk::Extent2D{});
+}
+
+void Passes::ResizeFsr4(Vulkan::Scheduler& scheduler, vk::Extent2D render_size, bool camera_motion,
+                        bool depth_copy) {
+    impl->ResizeImages(scheduler, {}, {}, camera_motion ? render_size : vk::Extent2D{}, {},
+                       depth_copy ? render_size : vk::Extent2D{});
 }
 
 void Passes::ResetHistory() {
@@ -466,6 +514,9 @@ void Passes::RecordMask(vk::CommandBuffer cmdbuf, const MaskParams& params) {
         .flags = (params.character_history ? MaskUseHistory : 0u) |
                  (state.history_valid ? MaskHistoryValid : 0u),
         .outline_radius = OutlineRadius,
+        .character_stencil = params.character_stencil,
+        .geometry_stencil = params.geometry_stencil,
+        .temporal_stencil = params.temporal_stencil,
     };
     Record(cmdbuf, state.mask, MaskBindings,
            std::array{ImageDescriptor(params.stencil), ImageDescriptor(*state.reactive.view),
@@ -496,9 +547,31 @@ void Passes::RecordCameraMotion(vk::CommandBuffer cmdbuf, const CameraMotionPara
     state.camera_written = true;
 }
 
+void Passes::RecordGrrCameraMotion(vk::CommandBuffer cmdbuf, const GrrCameraMotionParams& params) {
+    Impl& state = *impl;
+    const std::array barriers{
+        OverwriteBarrier(state.camera_mv.image, vk::AccessFlagBits2::eShaderStorageWrite),
+        OverwriteBarrier(state.depth_copy.image, vk::AccessFlagBits2::eShaderStorageWrite),
+    };
+    Barrier(cmdbuf, barriers);
+    const vk::Extent2D size = params.render_size;
+    const GrrCameraMotionConstants constants{
+        .scene = params.scene,
+        .sky = params.sky,
+        .jitter = {params.jitter_x, params.jitter_y},
+        .size = {size.width, size.height},
+    };
+    Record(cmdbuf, state.grr_camera_motion, GrrCameraMotionBindings,
+           std::array{ImageDescriptor(params.depth), ImageDescriptor(*state.camera_mv.view),
+                      ImageDescriptor(*state.depth_copy.view)},
+           constants, size);
+    state.camera_written = true;
+    state.depth_written = true;
+}
+
 void Passes::PrepareFsr(vk::CommandBuffer cmdbuf) {
     Impl& state = *impl;
-    std::array<vk::ImageMemoryBarrier2, 4> barriers{
+    std::array<vk::ImageMemoryBarrier2, 5> barriers{
         OverwriteBarrier(state.output.image, vk::AccessFlagBits2::eShaderRead |
                                                  vk::AccessFlagBits2::eShaderStorageWrite)};
     u32 count = 1;
@@ -511,15 +584,20 @@ void Passes::PrepareFsr(vk::CommandBuffer cmdbuf) {
         barriers[count++] =
             AfterWriteBarrier(state.camera_mv.image, vk::AccessFlagBits2::eShaderRead);
     }
+    if (state.depth_written) {
+        barriers[count++] =
+            AfterWriteBarrier(state.depth_copy.image, vk::AccessFlagBits2::eShaderRead);
+    }
     Barrier(cmdbuf, {barriers.data(), count});
     state.mask_written = false;
     state.camera_written = false;
+    state.depth_written = false;
 }
 
 void Passes::RecordFsr4Inputs(vk::CommandBuffer cmdbuf, const Fsr4InputsParams& params) {
     Impl& state = *impl;
     const Fsr4Images& targets = params.targets;
-    std::array<vk::ImageMemoryBarrier2, 4> barriers{
+    std::array<vk::ImageMemoryBarrier2, 5> barriers{
         OverwriteBarrier(targets.color.image, vk::AccessFlagBits2::eShaderStorageWrite),
         OverwriteBarrier(targets.motion_vectors.image, vk::AccessFlagBits2::eShaderStorageWrite),
         OverwriteBarrier(targets.depth.image, vk::AccessFlagBits2::eShaderStorageWrite),
@@ -529,8 +607,13 @@ void Passes::RecordFsr4Inputs(vk::CommandBuffer cmdbuf, const Fsr4InputsParams& 
         barriers[count++] =
             AfterWriteBarrier(state.camera_mv.image, vk::AccessFlagBits2::eShaderRead);
     }
+    if (state.depth_written) {
+        barriers[count++] =
+            AfterWriteBarrier(state.depth_copy.image, vk::AccessFlagBits2::eShaderRead);
+    }
     Barrier(cmdbuf, {barriers.data(), count});
     state.camera_written = false;
+    state.depth_written = false;
     const Fsr4InputsConstants constants{
         .size = {params.render_size.width, params.render_size.height},
         .flags = (params.encode_srgb ? Fsr4InputsEncodeSrgb : 0u) |
@@ -544,7 +627,7 @@ void Passes::RecordFsr4Inputs(vk::CommandBuffer cmdbuf, const Fsr4InputsParams& 
         std::array{
             ImageDescriptor(params.color),
             ImageDescriptor(params.camera_motion ? *state.camera_mv.view : params.motion_vectors),
-            ImageDescriptor(params.depth),
+            ImageDescriptor(params.host_depth ? *state.depth_copy.view : params.depth),
             ImageDescriptor(targets.color.view),
             ImageDescriptor(targets.motion_vectors.view),
             ImageDescriptor(targets.depth.view),
@@ -565,8 +648,11 @@ void Passes::RecordStore(vk::CommandBuffer cmdbuf, const StoreParams& params) {
         .flags = (params.rcas_stops >= 0.0f ? StoreRcas : 0u) |
                  (params.linear_input ? StoreLinearInput : 0u) |
                  (params.fxaa != Fxaa::Off ? StoreFxaa : 0u) |
-                 (params.fxaa == Fxaa::Characters ? StoreFxaaCharacters : 0u),
+                 (params.fxaa == Fxaa::Characters ? StoreFxaaCharacters : 0u) |
+                 (params.alpha_one ? StoreAlphaOne : 0u),
         .render_size = {params.render_size.width, params.render_size.height},
+        .character_stencil = params.character_stencil,
+        .components = PackComponents(params.components),
     };
     // The stencil may be a null descriptor when FXAA does not read it.
     Record(cmdbuf, state.store, StoreBindings,
@@ -592,14 +678,24 @@ void Passes::RecordDebug(vk::CommandBuffer cmdbuf, const DebugParams& params) {
     Impl& state = *impl;
     const bool masks = params.view == DebugView::Masks;
     const bool reprojection = params.view == DebugView::Reprojection;
-    std::array<vk::ImageMemoryBarrier2, 4> barriers{};
+    std::array<vk::ImageMemoryBarrier2, 6> barriers{};
     u32 count = 0;
     if (state.mask_written) {
         barriers[count++] =
             AfterWriteBarrier(state.reactive.image, vk::AccessFlagBits2::eShaderRead);
         barriers[count++] = AfterWriteBarrier(state.tc.image, vk::AccessFlagBits2::eShaderRead);
     }
+    if (state.camera_written) {
+        barriers[count++] =
+            AfterWriteBarrier(state.camera_mv.image, vk::AccessFlagBits2::eShaderRead);
+    }
+    if (state.depth_written) {
+        barriers[count++] =
+            AfterWriteBarrier(state.depth_copy.image, vk::AccessFlagBits2::eShaderRead);
+    }
     state.mask_written = false;
+    state.camera_written = false;
+    state.depth_written = false;
     if (reprojection) {
         constexpr vk::AccessFlags2 read_write =
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderStorageWrite;
@@ -623,6 +719,8 @@ void Passes::RecordDebug(vk::CommandBuffer cmdbuf, const DebugParams& params) {
         .near_plane = params.camera.near_plane,
         .far_plane = params.camera.far_plane,
         .motion_vector_scale = {params.motion_vector_scale_x, params.motion_vector_scale_y},
+        .stencil_bits = params.stencil_bits,
+        .components = PackComponents(params.components),
     };
     // Host images the selected view does not read are bound as null descriptors.
     Record(cmdbuf, state.debug, DebugBindings,
@@ -658,18 +756,33 @@ FsrImage Passes::CameraMotionVectors() const {
     return Describe(impl->camera_mv, false);
 }
 
+FsrImage Passes::DepthCopy() const {
+    return Describe(impl->depth_copy, false);
+}
+
 FsrImage Passes::Output() const {
     return Describe(impl->output, true);
 }
 
-u64 Passes::EstimateBytes(vk::Extent2D render_size, vk::Extent2D output_size, bool camera_motion) {
-    const u64 render_pixels = u64{render_size.width} * render_size.height;
-    const u64 output_pixels = u64{output_size.width} * output_size.height;
-    return 3 * render_pixels + 8 * output_pixels + (camera_motion ? 4 * render_pixels : 0);
+vk::ImageView Passes::CameraMotionView() const {
+    return *impl->camera_mv.view;
 }
 
-u64 Passes::EstimateFsr4Bytes(vk::Extent2D render_size, bool camera_motion) {
-    return camera_motion ? 4 * u64{render_size.width} * render_size.height : 0;
+vk::ImageView Passes::DepthCopyView() const {
+    return *impl->depth_copy.view;
+}
+
+u64 Passes::EstimateBytes(vk::Extent2D render_size, vk::Extent2D output_size, bool camera_motion,
+                          bool depth_copy) {
+    const u64 render_pixels = u64{render_size.width} * render_size.height;
+    const u64 output_pixels = u64{output_size.width} * output_size.height;
+    return 3 * render_pixels + 8 * output_pixels + (camera_motion ? 4 * render_pixels : 0) +
+           (depth_copy ? 4 * render_pixels : 0);
+}
+
+u64 Passes::EstimateFsr4Bytes(vk::Extent2D render_size, bool camera_motion, bool depth_copy) {
+    const u64 render_pixels = u64{render_size.width} * render_size.height;
+    return (camera_motion ? 4 * render_pixels : 0) + (depth_copy ? 4 * render_pixels : 0);
 }
 
 } // namespace Gr2Fsr3

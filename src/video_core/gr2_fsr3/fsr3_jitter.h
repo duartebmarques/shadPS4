@@ -7,10 +7,16 @@
 
 #include "common/types.h"
 
+namespace AmdGpu {
+struct Liverpool;
+}
+
 // Sub-pixel viewport jitter of the scene draws. A plan armed at one Antialias dispatch takes effect
 // after the next Composite draw, so only the scene draws of the next frame are jittered. The window
 // opens at the first draw into the scene depth-stencil image and closes at the next Antialias
-// dispatch. GPU command thread only.
+// dispatch. For Gravity Rush Remastered a plan armed at the FXAA draw takes effect at the next
+// StartFrame, and the draws depth-tested against the scene depth are jittered until the next FXAA
+// draw. GPU command thread only.
 namespace Gr2Fsr3::Jitter {
 
 /// Offset in render pixels: +x right, +y down.
@@ -25,6 +31,7 @@ struct FramePlan {
     Offset offset{};
     float lod_bias{};              ///< Added to the samplers of jittered draws; 0 adds nothing.
     VAddr scene_stencil_address{}; ///< Stencil plane of the scene depth-stencil image.
+    VAddr scene_depth_address{};   ///< Depth plane of the same image (Gravity Rush Remastered).
 };
 
 /// What the draws of a frame received, collected until the Antialias dispatch.
@@ -53,10 +60,21 @@ Offset PhaseOffset(s32 index, s32 phase_count);
 /// Sets the device maxSamplerLodBias, which bounds the negative LOD bias of jittered draws.
 void SetMaxLodBias(float max_lod_bias);
 
-/// Replaces the plan; it takes effect after the next Composite draw.
+/// Replaces the plan; it takes effect after the next Composite draw, or at the next StartFrame for
+/// Gravity Rush Remastered.
 void BeginFrame(const FramePlan& plan);
 
 /// Closes the window and returns what the draws since the last call received.
 FrameReport EndFrame();
+
+/// Takes the plan armed since the last call, or no plan when none was armed, and clears the
+/// report: a Gravity Rush Remastered frame starts here. Returns whether the frame is jittered.
+bool StartFrame();
+
+/// Whether a Gravity Rush Remastered draw is depth-tested against the scene depth at scene_depth.
+bool GrrEligible(const AmdGpu::Liverpool& liverpool, VAddr scene_depth);
+
+/// Decides whether a Gravity Rush Remastered draw receives the jitter of the frame.
+void OnGrrDraw(const AmdGpu::Liverpool& liverpool, u64 vertex_hash, bool is_indirect);
 
 } // namespace Gr2Fsr3::Jitter

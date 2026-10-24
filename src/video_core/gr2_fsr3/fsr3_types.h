@@ -51,7 +51,7 @@ enum class DepthSource : u8 {
 /// Pixels the store pass smooths with FXAA. The values are the fsr3Fxaa values.
 enum class Fxaa : u8 {
     Off,
-    Characters, ///< Pixels within one render pixel of a stencil 0x20 pixel.
+    Characters, ///< Pixels within one render pixel of a character in the stencil.
     Everything,
 };
 

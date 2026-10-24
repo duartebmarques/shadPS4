@@ -5,7 +5,8 @@
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_GOOGLE_include_directive : require
 
-// Reactive and transparency-and-composition masks for FSR from the Gravity Rush 2 scene stencil.
+// Reactive and transparency-and-composition masks for FSR from the scene stencil; the stencil bits
+// of the title are push constants.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -22,12 +23,10 @@ layout(push_constant) uniform MaskConstants {
     float tc_characters;
     uint flags;
     int outline_radius;
+    uint character_stencil;
+    uint geometry_stencil;
+    uint temporal_stencil;
 } pc;
-
-// Stencil bits of the game: geometry, temporal blend allowed, forward character (motion vector 0).
-const uint STENCIL_GEOMETRY = 0x01u;
-const uint STENCIL_TEMPORAL = 0x08u;
-const uint STENCIL_CHARACTER = 0x20u;
 
 const uint MASK_USE_HISTORY = 1u;
 const uint MASK_HISTORY_VALID = 2u;
@@ -40,8 +39,9 @@ void main() {
     }
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     const uint s = texelFetch(stencil_tex, p, 0).r;
-    const bool character = (s & STENCIL_CHARACTER) != 0u;
-    const bool effect = (s & STENCIL_GEOMETRY) != 0u && (s & STENCIL_TEMPORAL) == 0u && !character;
+    const bool character = (s & pc.character_stencil) != 0u;
+    const bool effect =
+        (s & pc.geometry_stencil) != 0u && (s & pc.temporal_stencil) == 0u && !character;
 
     // The character ink outlines carry the effect signature; they lie next to a character pixel.
     bool outline = false;
@@ -50,7 +50,8 @@ void main() {
         for (int y = -pc.outline_radius; y <= pc.outline_radius; ++y) {
             for (int x = -pc.outline_radius; x <= pc.outline_radius; ++x) {
                 const ivec2 q = clamp(p + ivec2(x, y), ivec2(0), last);
-                outline = outline || (texelFetch(stencil_tex, q, 0).r & STENCIL_CHARACTER) != 0u;
+                outline = outline ||
+                          (texelFetch(stencil_tex, q, 0).r & pc.character_stencil) != 0u;
             }
         }
     }

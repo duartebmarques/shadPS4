@@ -108,6 +108,11 @@ struct FrameImages {
     GuestImage output;     ///< Storage view.
 };
 
+/// Whether guest memory can be read in place: it is mapped and holds no GPU write. Memory that
+/// holds one is stale, and with precise readbacks a read of it faults into a readback that submits
+/// the open batch.
+bool IsGuestReadable(Vulkan::Rasterizer& rasterizer, VAddr address, u64 size);
+
 /// Summary of one Antialias dispatch for the log.
 struct FrameLog {
     u64 frame{};

@@ -125,6 +125,7 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
     gr2_fsr3_add_shader(fsr3_fallback.comp fsr3_fallback_comp)
     gr2_fsr3_add_shader(fsr3_debug.comp fsr3_debug_comp)
     gr2_fsr3_add_shader(fsr4_inputs.comp fsr4_inputs_comp)
+    gr2_fsr3_add_shader(grr_camera_motion.comp grr_camera_motion_comp)
     add_custom_target(gr2_fsr3_shaders
         DEPENDS ${GR2_FSR3_SHADER_HEADERS}
         SOURCES
@@ -134,7 +135,8 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
             ${GR2_FSR3_DIR}/shaders/fsr3_mask.comp
             ${GR2_FSR3_DIR}/shaders/fsr3_mvcopy.comp
             ${GR2_FSR3_DIR}/shaders/fsr3_store.comp
-            ${GR2_FSR3_DIR}/shaders/fsr4_inputs.comp)
+            ${GR2_FSR3_DIR}/shaders/fsr4_inputs.comp
+            ${GR2_FSR3_DIR}/shaders/grr_camera_motion.comp)
 
     # vk_trampolines.cpp defines the Vulkan commands that the FidelityFX libraries and the FSR 4 v07
     # provider call.
@@ -161,6 +163,11 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
         ${GR2_FSR3_DIR}/fsr_worker.h
         ${GR2_FSR3_DIR}/gr2_fsr3.cpp
         ${GR2_FSR3_DIR}/gr2_fsr3.h
+        ${GR2_FSR3_DIR}/grr_capture.cpp
+        ${GR2_FSR3_DIR}/grr_capture.h
+        ${GR2_FSR3_DIR}/grr_fsr3.cpp
+        ${GR2_FSR3_DIR}/grr_survey.cpp
+        ${GR2_FSR3_DIR}/grr_survey.h
         ${GR2_FSR3_DIR}/vk_trampolines.cpp)
     target_include_directories(shadps4 PRIVATE ${GR2_FSR3_SHADER_INCLUDE})
     add_dependencies(shadps4 gr2_fsr3_shaders)

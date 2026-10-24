@@ -9,15 +9,17 @@
 #include "common/types.h"
 #include "video_core/gr2_fsr3/fsr3_types.h"
 
-// The fsr3* and fsr4* keys of the "GR2Fork" section, read from custom_configs/<serial>.json first
-// and config.json second. The values live in atomics: the GPU command thread takes snapshots while
-// the menu edits them.
+// The fsr3*, fsr4* and grrFsr* keys of the "GR2Fork" section, read from
+// custom_configs/<serial>.json first and config.json second. The values live in atomics: the GPU
+// command thread takes snapshots while the menu edits them.
 namespace Gr2Fsr3::Settings {
 
-/// One copy of every fsr3* and fsr4* key but fsr4AssetDir. Percentages are integers in [0, 100].
+/// One copy of every key but fsr4AssetDir. Percentages are integers in [0, 100].
 struct Values {
     bool enable{false};
     bool fsr4_enable{false};
+    bool grr_enable{false};
+    bool grr_fsr4_enable{false};
     Fsr4Model fsr4_model{Fsr4Model::Auto};
     s32 sharpness{0};
     Fxaa fxaa{Fxaa::Off};

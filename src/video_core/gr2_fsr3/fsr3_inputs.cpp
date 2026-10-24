@@ -39,13 +39,6 @@ constexpr float CutFovDelta = 0.35f;
 constexpr float RepeatMotion = 1e-3f;
 constexpr size_t MaxLoggedRenderSizes = 16;
 
-// Guest memory is read in place only where it is mapped and holds no GPU write: there it is
-// stale, and with precise readbacks a read faults into a readback that submits the open batch.
-bool IsGuestReadable(Vulkan::Rasterizer& rasterizer, VAddr address, u64 size) {
-    return rasterizer.IsMapped(address, size) &&
-           !rasterizer.GetBufferCache().IsRegionGpuModified(address, size);
-}
-
 void LogImages(const Shader::Info& info, Common::Log::Level level) {
     for (size_t index = 0; index < info.images.size(); ++index) {
         const Shader::ImageResource& res = info.images[index];
@@ -59,6 +52,11 @@ void LogImages(const Shader::Info& info, Common::Log::Level level) {
 }
 
 } // namespace
+
+bool IsGuestReadable(Vulkan::Rasterizer& rasterizer, VAddr address, u64 size) {
+    return rasterizer.IsMapped(address, size) &&
+           !rasterizer.GetBufferCache().IsRegionGpuModified(address, size);
+}
 
 struct Inputs::Impl {
     VelocityCapture capture;

@@ -19,7 +19,11 @@ class Scheduler;
 
 namespace Gr2Fsr3 {
 
-/// Inputs of the mask pass. The values are fractions in [0, 1].
+/**
+ * Inputs of the mask pass. The values are fractions in [0, 1]. The stencil defaults are the
+ * Gravity Rush 2 bits: forward characters, drawn geometry, temporal blend allowed. A zero geometry
+ * bit leaves the effect and outline terms out.
+ */
 struct MaskParams {
     vk::ImageView stencil{};
     vk::Extent2D render_size{};
@@ -28,6 +32,9 @@ struct MaskParams {
     float reactive_outline{};
     float tc_characters{};
     bool character_history{}; ///< Pixels the characters covered in the previous frame count too.
+    u32 character_stencil{0x20};
+    u32 geometry_stencil{0x01};
+    u32 temporal_stencil{0x08};
 };
 
 /// Inputs of the camera-motion pass, which gives stencil 0x20 pixels the motion of the camera.
@@ -40,7 +47,19 @@ struct CameraMotionParams {
     std::array<float, 4> inverse_view{}; ///< Velocity constant buffer dwords 16-19.
 };
 
-/// Inputs of the store pass, which writes the FSR output into the guest history image.
+/// Inputs of the Gravity Rush Remastered camera-motion pass, which writes camera motion vectors
+/// in render pixels and an R32F copy of the scene depth.
+struct GrrCameraMotionParams {
+    vk::ImageView depth{}; ///< Depth-aspect view of the scene depth.
+    vk::Extent2D render_size{};
+    std::array<std::array<float, 4>, 3> scene{}; ///< Columns x, y, w of the reprojection.
+    std::array<std::array<float, 4>, 3> sky{};   ///< The same without the camera translation.
+    float jitter_x{};
+    float jitter_y{};
+};
+
+/// Inputs of the store pass, which writes the FSR output into the guest image of the replaced
+/// pass.
 struct StoreParams {
     vk::ImageView destination{};
     vk::Extent2D output_size{};
@@ -50,6 +69,9 @@ struct StoreParams {
     Fxaa fxaa{Fxaa::Off};    ///< RCAS skips the pixels FXAA smooths.
     vk::ImageView stencil{}; ///< Stencil-aspect view; only Fxaa::Characters reads it.
     vk::Extent2D render_size{};
+    u32 character_stencil{0x20};              ///< Stencil bit Fxaa::Characters looks for.
+    std::array<u8, 4> components{0, 1, 2, 3}; ///< Source component of each target component.
+    bool alpha_one{};                         ///< Alpha 1 instead of the luma of the colour.
 };
 
 /// Inputs of the FSR 4 inputs pass, which copies the FSR 4 inputs of a frame into the images of
@@ -63,6 +85,7 @@ struct Fsr4InputsParams {
     float near_plane{};
     float far_plane{};
     bool camera_motion{};  ///< The camera-motion image of this frame replaces motion_vectors.
+    bool host_depth{};     ///< The depth copy of the camera-motion pass replaces depth.
     bool encode_srgb{};    ///< Writes sRGB-encoded colour.
     bool depth_inverted{}; ///< Writes 1 - depth.
     bool depth_linear{};   ///< Writes the distance from the camera.
@@ -91,6 +114,8 @@ struct DebugParams {
     CameraParams camera{};
     float motion_vector_scale_x{};
     float motion_vector_scale_y{};
+    std::array<u32, 3> stencil_bits{0x08, 0x20, 0x40}; ///< Stencil bits shown in red, green, blue.
+    std::array<u8, 4> components{0, 1, 2, 3};          ///< Source of each destination component.
 };
 
 /**
@@ -112,20 +137,26 @@ public:
     /// Builds the FSR 4 inputs pass on first use. Returns whether it exists.
     bool InitFsr4();
 
+    /// Builds the Gravity Rush Remastered camera-motion pass on first use. Returns whether it
+    /// exists.
+    bool InitGrr();
+
     /// Sizes the host images. An image whose size changes is destroyed once the GPU passes the
     /// current tick.
     void Resize(Vulkan::Scheduler& scheduler, vk::Extent2D render_size, vk::Extent2D output_size,
-                bool camera_motion, bool debug_history);
+                bool camera_motion, bool debug_history, bool depth_copy = false);
 
-    /// Sizes the host images for an FSR 4 frame: only the camera-motion image remains, when the
-    /// camera-motion pass runs.
-    void ResizeFsr4(Vulkan::Scheduler& scheduler, vk::Extent2D render_size, bool camera_motion);
+    /// Sizes the host images for an FSR 4 frame: only the camera-motion image and the depth copy
+    /// remain, when the camera-motion pass runs and writes them.
+    void ResizeFsr4(Vulkan::Scheduler& scheduler, vk::Extent2D render_size, bool camera_motion,
+                    bool depth_copy = false);
 
     /// The previous-frame character mask and the reprojection history start empty again.
     void ResetHistory();
 
     void RecordMask(vk::CommandBuffer cmdbuf, const MaskParams& params);
     void RecordCameraMotion(vk::CommandBuffer cmdbuf, const CameraMotionParams& params);
+    void RecordGrrCameraMotion(vk::CommandBuffer cmdbuf, const GrrCameraMotionParams& params);
 
     /// Makes the mask and camera-motion writes of the frame visible to FSR and readies the output.
     void PrepareFsr(vk::CommandBuffer cmdbuf);
@@ -138,14 +169,18 @@ public:
     FsrImage ReactiveMask() const;
     FsrImage TransparencyMask() const;
     FsrImage CameraMotionVectors() const;
+    FsrImage DepthCopy() const;
     FsrImage Output() const;
+    vk::ImageView CameraMotionView() const;
+    vk::ImageView DepthCopyView() const;
 
     /// Device memory of the host images for these sizes.
-    static u64 EstimateBytes(vk::Extent2D render_size, vk::Extent2D output_size,
-                             bool camera_motion);
+    static u64 EstimateBytes(vk::Extent2D render_size, vk::Extent2D output_size, bool camera_motion,
+                             bool depth_copy = false);
 
     /// Device memory of the host images of an FSR 4 frame.
-    static u64 EstimateFsr4Bytes(vk::Extent2D render_size, bool camera_motion);
+    static u64 EstimateFsr4Bytes(vk::Extent2D render_size, bool camera_motion,
+                                 bool depth_copy = false);
 
 private:
     struct Impl;

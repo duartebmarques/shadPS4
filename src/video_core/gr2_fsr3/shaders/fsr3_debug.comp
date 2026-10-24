@@ -5,8 +5,8 @@
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_GOOGLE_include_directive : require
 
-// Diagnostic views of the FSR inputs, written into the guest history image in place of the
-// antialias result. Each output pixel shows the nearest render pixel.
+// Diagnostic views of the FSR inputs, written into the guest image of the replaced pass in its
+// component order. Each output pixel shows the nearest render pixel.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -30,6 +30,10 @@ layout(push_constant) uniform DebugConstants {
     float near_plane;
     float far_plane;
     vec2 mv_scale;
+    uint stencil_red;
+    uint stencil_green;
+    uint stencil_blue;
+    uint components;
 } pc;
 
 // fsr3Debug values.
@@ -42,10 +46,6 @@ const uint VIEW_REPROJECTION = 5u;
 const uint DEBUG_HISTORY_VALID = 1u;
 const uint DEBUG_DEPTH_COPY = 2u;
 const uint DEBUG_DEPTH_MAIN = 4u;
-
-const uint STENCIL_TEMPORAL = 0x08u;
-const uint STENCIL_CHARACTER = 0x20u;
-const uint STENCIL_OBJECT_MOTION = 0x40u;
 
 #include "fsr3_color.glsl"
 
@@ -71,8 +71,8 @@ vec3 MotionVectorView(ivec2 q) {
 
 vec3 StencilView(ivec2 q) {
     const uint s = texelFetch(stencil_tex, q, 0).r;
-    return vec3((s & STENCIL_TEMPORAL) != 0u, (s & STENCIL_CHARACTER) != 0u,
-                (s & STENCIL_OBJECT_MOTION) != 0u);
+    return vec3((s & pc.stencil_red) != 0u, (s & pc.stencil_green) != 0u,
+                (s & pc.stencil_blue) != 0u);
 }
 
 // Grey for the copied depth, or the main depth when only that is bound; red where both are bound
@@ -134,5 +134,6 @@ void main() {
     default:
         break;
     }
-    imageStore(dst, ivec2(gl_GlobalInvocationID.xy), vec4(Fsr3SrgbEncode(color), 1.0));
+    imageStore(dst, ivec2(gl_GlobalInvocationID.xy),
+               Fsr3Reorder(vec4(Fsr3SrgbEncode(color), 1.0), pc.components));
 }

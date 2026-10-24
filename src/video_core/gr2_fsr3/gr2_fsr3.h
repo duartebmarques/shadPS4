@@ -20,9 +20,10 @@ class GraphicsPipeline;
 class Rasterizer;
 } // namespace Vulkan
 
-// FSR 3.1 and FSR 4 (INT8, experimental) temporal upscaling for Gravity Rush 2. Every function runs
-// on the GPU command thread except DrawMenu, which runs on the ImGui thread. For other titles a
-// call costs one load and a branch.
+// FSR 3.1 and FSR 4 (INT8, experimental) temporal upscaling for Gravity Rush 2, and the same
+// upscalers as anti-aliasing for Gravity Rush Remastered. Every function runs on the GPU command
+// thread except DrawMenu, which runs on the ImGui thread. For other titles a call costs one load
+// and a few compares.
 namespace Gr2Fsr3 {
 
 #ifdef ENABLE_GR2_FSR3
@@ -35,7 +36,8 @@ namespace Detail {
 enum class TitleState : u8 {
     Unresolved,
     Inactive,
-    Active,
+    Gr2,
+    Grr,
 };
 
 extern TitleState g_title_state;
@@ -44,18 +46,22 @@ extern float g_jitter_x;
 extern float g_jitter_y;
 extern float g_lod_bias;
 
-bool ResolveTitle();
+TitleState ResolveTitle();
 bool OnDispatchActive(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                       Vulkan::Rasterizer& rasterizer);
 void OnDrawActive(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::Liverpool& liverpool,
                   bool is_indirect);
 void AdjustSamplerActive(AmdGpu::Sampler& ssharp, const Shader::Info& stage);
+void OnGrrDispatch(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
+                   Vulkan::Rasterizer& rasterizer);
+bool OnGrrDraw(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::Liverpool& liverpool,
+               Vulkan::Rasterizer& rasterizer, bool is_indirect);
 
-inline bool IsActive() {
+inline TitleState Title() {
     if (g_title_state == TitleState::Unresolved) [[unlikely]] {
         return ResolveTitle();
     }
-    return g_title_state == TitleState::Active;
+    return g_title_state;
 }
 
 } // namespace Detail
@@ -63,14 +69,29 @@ inline bool IsActive() {
 /// Observes or replaces a direct compute dispatch. Returns true when the guest dispatch is skipped.
 inline bool OnDispatch(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                        Vulkan::Rasterizer& rasterizer) {
-    return Detail::IsActive() && Detail::OnDispatchActive(info, cs_program, rasterizer);
+    switch (Detail::Title()) {
+    case Detail::TitleState::Gr2:
+        return Detail::OnDispatchActive(info, cs_program, rasterizer);
+    case Detail::TitleState::Grr:
+        Detail::OnGrrDispatch(info, cs_program, rasterizer);
+        return false;
+    default:
+        return false;
+    }
 }
 
-/// Decides whether the draw being set up receives the sub-pixel jitter of the frame.
-inline void OnDraw(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::Liverpool& liverpool,
-                   bool is_indirect) {
-    if (Detail::IsActive()) {
+/// Decides whether the draw being set up receives the sub-pixel jitter of the frame, and records
+/// the module's replacement of a draw it takes over. Returns true when the guest draw is skipped.
+inline bool OnDraw(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::Liverpool& liverpool,
+                   Vulkan::Rasterizer& rasterizer, bool is_indirect) {
+    switch (Detail::Title()) {
+    case Detail::TitleState::Gr2:
         Detail::OnDrawActive(pipeline, liverpool, is_indirect);
+        return false;
+    case Detail::TitleState::Grr:
+        return Detail::OnGrrDraw(pipeline, liverpool, rasterizer, is_indirect);
+    default:
+        return false;
     }
 }
 
@@ -94,7 +115,7 @@ inline void AdjustSampler(AmdGpu::Sampler& ssharp, const Shader::Info& stage) {
     }
 }
 
-/// Draws the "FSR 3.1 (GR2)" submenu of the Display menu.
+/// Draws the "FSR 3.1 (GR2)" or "FSR 3.1 (GRR)" submenu of the Display menu.
 void DrawMenu();
 
 #else
@@ -103,7 +124,10 @@ inline bool OnDispatch(const Shader::Info&, const AmdGpu::ComputeProgram&, Vulka
     return false;
 }
 
-inline void OnDraw(const Vulkan::GraphicsPipeline&, const AmdGpu::Liverpool&, bool) {}
+inline bool OnDraw(const Vulkan::GraphicsPipeline&, const AmdGpu::Liverpool&, Vulkan::Rasterizer&,
+                   bool) {
+    return false;
+}
 
 inline void JitterViewport(float&, float&) {}
 

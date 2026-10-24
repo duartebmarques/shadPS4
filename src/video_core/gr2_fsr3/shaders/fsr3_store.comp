@@ -7,9 +7,10 @@
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_ARB_shading_language_420pack : enable
 
-// Writes the FSR output into the guest history image as the Gravity Rush 2 antialias pass writes
-// it: sRGB-encoded colour with the luma of the linear colour in alpha. FXAA smooths the edges near
-// characters or everywhere and FSR 1 RCAS sharpens the other pixels, each when enabled.
+// Writes the FSR output into the guest image of the replaced pass: sRGB-encoded colour in the
+// component order of the target, alpha the luma of the linear colour (the Gravity Rush 2 antialias
+// pass) or 1 (the Gravity Rush Remastered FXAA pass). FXAA smooths the edges near characters or
+// everywhere and FSR 1 RCAS sharpens the other pixels, each when enabled.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -23,14 +24,15 @@ layout(push_constant) uniform StoreConstants {
     float rcas_stops;
     uint flags;
     uvec2 render_size;
+    uint character_stencil;
+    uint components;
 } pc;
 
 const uint STORE_RCAS = 1u;
 const uint STORE_LINEAR_INPUT = 2u;
 const uint STORE_FXAA = 4u;
 const uint STORE_FXAA_CHARACTERS = 8u;
-
-const uint STENCIL_CHARACTER = 0x20u;
+const uint STORE_ALPHA_ONE = 16u;
 
 // FXAA edge thresholds in luma of the gamma-encoded colour, and the strength of its subpixel blend.
 const float FXAA_EDGE_THRESHOLD = 0.125;
@@ -53,14 +55,14 @@ void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
 
 #include "fsr3_color.glsl"
 
-// Whether a forward character covers the render pixel of output pixel p or one of its neighbours.
+// Whether a character covers the render pixel of output pixel p or one of its neighbours.
 bool NearCharacter(uvec2 p) {
     const ivec2 q = ivec2(p * pc.render_size / pc.size);
     const ivec2 last = ivec2(pc.render_size) - 1;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             const ivec2 r = clamp(q + ivec2(x, y), ivec2(0), last);
-            if ((texelFetch(stencil_tex, r, 0).r & STENCIL_CHARACTER) != 0u) {
+            if ((texelFetch(stencil_tex, r, 0).r & pc.character_stencil) != 0u) {
                 return true;
             }
         }
@@ -185,5 +187,6 @@ void main() {
     const bool linear_input = (pc.flags & STORE_LINEAR_INPUT) != 0u;
     const vec3 encoded = linear_input ? Fsr3SrgbEncode(c) : c;
     const vec3 linear_color = linear_input ? c : Fsr3SrgbDecode(c);
-    imageStore(dst, p, vec4(encoded, Fsr3Luma(linear_color)));
+    const float alpha = (pc.flags & STORE_ALPHA_ONE) != 0u ? 1.0 : Fsr3Luma(linear_color);
+    imageStore(dst, p, Fsr3Reorder(vec4(encoded, alpha), pc.components));
 }

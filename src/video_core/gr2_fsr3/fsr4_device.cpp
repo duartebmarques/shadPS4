@@ -29,7 +29,12 @@ void ExtendDevice(vk::PhysicalDevice physical_device, vk::DeviceCreateInfo& crea
                   vk::PhysicalDeviceFeatures2& features, vk::PhysicalDeviceVulkan11Features& vk11,
                   vk::PhysicalDeviceVulkan12Features& vk12,
                   vk::PhysicalDeviceVulkan13Features& vk13) {
-    if (!Common::IsGravityRush2() || !Settings::Snapshot().fsr4_enable) {
+    const bool gr2 = Common::IsGravityRush2();
+    if (!gr2 && !Common::IsGravityRushRemastered()) {
+        return;
+    }
+    const Settings::Values settings = Settings::Snapshot();
+    if (!(gr2 ? settings.fsr4_enable : settings.grr_fsr4_enable)) {
         return;
     }
     const auto supported =

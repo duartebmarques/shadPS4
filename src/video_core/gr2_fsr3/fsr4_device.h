@@ -39,10 +39,10 @@ void ExtendDevice(vk::PhysicalDevice physical_device, vk::DeviceCreateInfo& crea
                   vk::PhysicalDeviceVulkan13Features& vk13);
 
 /**
- * For Gravity Rush 2 with fsr4Enable set, enables the supported features and the
- * VK_KHR_compute_shader_derivatives extension that FSR 4 v07 shaders can declare, and records the
- * features the device is created with. Call after the last change to the chain, right before the
- * device is created.
+ * For Gravity Rush 2 with fsr4Enable or Gravity Rush Remastered with grrFsr4Enable set, enables
+ * the supported features and the VK_KHR_compute_shader_derivatives extension that FSR 4 v07
+ * shaders can declare, and records the features the device is created with. Call after the last
+ * change to the chain, right before the device is created.
  */
 template <typename... Chain>
 void ExtendDevice(vk::PhysicalDevice physical_device, vk::StructureChain<Chain...>& chain) {
@@ -52,7 +52,7 @@ void ExtendDevice(vk::PhysicalDevice physical_device, vk::StructureChain<Chain..
                  chain.template get<vk::PhysicalDeviceVulkan13Features>());
 }
 
-/// The features ExtendDevice recorded; empty unless it ran for Gravity Rush 2 with fsr4Enable set.
+/// The features ExtendDevice recorded; empty unless it ran for one of the titles with its key set.
 std::optional<Fsr4DeviceFeatures> Fsr4EnabledFeatures();
 
 #else

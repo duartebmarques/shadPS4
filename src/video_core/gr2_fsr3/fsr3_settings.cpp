@@ -83,6 +83,8 @@ constexpr auto TestBitLabels = std::to_array<std::pair<const char*, u32>>({
 
 std::atomic<u32> g_enable{};
 std::atomic<u32> g_fsr4_enable{};
+std::atomic<u32> g_grr_enable{};
+std::atomic<u32> g_grr_fsr4_enable{};
 std::atomic<u32> g_fsr4_model{};
 std::atomic<u32> g_sharpness{};
 std::atomic<u32> g_fxaa{};
@@ -105,6 +107,8 @@ std::atomic<u32> g_test{};
 constexpr auto Keys = std::to_array<Key>({
     {"fsr3Enable", Type::Bool, &g_enable, Defaults.enable},
     {"fsr4Enable", Type::Bool, &g_fsr4_enable, Defaults.fsr4_enable},
+    {"grrFsr3Enable", Type::Bool, &g_grr_enable, Defaults.grr_enable},
+    {"grrFsr4Enable", Type::Bool, &g_grr_fsr4_enable, Defaults.grr_fsr4_enable},
     {"fsr4Model", Type::Name, &g_fsr4_model, static_cast<u32>(Defaults.fsr4_model), Fsr4ModelNames},
     {"fsr3Sharpness", Type::Percent, &g_sharpness, Defaults.sharpness},
     {"fsr3Fxaa", Type::Index, &g_fxaa, static_cast<u32>(Defaults.fxaa), FxaaNames},
@@ -344,6 +348,8 @@ Settings::Values Settings::Snapshot() {
     return {
         .enable = load(g_enable) != 0,
         .fsr4_enable = load(g_fsr4_enable) != 0,
+        .grr_enable = load(g_grr_enable) != 0,
+        .grr_fsr4_enable = load(g_grr_fsr4_enable) != 0,
         .fsr4_model = static_cast<Fsr4Model>(load(g_fsr4_model)),
         .sharpness = static_cast<s32>(load(g_sharpness)),
         .fxaa = static_cast<Fxaa>(load(g_fxaa)),
@@ -394,26 +400,35 @@ bool Settings::Save() {
 
 void DrawMenu() {
     static const bool is_gr2 = Common::IsGravityRush2();
-    if (!is_gr2 || !ImGui::BeginMenu("FSR 3.1 (GR2)")) {
+    static const bool is_grr = Common::IsGravityRushRemastered();
+    if (!(is_gr2 || is_grr) || !ImGui::BeginMenu(is_gr2 ? "FSR 3.1 (GR2)" : "FSR 3.1 (GRR)")) {
         return;
     }
     std::call_once(g_load_once, LoadFiles);
-    EditBool("Enable FSR 3.1", g_enable);
-    EditBool("Enable FSR 4 (INT8, experimental)", g_fsr4_enable);
+    EditBool("Enable FSR 3.1", is_gr2 ? g_enable : g_grr_enable);
+    EditBool("Enable FSR 4 (INT8, experimental)", is_gr2 ? g_fsr4_enable : g_grr_fsr4_enable);
     EditChoice("FSR 4 model", g_fsr4_model, Fsr4ModelNames);
     EditPercent("Sharpness", g_sharpness);
     EditChoice("FXAA", g_fxaa, FxaaNames);
     EditPercent("Reactive characters", g_reactive_characters);
-    EditPercent("Reactive effects", g_reactive_effects);
-    EditPercent("Reactive outlines", g_reactive_outline);
+    if (is_gr2) {
+        EditPercent("Reactive effects", g_reactive_effects);
+        EditPercent("Reactive outlines", g_reactive_outline);
+    }
     EditPercent("T&C characters", g_tc_characters);
-    EditBool("Character camera motion", g_character_camera_motion);
+    if (is_gr2) {
+        EditBool("Character camera motion", g_character_camera_motion);
+    }
     EditChoice("Colour space", g_color_space, ColorSpaceNames);
-    EditChoice("Depth source", g_depth_source, DepthSourceNames);
-    EditBool("Texture LOD bias", g_lod_bias);
-    EditChoice("Extra LOD bias", g_lod_bias_extra, LodBiasExtraNames);
+    if (is_gr2) {
+        EditChoice("Depth source", g_depth_source, DepthSourceNames);
+        EditBool("Texture LOD bias", g_lod_bias);
+        EditChoice("Extra LOD bias", g_lod_bias_extra, LodBiasExtraNames);
+    }
     EditBool("FP32 shaders", g_fp32);
-    EditBool("EASU fallback", g_fallback_easu);
+    if (is_gr2) {
+        EditBool("EASU fallback", g_fallback_easu);
+    }
     EditChoice("Debug view", g_debug, DebugViewNames);
     EditBool("Validation", g_validate);
     EditBool("Periodic log", g_log);

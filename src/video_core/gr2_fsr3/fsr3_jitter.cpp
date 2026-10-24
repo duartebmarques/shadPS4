@@ -47,6 +47,16 @@ float Halton(s32 index, s32 base) {
     return result;
 }
 
+void AddVertexHash(u64 vs_hash) {
+    auto& hashes = g_report.vertex_hashes;
+    const u32 count = g_report.num_vertex_hashes;
+    if (count < hashes.size() &&
+        !std::ranges::contains(hashes.begin(), hashes.begin() + count, vs_hash)) {
+        hashes[count] = vs_hash;
+        ++g_report.num_vertex_hashes;
+    }
+}
+
 } // namespace
 
 namespace Jitter {
@@ -84,6 +94,44 @@ FrameReport EndFrame() {
         report.applied = g_plan.offset;
     }
     return report;
+}
+
+bool StartFrame() {
+    g_plan = std::exchange(g_has_pending, false) ? g_pending : FramePlan{};
+    g_armed = g_plan.enabled;
+    g_window_open = false;
+    g_report = {};
+    Detail::g_jitter_x = g_plan.offset.x;
+    Detail::g_jitter_y = g_plan.offset.y;
+    Detail::g_lod_bias = g_plan.lod_bias;
+    return g_armed;
+}
+
+bool GrrEligible(const AmdGpu::Liverpool& liverpool, VAddr scene_depth) {
+    const auto& regs = liverpool.regs;
+    const auto& db = regs.depth_buffer;
+    return db.DepthValid() && db.DepthAddress() == scene_depth && regs.depth_control.depth_enable &&
+           regs.depth_control.depth_func != AmdGpu::CompareFunc::Always && !regs.IsClipDisabled();
+}
+
+void OnGrrDraw(const AmdGpu::Liverpool& liverpool, u64 vertex_hash, bool is_indirect) {
+    Detail::g_draw_jittered = false;
+    if (!g_armed || !GrrEligible(liverpool, g_plan.scene_depth_address)) {
+        return;
+    }
+    if (!g_window_open) {
+        g_window_open = true;
+        g_report.window_opened = true;
+        if (!std::exchange(g_window_logged, true)) {
+            LOG_INFO(Render_Vulkan, "GRR FSR: jitter window opens at depth {:#x}",
+                     g_plan.scene_depth_address);
+        }
+    }
+    ++g_report.eligible_draws;
+    g_report.indirect_draws += is_indirect;
+    Detail::g_draw_jittered = true;
+    ++g_report.jittered_draws;
+    AddVertexHash(vertex_hash);
 }
 
 } // namespace Jitter
@@ -152,13 +200,7 @@ void OnDrawActive(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::Liverp
     }
     g_draw_jittered = true;
     ++g_report.jittered_draws;
-    auto& hashes = g_report.vertex_hashes;
-    const u32 count = g_report.num_vertex_hashes;
-    if (count < hashes.size() &&
-        !std::ranges::contains(hashes.begin(), hashes.begin() + count, vs_hash)) {
-        hashes[count] = vs_hash;
-        ++g_report.num_vertex_hashes;
-    }
+    AddVertexHash(vs_hash);
 }
 
 void AdjustSamplerActive(AmdGpu::Sampler& ssharp, const Shader::Info& stage) {

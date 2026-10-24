@@ -742,14 +742,18 @@ namespace Detail {
 
 TitleState g_title_state{TitleState::Unresolved};
 
-bool ResolveTitle() {
-    const bool active = Common::IsGravityRush2();
-    g_title_state = active ? TitleState::Active : TitleState::Inactive;
-    if (active) {
+TitleState ResolveTitle() {
+    if (Common::IsGravityRush2()) {
+        g_title_state = TitleState::Gr2;
         LOG_INFO(Render_Vulkan, "GR2 FSR3: active for {}",
                  Common::ElfInfo::Instance().GameSerial());
+    } else if (Common::IsGravityRushRemastered()) {
+        g_title_state = TitleState::Grr;
+        LOG_INFO(Render_Vulkan, "GRR FSR: active for {}", Common::ElfInfo::Instance().GameSerial());
+    } else {
+        g_title_state = TitleState::Inactive;
     }
-    return active;
+    return g_title_state;
 }
 
 bool OnDispatchActive(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
