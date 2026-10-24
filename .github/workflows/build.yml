@@ -431,10 +431,15 @@ jobs:
     - name: Download PGO profile
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: gh release download pgo-profile -R ${{ github.repository }} -p shadps4.profdata -D $RUNNER_TEMP
+      # Named after its hash: ccache does not hash the profile, so a new one must change the flags.
+      run: |
+        gh release download pgo-profile -R ${{ github.repository }} -p shadps4.profdata -D $RUNNER_TEMP
+        p=$RUNNER_TEMP/shadps4-$(sha256sum $RUNNER_TEMP/shadps4.profdata | cut -c1-16).profdata
+        mv $RUNNER_TEMP/shadps4.profdata $p
+        echo "PGO_PROFILE=$p" >> $GITHUB_ENV
 
     - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-use=${{ runner.temp }}/shadps4.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_CXX_FLAGS="-fprofile-instr-use=${{ runner.temp }}/shadps4.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-use=${{ env.PGO_PROFILE }} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_CXX_FLAGS="-fprofile-instr-use=${{ env.PGO_PROFILE }} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
