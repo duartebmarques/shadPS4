@@ -21,6 +21,10 @@ Once, while a game runs: press **...** > Performance, turn on *Use per-game prof
 GPU clock* to **1600 MHz**, and turn the frame limit **off**. In the game, set the frame rate option
 to **30fps limit**.
 
+**Important:** after every game start, turn *Manual GPU clock* off and on again. A Steam bug
+([SteamOS#2586](https://github.com/ValveSoftware/SteamOS/issues/2586)) leaves the GPU unlocked
+although the menu shows 1600 MHz, and the game can drop under 10 fps.
+
 Already installed (any version)? Run the one-line install again, or `./shadPS4.sh --update` in the
 app folder. Saves, controls and patch choices are kept.
 
