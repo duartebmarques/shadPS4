@@ -1526,6 +1526,24 @@ if (NOT MSVC)
     target_compile_options(shadps4 PRIVATE -Wno-invalid-offsetof)
 endif()
 
+# Codegen items for the Linux and Windows builds; macOS keeps upstream's defaults.
+if (NOT APPLE)
+    # Many small XXH3 calls per draw (user data words per stage, per-sharp specialization
+    # fingerprints, sampler keys, image hashes) each pay a cross-library call and a length
+    # dispatch while xxhash is linked as a plain C library. XXH_INLINE_ALL gives every
+    # translation unit a private inlined copy with internal linkage; the library stays linked
+    # for the externals and the hash values do not change.
+    target_compile_definitions(shadps4 PRIVATE XXH_INLINE_ALL)
+    # The toolchains emit stack-protector canaries by default, and they sit in most hot
+    # video_core prologues and epilogues at 0.3-0.6% of the GPU command thread. Hardening is
+    # traded for that time. clang-cl takes the MSVC spelling.
+    if (MSVC)
+        target_compile_options(shadps4 PRIVATE /GS-)
+    else()
+        target_compile_options(shadps4 PRIVATE -fno-stack-protector)
+    endif()
+endif()
+
 add_compile_definitions(BOOST_ASIO_STANDALONE)
 
 target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
