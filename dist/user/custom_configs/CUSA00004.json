@@ -15,6 +15,6 @@
     "readbacks_mode": 1,
     "ring_drain_flush_draws": 0,
     "stream_copy_workers": 0,
-    "tick_query_interval_us": 10
+    "tick_query_interval_us": 100
   }
 }
