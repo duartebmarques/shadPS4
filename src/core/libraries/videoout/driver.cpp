@@ -559,6 +559,10 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 void VideoOutDriver::SetFlipRate(VideoOutPort* port, s32 rate) {
     const bool changed = port->flip_rate != rate;
     port->flip_rate = rate;
+    if (changed) {
+        LOG_INFO(Lib_VideoOut, "Flip rate {} (pacing {})", rate,
+                 present_pacing != 0 && EmulatorSettings.GetFrameCap() == 0 ? "on" : "off");
+    }
     if (!changed || present_pacing == 0 || EmulatorSettings.GetFrameCap() != 0) {
         return;
     }

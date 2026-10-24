@@ -332,9 +332,22 @@ play() {
     run_emu "$game" "$@"
 }
 
+# Copies the saves to user/save-backups/<date> before each run (unchanged saves are not copied
+# again) and keeps the last 20, so an overwritten save can be put back.
+backup_saves() {
+    local src="$U/home/1000/savedata" dir="$U/save-backups" last
+    [ -d "$src" ] || return 0
+    mkdir -p "$dir"
+    last="$(ls -1d "$dir"/*/ 2>/dev/null | tail -1 || true)"
+    [ -n "$last" ] && diff -rq "$src" "$last" >/dev/null 2>&1 && return 0
+    cp -a "$src" "$dir/$(date +%Y-%m-%d_%H%M%S)" || { warn "save backup failed"; return 0; }
+    ls -1d "$dir"/*/ | head -n -20 | xargs -r rm -rf
+}
+
 # An executable user/session-hook (optional, e.g. a play recorder) is started detached for each run,
 # as its own systemd user unit where possible: Steam kills everything under the game when it exits.
 run_emu() {
+    backup_saves
     if [ -x "$U/session-hook" ]; then
         systemd-run --user --quiet --collect --nice=10 "$U/session-hook" >/dev/null 2>&1 ||
             { setsid nice -n 10 "$U/session-hook" </dev/null >/dev/null 2>&1 & }
