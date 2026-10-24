@@ -50,6 +50,13 @@ While the game runs, press the **...** button > **Performance** (battery icon):
 - turn on **Manual GPU clock** and set it to **1600 MHz**: heavy fights need it;
 - turn the **Frame limit off**: it adds input lag.
 
+> [!IMPORTANT]
+> **After every game start, turn Manual GPU clock off and on again.** A Steam bug
+> ([SteamOS#2586](https://github.com/ValveSoftware/SteamOS/issues/2586)) drops the GPU lock when a
+> game exits, and the next start does not restore it, although the Performance menu still shows
+> 1600 MHz. Without the lock the GPU clock falls as low as 200 MHz and the game can drop to under
+> 10 fps. Turning the toggle off and on applies the lock until the game is closed.
+
 In the game: **Options > Video > Frame Rate > 30fps limit**. The emulator paces the game's own
 limit so each frame is shown on time with little input lag. *Unlimited* runs as fast as the
 machine allows (uneven on the Deck, about 34 fps).
@@ -78,8 +85,8 @@ machine allows (uneven on the Deck, about 34 fps).
   or its `.pkg` files there and run `./shadPS4.sh --setup` in a terminal (it can extract pkg files).
 - **No update found:** put the update folder next to the game as `<game folder>-UPDATE` (or
   `-patch`) and run `--setup` again.
-- **Low fps in fights:** check the 1600 MHz GPU clock above. Turn off other overlays and frame
-  limiters.
+- **Low fps in fights:** check the 1600 MHz GPU clock above and turn it off and on again after the
+  game starts (Steam bug, see above). Turn off other overlays and frame limiters.
 - **Uneven frame rate or aiming feels laggy:** set the game's Frame Rate option to *30fps limit*
   (Options > Video) and the Deck's frame limit off.
 - **Reporting a problem:** include `user/log/shad_log.txt` from the app folder.
