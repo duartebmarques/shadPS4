@@ -66,12 +66,13 @@ enum class DebugView : u8 {
     Bypass,
 };
 
-/// How one Antialias dispatch is handled.
+/// How one replaced pass, the Antialias dispatch of Gravity Rush 2 or the FXAA draw of Gravity
+/// Rush Remastered, is handled.
 enum class Mode : u8 {
-    Stock,    ///< The guest dispatch runs.
+    Stock,    ///< The guest pass runs.
     Fsr,      ///< FSR 3.1 followed by the store pass.
-    Fallback, ///< The fallback pass scales the colour input into the history image.
-    Debug,    ///< The debug pass writes the history image.
+    Fallback, ///< The fallback pass scales the colour input into the guest image.
+    Debug,    ///< The debug pass writes the guest image.
     Fsr4,     ///< FSR 4 (INT8, experimental) followed by the store pass.
 };
 
@@ -86,7 +87,7 @@ enum class Fsr4Model : u8 {
     Drs,
 };
 
-/// Extent of the Antialias output relative to its colour input.
+/// Extent of the output of the replaced pass relative to its colour input.
 enum class Kind : u8 {
     Native,  ///< Equal extents.
     Upscale, ///< The output is at least as large in both dimensions and larger in one.

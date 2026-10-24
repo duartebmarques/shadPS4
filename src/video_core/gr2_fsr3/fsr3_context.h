@@ -28,6 +28,25 @@ struct ContextKey {
     bool operator==(const ContextKey&) const = default;
 };
 
+/// Render and output extents of a frame.
+struct SizePair {
+    vk::Extent2D render{};
+    vk::Extent2D output{};
+
+    bool operator==(const SizePair&) const = default;
+};
+
+/// How the output extent of a frame compares with its render extent.
+inline Kind KindOf(const SizePair& sizes) {
+    if (sizes.render == sizes.output) {
+        return Kind::Native;
+    }
+    if (sizes.output.width >= sizes.render.width && sizes.output.height >= sizes.render.height) {
+        return Kind::Upscale;
+    }
+    return Kind::Other;
+}
+
 /**
  * An image as FSR receives it, in VK_IMAGE_LAYOUT_GENERAL. Read images are declared
  * FFX_VK_PORTABLE_RESOURCE_STATE_GENERIC_READ and written ones UNORDERED_ACCESS; FSR returns each

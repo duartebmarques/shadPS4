@@ -20,10 +20,9 @@ class GraphicsPipeline;
 class Rasterizer;
 } // namespace Vulkan
 
-// FSR 3.1 and FSR 4 (INT8, experimental) temporal upscaling for Gravity Rush 2, and the same
-// upscalers as anti-aliasing for Gravity Rush Remastered. Every function runs on the GPU command
-// thread except DrawMenu, which runs on the ImGui thread. For other titles a call costs one load
-// and a few compares.
+// FSR 3.1 and FSR 4 (INT8, experimental) temporal upscaling and anti-aliasing for Gravity Rush 2
+// and Gravity Rush Remastered. Every function runs on the GPU command thread except DrawMenu,
+// which runs on the ImGui thread. For other titles a call costs one load and a few compares.
 namespace Gr2Fsr3 {
 
 #ifdef ENABLE_GR2_FSR3

@@ -344,6 +344,11 @@ GrrDrawHashes HashesOf(const Vulkan::GraphicsPipeline& pipeline) {
     };
 }
 
+bool IsComposite(const GrrDrawHashes& hashes) {
+    return hashes.vs == GrrHash::CompositeVs ||
+           std::ranges::contains(GrrHash::CompositePs, hashes.ps);
+}
+
 GrrCameraDelta CompareCameras(const GrrCamera& current, const GrrCamera& previous) {
     GrrCameraDelta delta{
         .translation = std::hypot(current.position[0] - previous.position[0],
@@ -437,8 +442,8 @@ struct GrrCapture::Impl {
 
     GrrCamera camera{};
     GrrSceneDepth scene{};
-    bool camera_attempted{};
     VAddr copyluma_target{};
+    VAddr composite_target{};
     VAddr scene_depth_address{};
     BoundedSet<VAddr, 4> logged_camera_draws;
     BoundedSet<VAddr, 8> logged_camera_buffers;
@@ -496,7 +501,6 @@ void GrrCapture::Impl::LatchCamera(const Vulkan::GraphicsPipeline& pipeline,
     if (!qualifies) {
         return;
     }
-    camera_attempted = true;
     scene = GrrSceneDepth{
         .buffer = db,
         .view = regs.depth_view,
@@ -616,8 +620,8 @@ void GrrCapture::StartFrame() {
     Impl& state = *impl;
     state.camera = {};
     state.scene = {};
-    state.camera_attempted = false;
     state.copyluma_target = 0;
+    state.composite_target = 0;
 }
 
 void GrrCapture::OnDraw(const Vulkan::GraphicsPipeline& pipeline,
@@ -625,7 +629,9 @@ void GrrCapture::OnDraw(const Vulkan::GraphicsPipeline& pipeline,
                         const GrrDrawHashes& hashes) {
     if (hashes.ps == GrrHash::CopyLumaPs) {
         impl->LatchCopyLuma(pipeline, liverpool);
-    } else if (hashes.vs == GrrHash::CameraVs && !impl->camera_attempted) {
+    } else if (IsComposite(hashes)) {
+        impl->composite_target = liverpool.regs.color_buffers[0].Address();
+    } else if (hashes.vs == GrrHash::CameraVs && !impl->scene.valid) {
         impl->LatchCamera(pipeline, liverpool, rasterizer);
     }
 }
@@ -736,8 +742,8 @@ bool GrrCapture::CopyLumaWrote(VAddr address) const {
     return impl->copyluma_target == address;
 }
 
-bool GrrCapture::CameraAttempted() const {
-    return impl->camera_attempted;
+bool GrrCapture::CompositeWrote(VAddr address) const {
+    return impl->composite_target == address;
 }
 
 const GrrCamera& GrrCapture::Camera() const {

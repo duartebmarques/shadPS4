@@ -35,8 +35,8 @@ constexpr u32 StoreLinearInput = 1u << 1;
 constexpr u32 StoreFxaa = 1u << 2;
 constexpr u32 StoreFxaaCharacters = 1u << 3;
 constexpr u32 StoreAlphaOne = 1u << 4;
-constexpr u32 FallbackBilinear = 0;
-constexpr u32 FallbackEasu = 1;
+constexpr u32 FallbackEasu = 1u << 0;
+constexpr u32 FallbackAlphaOne = 1u << 1;
 constexpr u32 DebugHistoryValid = 1u << 0;
 constexpr u32 DebugDepthCopy = 1u << 1;
 constexpr u32 DebugDepthMain = 1u << 2;
@@ -136,11 +136,13 @@ static_assert(offsetof(StoreConstants, components) == 28);
 struct FallbackConstants {
     std::array<u32, 2> destination_size{};
     std::array<u32, 2> source_size{};
-    u32 mode{};
+    u32 flags{};
+    u32 components{};
 };
-static_assert(sizeof(FallbackConstants) == 20);
+static_assert(sizeof(FallbackConstants) == 24);
 static_assert(offsetof(FallbackConstants, source_size) == 8);
-static_assert(offsetof(FallbackConstants, mode) == 16);
+static_assert(offsetof(FallbackConstants, flags) == 16);
+static_assert(offsetof(FallbackConstants, components) == 20);
 
 struct DebugConstants {
     std::array<u32, 2> destination_size{};
@@ -669,7 +671,8 @@ void Passes::RecordFallback(const Vulkan::CommandRecorder& cmdbuf, const Fallbac
     const FallbackConstants constants{
         .destination_size = {params.destination_size.width, params.destination_size.height},
         .source_size = {params.source_size.width, params.source_size.height},
-        .mode = params.easu ? FallbackEasu : FallbackBilinear,
+        .flags = (params.easu ? FallbackEasu : 0u) | (params.alpha_one ? FallbackAlphaOne : 0u),
+        .components = PackComponents(params.components),
     };
     Record(cmdbuf, state.fallback, FallbackBindings,
            std::array{ImageDescriptor(params.source), state.SamplerDescriptor(),

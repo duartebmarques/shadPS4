@@ -54,23 +54,6 @@ constexpr float MaxFrameTimeMs = 200.0f;
 constexpr float DefaultFrameTimeMs = 16.6f;
 constexpr float CoverageOffset = 2.0f;
 
-struct SizePair {
-    vk::Extent2D render{};
-    vk::Extent2D output{};
-
-    bool operator==(const SizePair&) const = default;
-};
-
-Kind KindOf(const SizePair& sizes) {
-    if (sizes.render == sizes.output) {
-        return Kind::Native;
-    }
-    if (sizes.output.width >= sizes.render.width && sizes.output.height >= sizes.render.height) {
-        return Kind::Upscale;
-    }
-    return Kind::Other;
-}
-
 float Milliseconds(Clock::duration duration) {
     return std::chrono::duration<float, std::milli>(duration).count();
 }

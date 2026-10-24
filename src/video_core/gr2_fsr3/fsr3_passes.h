@@ -92,13 +92,16 @@ struct Fsr4InputsParams {
     bool depth_linear{};   ///< Writes the distance from the camera.
 };
 
-/// Inputs of the fallback pass, which scales the colour input into the guest history image.
+/// Inputs of the fallback pass, which scales the colour input into the guest image of the replaced
+/// pass.
 struct FallbackParams {
     vk::ImageView source{};
     vk::Extent2D source_size{};
     vk::ImageView destination{};
     vk::Extent2D destination_size{};
     bool easu{};
+    std::array<u8, 4> components{0, 1, 2, 3}; ///< Source component of each target component.
+    bool alpha_one{};                         ///< Alpha 1 instead of the luma of the colour.
 };
 
 /// Inputs of the debug pass. A view the selected view does not read may be null.

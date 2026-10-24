@@ -422,13 +422,11 @@ void DrawMenu() {
     EditChoice("Colour space", g_color_space, ColorSpaceNames);
     if (is_gr2) {
         EditChoice("Depth source", g_depth_source, DepthSourceNames);
-        EditBool("Texture LOD bias", g_lod_bias);
-        EditChoice("Extra LOD bias", g_lod_bias_extra, LodBiasExtraNames);
     }
+    EditBool("Texture LOD bias", g_lod_bias);
+    EditChoice("Extra LOD bias", g_lod_bias_extra, LodBiasExtraNames);
     EditBool("FP32 shaders", g_fp32);
-    if (is_gr2) {
-        EditBool("EASU fallback", g_fallback_easu);
-    }
+    EditBool("EASU fallback", g_fallback_easu);
     EditChoice("Debug view", g_debug, DebugViewNames);
     EditBool("Validation", g_validate);
     EditBool("Periodic log", g_log);

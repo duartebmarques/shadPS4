@@ -127,7 +127,7 @@ void GrrSurvey::Impl::Census(const Vulkan::GraphicsPipeline& pipeline, const Amd
     camera_draws += hashes.vs == GrrHash::CameraVs;
     copyluma_draws += hashes.ps == GrrHash::CopyLumaPs;
     fxaa_draws += hashes.ps == GrrHash::FxaaPs;
-    composite_draws += hashes.vs == GrrHash::CompositeVs;
+    composite_draws += IsComposite(hashes);
     motion_blur_draws += hashes.ps == GrrHash::MotionBlurPs;
     if (pipeline.GetGraphicsKey().mrt_mask == 1 &&
         regs.color_buffers[0].GetDataFmt() == AmdGpu::DataFormat::Format8_8_8_8 &&
@@ -260,7 +260,7 @@ void GrrSurvey::OnDraw(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::L
     if (hashes.vs == GrrHash::CameraVs) {
         state.events.Add(Event::Camera);
     }
-    if (hashes.vs == GrrHash::CompositeVs) {
+    if (IsComposite(hashes)) {
         state.events.Add(Event::Composite);
         state.LogComposite(pipeline, regs, hashes);
     }

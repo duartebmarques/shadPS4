@@ -34,6 +34,13 @@ namespace GrrHash {
 constexpr u64 ExposureCs = 0x275e3114; ///< First GPU work of every 3D frame.
 constexpr u64 CameraVs = 0xdbb08a76;   ///< GfxMaterial_G_BG_Main_vso, constant buffer 0 = camera.
 constexpr u64 CompositeVs = 0x4dccac15;
+/// The GfxRenderPassComposite pixel shaders, one per Composite variant.
+constexpr std::array<u64, 32> CompositePs{
+    0x10b60698, 0x1784ed3b, 0x1955dfe9, 0x22251b56, 0x2f887d9f, 0x32f2d5eb, 0x3610ea85, 0x3e7be685,
+    0x40de8a89, 0x414383c9, 0x4146e510, 0x4b793409, 0x52ff72de, 0x7246d172, 0x74456ebb, 0x7e6b1092,
+    0x869c2c38, 0x885e858a, 0x9a4b146c, 0xb041b1f2, 0xb663a197, 0xb732a9ff, 0xba16c10f, 0xd179c883,
+    0xdba6dd74, 0xe542cedb, 0xe775c523, 0xea49c496, 0xebe95e8d, 0xedb2ffe3, 0xefbcc99a, 0xf2a0fefe,
+};
 constexpr u64 CopyLumaPs = 0x8c2537d0;
 constexpr u64 FxaaPs = 0x634c42fb;
 constexpr u64 MotionBlurPs = 0x2f948ea9;
@@ -120,7 +127,7 @@ struct GrrSceneDepth {
 
 /// The bindings of an FXAA draw (pixel shader 0x634c42fb).
 struct GrrFxaaDraw {
-    ImageBinding color;           ///< t0, the FXAA intermediate that CopyLuma writes.
+    ImageBinding color;           ///< t0, written by CopyLuma or the Composite.
     AmdGpu::ColorBuffer target{}; ///< The back buffer, or the 2D screen capture of menus.
     AmdGpu::CbDbExtent target_hint{};
     std::array<u8, 4> components{}; ///< Source component of each target component.
@@ -147,6 +154,10 @@ struct GrrDrawHashes {
 /// Program hashes of the vertex, geometry and pixel stages of a pipeline.
 GrrDrawHashes HashesOf(const Vulkan::GraphicsPipeline& pipeline);
 
+/// Whether a draw is a Composite draw: its pixel shader is a Composite variant, or its vertex
+/// shader is the Composite one. A patch of the vertex shader's texel offsets changes its hash.
+bool IsComposite(const GrrDrawHashes& hashes);
+
 /// Compares a camera with the one of the previous frame.
 GrrCameraDelta CompareCameras(const GrrCamera& current, const GrrCamera& previous);
 
@@ -164,12 +175,12 @@ public:
     GrrCapture(const GrrCapture&) = delete;
     GrrCapture& operator=(const GrrCapture&) = delete;
 
-    /// Forgets the camera, the scene depth and the CopyLuma target of the frame. The scene depth
-    /// address stays for the jitter of the next frame.
+    /// Forgets the camera, the scene depth and the CopyLuma and Composite targets of the frame. The
+    /// scene depth address stays for the jitter of the next frame.
     void StartFrame();
 
     /// Latches the camera and the scene depth at the first qualifying camera draw of the frame,
-    /// and the target of a CopyLuma draw.
+    /// and the targets of the CopyLuma and Composite draws.
     void OnDraw(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::Liverpool& liverpool,
                 Vulkan::Rasterizer& rasterizer, const GrrDrawHashes& hashes);
 
@@ -182,8 +193,8 @@ public:
     /// Whether a CopyLuma draw of the frame wrote the non-zero address.
     bool CopyLumaWrote(VAddr address) const;
 
-    /// Whether a camera draw of the frame qualified; its camera may still have been rejected.
-    bool CameraAttempted() const;
+    /// Whether the last Composite draw of the frame wrote the non-zero address.
+    bool CompositeWrote(VAddr address) const;
 
     const GrrCamera& Camera() const;
     const GrrSceneDepth& SceneDepth() const;

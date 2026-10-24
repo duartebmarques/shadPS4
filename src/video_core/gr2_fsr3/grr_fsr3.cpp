@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -46,22 +47,24 @@ constexpr float DefaultFrameTimeMs = 16.6f;
 constexpr float CoverageOffset = 2.0f;
 constexpr u32 MaxLoggedCuts = 8;
 
-// Why an FXAA draw stays stock.
+// Why FSR does not run for an FXAA draw.
 enum class StockReason : u8 {
     Bindings,
     NoCamera,
     CameraRejected,
     NoCopyLuma,
+    NoComposite,
     Sizes,
     NoPreviousCamera,
     Images,
 };
-constexpr std::array<std::string_view, 7> StockReasonNames{
+constexpr std::array<std::string_view, 8> StockReasonNames{
     "the FXAA bindings are not recognized",
     "no camera draw this frame",
     "the camera of this frame is rejected",
     "no CopyLuma draw wrote the FXAA input this frame",
-    "the FXAA input, its target and the scene differ in size",
+    "no Composite draw wrote the FXAA input this frame",
+    "the FXAA input differs from the scene in size or is larger than its target",
     "no camera in the previous frame",
     "the images cannot be used",
 };
@@ -133,19 +136,16 @@ MaskParams MasksOf(const GrrFrame& frame, const GrrImages& images) {
 }
 
 // The store writes what the FXAA pixel shader exports: colour in the component order of the
-// target, alpha 1. It reads output, a null image for the FSR 3.1 output, or with the FSR bypass
-// view the colour input, linear through its sRGB view.
+// target, alpha 1. It reads output, a null image for the FSR 3.1 output.
 StoreParams StoreOf(const GrrFrame& frame, const GrrImages& images, const Fsr4Image& output) {
     const Settings::Values& settings = frame.settings;
     const float sharpness = static_cast<float>(settings.sharpness) / 100.0f;
-    const bool bypass = settings.debug == DebugView::Bypass;
-    const Fsr4Image color{.image = images.color.image->GetImage(), .view = images.color.view};
     return {
         .destination = images.output.view,
         .output_size = frame.draw.output_size,
         .rcas_stops = sharpness > 0.0f ? 2.0f * (1.0f - sharpness) : -1.0f,
-        .linear_input = bypass || settings.color_space == ColorSpace::Linear,
-        .source = bypass ? color : output,
+        .linear_input = settings.color_space == ColorSpace::Linear,
+        .source = output,
         .fxaa = settings.fxaa,
         .stencil = images.stencil.view,
         .render_size = frame.draw.render_size,
@@ -155,10 +155,26 @@ StoreParams StoreOf(const GrrFrame& frame, const GrrImages& images, const Fsr4Im
     };
 }
 
+// The fallback writes what the FXAA pixel shader exports: colour in the component order of the
+// target, alpha 1.
+FallbackParams FallbackOf(const GrrFrame& frame, const GrrImages& images, bool easu) {
+    return {
+        .source = images.color.view,
+        .source_size = frame.draw.render_size,
+        .destination = images.output.view,
+        .destination_size = frame.draw.output_size,
+        .easu = easu,
+        .components = frame.draw.components,
+        .alpha_one = true,
+    };
+}
+
 class GrrModule {
 public:
     explicit GrrModule(const Vulkan::Instance& instance)
-        : instance{instance}, context{instance}, fsr4{instance} {}
+        : instance{instance}, context{instance}, fsr4{instance} {
+        Jitter::SetMaxLodBias(instance.MaxSamplerLodBias());
+    }
 
     void OnExposure(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                     Vulkan::Rasterizer& rasterizer);
@@ -192,7 +208,7 @@ private:
     ContextState context_state{ContextState::Idle};
     ContextState fsr4_state{ContextState::Idle};
     std::optional<Fsr4Key> fsr4_key;
-    std::optional<vk::Extent2D> session_size;
+    std::optional<SizePair> session_sizes;
     GrrCamera previous_camera{};
     bool exposure_seen{};
     bool awaiting_frame_start{};
@@ -297,8 +313,9 @@ bool GrrModule::OnFxaa(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::L
     survey.OnFxaa(frame.draw, recognized, frame.scene, rasterizer);
     const vk::Extent2D render = frame.draw.render_size;
     const vk::Extent2D output = frame.draw.output_size;
+    const SizePair sizes{.render = render, .output = output};
     if (recognized) {
-        frame.kind = render == output ? Kind::Native : Kind::Other;
+        frame.kind = KindOf(sizes);
     }
     if (frame.camera.valid && previous_camera.valid) {
         frame.delta = CompareCameras(frame.camera, previous_camera);
@@ -317,36 +334,42 @@ bool GrrModule::OnFxaa(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::L
             Reprojection(frame.camera, previous_camera.valid ? previous_camera : frame.camera);
     }
 
-    // A replaced frame is native: its input, its target and the scene have one size.
+    // A replaced frame has its input at the scene size and a target at least as large. The input
+    // of a native frame is the CopyLuma copy of the Composite, that of an upscaled frame is the
+    // Composite itself.
+    const bool native = frame.kind == Kind::Native;
+    const VAddr input = frame.draw.color.tsharp.Address();
     std::optional<StockReason> stock;
     if (!recognized) {
         stock = StockReason::Bindings;
     } else if (!reprojection) {
-        stock = capture.CameraAttempted() ? StockReason::CameraRejected : StockReason::NoCamera;
-    } else if (!capture.CopyLumaWrote(frame.draw.color.tsharp.Address())) {
-        stock = StockReason::NoCopyLuma;
-    } else if (frame.kind != Kind::Native || render != frame.scene.extent) {
+        stock = frame.scene.valid ? StockReason::CameraRejected : StockReason::NoCamera;
+    } else if (frame.kind == Kind::Other || render != frame.scene.extent) {
         stock = StockReason::Sizes;
+    } else if (native ? !capture.CopyLumaWrote(input) : !capture.CompositeWrote(input)) {
+        stock = native ? StockReason::NoCopyLuma : StockReason::NoComposite;
     } else {
         frame.reprojection = *reprojection;
-        if (!session_size) {
-            session_size = render;
+        if (!session_sizes) {
+            session_sizes = sizes;
         }
         if (!std::exchange(logged_eligible, true)) {
-            LOG_INFO(Render_Vulkan, "GRR FSR: the FXAA draw can be replaced: {}x{}, target {:#x}",
-                     render.width, render.height, frame.draw.target.Address());
+            LOG_INFO(Render_Vulkan,
+                     "GRR FSR: the FXAA draw can be replaced: {}x{} -> {}x{} ({}), target {:#x}",
+                     render.width, render.height, output.width, output.height,
+                     magic_enum::enum_name(frame.kind), frame.draw.target.Address());
         }
     }
 
     const bool coverage = (settings.test & TestBit::CoverageJitter) != 0;
-    const vk::Extent2D session = session_size.value_or(vk::Extent2D{});
-    const bool session_fsr = session_size.has_value() && !coverage;
+    const SizePair session = session_sizes.value_or(SizePair{});
+    const bool session_fsr = session_sizes.has_value() && !coverage;
     fsr4_key.reset();
     if (settings.grr_fsr4_enable && session_fsr && !fsr4_passes_failed) {
-        fsr4_key = Fsr4KeyFor(session, session, settings.fsr4_model);
+        fsr4_key = Fsr4KeyFor(session.render, session.output, settings.fsr4_model);
     }
     fsr4_state = fsr4.Update(rasterizer.GetScheduler(), fsr4_key, !context.HoldsMemory(),
-                             Passes::EstimateFsr4Bytes(session, true, true));
+                             Passes::EstimateFsr4Bytes(session.render, true, true));
     // FSR 3.1 holds no context while FSR 4 holds one or its files have passed their checks; while
     // the files load, a context FSR 3.1 already has keeps running.
     const bool fsr3_blocked =
@@ -355,18 +378,23 @@ bool GrrModule::OnFxaa(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::L
     std::optional<ContextKey> wanted;
     if (settings.grr_enable && session_fsr && !fsr3_blocked) {
         wanted = ContextKey{
-            .max_render_size = session,
-            .max_output_size = session,
+            .max_render_size = session.render,
+            .max_output_size = session.output,
             .fp16 = context.IsFp16Supported() && !settings.fp32,
             .debug_checking = settings.validate,
         };
     }
-    context_state = context.Update(rasterizer.GetScheduler(), wanted,
-                                   Passes::EstimateBytes(session, session, true, true));
+    context_state =
+        context.Update(rasterizer.GetScheduler(), wanted,
+                       Passes::EstimateBytes(session.render, session.output, true, true));
 
-    // Frames of other sizes keep the contexts of the first sizes and the stock FXAA.
-    const bool session_frame = session_size && render == *session_size;
-    Mode mode = Mode::Stock;
+    // Frames of other sizes keep the contexts of the first sizes and the stock FXAA. Without FSR
+    // an upscaled frame takes the fallback pass, bilinear like the stock FXAA of these frames, or
+    // EASU.
+    const bool session_frame = session_sizes && sizes == *session_sizes;
+    const Mode fallback =
+        !stock && session_frame && frame.kind == Kind::Upscale ? Mode::Fallback : Mode::Stock;
+    Mode mode = fallback;
     if (!stock) {
         if (settings.debug >= DebugView::MotionVectors &&
             settings.debug <= DebugView::Reprojection) {
@@ -377,9 +405,9 @@ bool GrrModule::OnFxaa(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::L
             mode = Mode::Fsr;
         }
     }
-    if (mode != Mode::Stock && !previous_camera.valid) {
+    if (mode != fallback && !previous_camera.valid) {
         stock = StockReason::NoPreviousCamera;
-        mode = Mode::Stock;
+        mode = fallback;
     }
     if (stock) {
         LogStock(*stock);
@@ -400,17 +428,16 @@ bool GrrModule::OnFxaa(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::L
     }
     if (mode != Mode::Stock && !grr_passes_failed && !passes->InitGrr()) {
         grr_passes_failed = true;
-        LOG_ERROR(Render_Vulkan,
-                  "GRR FSR: the camera-motion pass is unavailable, FXAA stays stock");
+        LOG_ERROR(Render_Vulkan, "GRR FSR: the camera-motion pass is unavailable, FSR stays off");
     }
     if (grr_passes_failed) {
-        mode = Mode::Stock;
+        mode = fallback;
     }
     if (mode == Mode::Fsr4 && !passes->InitFsr4()) {
         // From the next frame no FSR 4 context is wanted, and FSR 3.1 can take over.
         fsr4_passes_failed = true;
         LOG_ERROR(Render_Vulkan, "GRR FSR: the FSR 4 inputs pass is unavailable, FSR 4 stays off");
-        mode = Mode::Stock;
+        mode = fallback;
     }
 
     // History restarts on a new context, after a frame without this upscaler, after a gap, at a
@@ -446,6 +473,12 @@ bool GrrModule::OnFxaa(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::L
         if ((settings.test & TestBit::JitterOff) == 0) {
             plan.enabled = true;
             plan.offset = Jitter::PhaseOffset(phase_index, phase_count);
+            if (frame.kind == Kind::Upscale && settings.lod_bias) {
+                const float ratio =
+                    static_cast<float>(render.width) / static_cast<float>(output.width);
+                plan.lod_bias =
+                    std::log2(ratio) - 0.5f * static_cast<float>(settings.lod_bias_extra);
+            }
         }
     } else if (coverage && executed != Mode::Debug) {
         plan.enabled = true;
@@ -471,7 +504,10 @@ Mode GrrModule::Record(Mode mode, const GrrFrame& frame, Vulkan::Rasterizer& ras
     auto& scheduler = rasterizer.GetScheduler();
     // A wait for a free FSR 4 frame slot can submit the open command buffer, so it comes first.
     if (mode == Mode::Fsr4 && !fsr4.PrepareFrame(rasterizer)) {
-        return Mode::Stock;
+        if (frame.kind == Kind::Native) {
+            return Mode::Stock;
+        }
+        mode = Mode::Fallback;
     }
     scheduler.EndRendering();
     GrrImages images{};
@@ -490,6 +526,8 @@ Mode GrrModule::Record(Mode mode, const GrrFrame& frame, Vulkan::Rasterizer& ras
         mode = RecordFsr(cmdbuf, frame, images, scheduler);
     } else if (mode == Mode::Fsr4) {
         mode = RecordFsr4(cmdbuf, frame, images, scheduler);
+    } else if (mode == Mode::Fallback) {
+        passes->RecordFallback(cmdbuf, FallbackOf(frame, images, frame.settings.fallback_easu));
     } else {
         RecordDebug(cmdbuf, frame, images, scheduler);
     }
@@ -547,11 +585,20 @@ Mode GrrModule::RecordFsr(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame&
         .frame_id = frame_id++,
     };
     if (!context.RecordDispatch(scheduler, dispatch)) {
+        const bool native = frame.kind == Kind::Native;
         if (!std::exchange(logged_rejected, true)) {
-            LOG_ERROR(Render_Vulkan,
-                      "GRR FSR: FSR rejected the dispatch, the frame uses the stock FXAA");
+            LOG_ERROR(Render_Vulkan, "GRR FSR: FSR rejected the dispatch, the frame uses the {}",
+                      native ? "stock FXAA" : "fallback pass");
         }
-        return Mode::Stock;
+        if (native) {
+            return Mode::Stock;
+        }
+        passes->RecordFallback(cmdbuf, FallbackOf(frame, images, settings.fallback_easu));
+        return Mode::Fallback;
+    }
+    if (settings.debug == DebugView::Bypass) {
+        passes->RecordFallback(cmdbuf, FallbackOf(frame, images, false));
+        return Mode::Fsr;
     }
     passes->RecordStore(cmdbuf, StoreOf(frame, images, {}));
     return Mode::Fsr;
@@ -590,11 +637,20 @@ Mode GrrModule::RecordFsr4(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame
         .reset = frame.reset,
     };
     if (!fsr4.RecordDispatch(scheduler, dispatch)) {
+        const bool native = frame.kind == Kind::Native;
         if (!std::exchange(logged_fsr4_rejected, true)) {
-            LOG_ERROR(Render_Vulkan,
-                      "GRR FSR: FSR 4 rejected the dispatch, the frame uses the stock FXAA");
+            LOG_ERROR(Render_Vulkan, "GRR FSR: FSR 4 rejected the dispatch, the frame uses the {}",
+                      native ? "stock FXAA" : "fallback pass");
         }
-        return Mode::Stock;
+        if (native) {
+            return Mode::Stock;
+        }
+        passes->RecordFallback(cmdbuf, FallbackOf(frame, images, settings.fallback_easu));
+        return Mode::Fallback;
+    }
+    if (settings.debug == DebugView::Bypass) {
+        passes->RecordFallback(cmdbuf, FallbackOf(frame, images, false));
+        return Mode::Fsr4;
     }
     passes->RecordStore(cmdbuf, StoreOf(frame, images, targets.output));
     return Mode::Fsr4;
@@ -632,7 +688,7 @@ void GrrModule::RecordDebug(const Vulkan::CommandRecorder& cmdbuf, const GrrFram
 void GrrModule::LogStock(StockReason reason) {
     const auto index = static_cast<std::size_t>(reason);
     if (!std::exchange(logged_stock[index], true)) {
-        LOG_WARNING(Render_Vulkan, "GRR FSR: the FXAA draw stays stock: {}",
+        LOG_WARNING(Render_Vulkan, "GRR FSR: no FSR for the FXAA draw: {}",
                     StockReasonNames[index]);
     }
 }
