@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 # Builds one PGO binary per candidate profile, in parallel, for A/B tests on the Deck.
 # Candidates are <name>.profdata assets of the pgo-candidates release (agent tool: pgo-ci).
 
@@ -53,14 +56,16 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         gh release download pgo-candidates -R ${{ github.repository }} -p "${{ matrix.name }}.profdata" -D $RUNNER_TEMP
-        mv "$RUNNER_TEMP/${{ matrix.name }}.profdata" "$RUNNER_TEMP/shadps4.profdata"
+        p=$RUNNER_TEMP/shadps4-$(sha256sum "$RUNNER_TEMP/${{ matrix.name }}.profdata" | cut -c1-16).profdata
+        mv "$RUNNER_TEMP/${{ matrix.name }}.profdata" $p
+        echo "PGO_PROFILE=$p" >> $GITHUB_ENV
         if [ -n "${{ inputs.extra_diff }}" ]; then
           gh release download pgo-candidates -R ${{ github.repository }} -p "${{ inputs.extra_diff }}" -D $RUNNER_TEMP
           git apply "$RUNNER_TEMP/${{ inputs.extra_diff }}"
         fi
 
     - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-use=${{ runner.temp }}/shadps4.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_CXX_FLAGS="-fprofile-instr-use=${{ runner.temp }}/shadps4.profdata -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-use=${{ env.PGO_PROFILE }} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_CXX_FLAGS="-fprofile-instr-use=${{ env.PGO_PROFILE }} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
