@@ -1555,6 +1555,7 @@ add_subdirectory(${HOST_SHADERS_INCLUDE})
 add_dependencies(shadps4 host_shaders)
 target_include_directories(shadps4 PRIVATE ${HOST_SHADERS_INCLUDE})
 include("${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/gr2_fsr3/gr2_fsr3.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/core/prompt_packs/prompt_packs.cmake")
 
 # embed resources
 

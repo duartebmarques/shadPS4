@@ -27,6 +27,7 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
+#include "core/prompt_packs/prompt_packs.h"
 #include "imgui/big_picture/settings_dialog_layer.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
@@ -797,6 +798,11 @@ void ParseInputConfig(const std::string game_id = "") {
         ProcessLine();
     }
     config_stream.close();
+    lineCount = 0;
+    std::ifstream prompt_pack_stream(PromptPacks::InputOverrideFile());
+    while (std::getline(prompt_pack_stream, line)) {
+        ProcessLine();
+    }
 
     // Sanity-check the hold-combo swipe layer now that both files have been parsed.
     for (int dir = 0; dir < 4; dir++) {
