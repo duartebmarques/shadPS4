@@ -471,7 +471,7 @@ struct GPUSettings {
     Setting<bool> one_core_gpu_thread_pin{false};
     // Record the draw scheduler's Vulkan commands and issue its queue submits on a dedicated
     // thread; the GPU command thread stores each call as a closure instead of calling the driver.
-    Setting<bool> vk_record_thread{false};
+    Setting<bool> vk_record_thread{true};
     // Rebuild the vertex input layout only when the pipeline, the instance step rates or an
     // attribute's format or stride changed, instead of on every draw.
     Setting<bool> vertex_layout_memo{true};
