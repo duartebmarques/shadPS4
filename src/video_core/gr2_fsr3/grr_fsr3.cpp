@@ -170,12 +170,12 @@ private:
     bool OnFxaa(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::Liverpool& liverpool,
                 Vulkan::Rasterizer& rasterizer);
     Mode Record(Mode mode, const GrrFrame& frame, Vulkan::Rasterizer& rasterizer);
-    Mode RecordFsr(vk::CommandBuffer cmdbuf, const GrrFrame& frame, const GrrImages& images,
-                   Vulkan::Scheduler& scheduler);
-    Mode RecordFsr4(vk::CommandBuffer cmdbuf, const GrrFrame& frame, const GrrImages& images,
-                    Vulkan::Scheduler& scheduler);
-    void RecordDebug(vk::CommandBuffer cmdbuf, const GrrFrame& frame, const GrrImages& images,
-                     Vulkan::Scheduler& scheduler);
+    Mode RecordFsr(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame& frame,
+                   const GrrImages& images, Vulkan::Scheduler& scheduler);
+    Mode RecordFsr4(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame& frame,
+                    const GrrImages& images, Vulkan::Scheduler& scheduler);
+    void RecordDebug(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame& frame,
+                     const GrrImages& images, Vulkan::Scheduler& scheduler);
     void LogStock(StockReason reason);
     void Publish(Mode mode, const GrrFrame& frame, float interval_ms);
     void LogFrame(u64 frame_index, Mode mode, const GrrFrame& frame, float interval_ms) const;
@@ -485,7 +485,7 @@ Mode GrrModule::Record(Mode mode, const GrrFrame& frame, Vulkan::Rasterizer& ras
     }
 
     rasterizer.ScopeMarkerBegin(mode == Mode::Fsr4 ? "Host/GRR FSR4" : "Host/GRR FSR3");
-    const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();
+    const Vulkan::CommandRecorder cmdbuf = scheduler.CommandBuffer();
     if (mode == Mode::Fsr) {
         mode = RecordFsr(cmdbuf, frame, images, scheduler);
     } else if (mode == Mode::Fsr4) {
@@ -501,8 +501,8 @@ Mode GrrModule::Record(Mode mode, const GrrFrame& frame, Vulkan::Rasterizer& ras
     return mode;
 }
 
-Mode GrrModule::RecordFsr(vk::CommandBuffer cmdbuf, const GrrFrame& frame, const GrrImages& images,
-                          Vulkan::Scheduler& scheduler) {
+Mode GrrModule::RecordFsr(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame& frame,
+                          const GrrImages& images, Vulkan::Scheduler& scheduler) {
     const Settings::Values& settings = frame.settings;
     const vk::Extent2D render = frame.draw.render_size;
     const vk::Extent2D output = frame.draw.output_size;
@@ -546,7 +546,7 @@ Mode GrrModule::RecordFsr(vk::CommandBuffer cmdbuf, const GrrFrame& frame, const
         .reset = frame.reset,
         .frame_id = frame_id++,
     };
-    if (!context.RecordDispatch(cmdbuf, dispatch, settings.validate)) {
+    if (!context.RecordDispatch(scheduler, dispatch)) {
         if (!std::exchange(logged_rejected, true)) {
             LOG_ERROR(Render_Vulkan,
                       "GRR FSR: FSR rejected the dispatch, the frame uses the stock FXAA");
@@ -557,8 +557,8 @@ Mode GrrModule::RecordFsr(vk::CommandBuffer cmdbuf, const GrrFrame& frame, const
     return Mode::Fsr;
 }
 
-Mode GrrModule::RecordFsr4(vk::CommandBuffer cmdbuf, const GrrFrame& frame, const GrrImages& images,
-                           Vulkan::Scheduler& scheduler) {
+Mode GrrModule::RecordFsr4(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame& frame,
+                           const GrrImages& images, Vulkan::Scheduler& scheduler) {
     const Settings::Values& settings = frame.settings;
     const vk::Extent2D render = frame.draw.render_size;
     passes->ResizeFsr4(scheduler, render, true, true);
@@ -589,7 +589,7 @@ Mode GrrModule::RecordFsr4(vk::CommandBuffer cmdbuf, const GrrFrame& frame, cons
         .output_size = frame.draw.output_size,
         .reset = frame.reset,
     };
-    if (!fsr4.RecordDispatch(scheduler, cmdbuf, dispatch)) {
+    if (!fsr4.RecordDispatch(scheduler, dispatch)) {
         if (!std::exchange(logged_fsr4_rejected, true)) {
             LOG_ERROR(Render_Vulkan,
                       "GRR FSR: FSR 4 rejected the dispatch, the frame uses the stock FXAA");
@@ -600,7 +600,7 @@ Mode GrrModule::RecordFsr4(vk::CommandBuffer cmdbuf, const GrrFrame& frame, cons
     return Mode::Fsr4;
 }
 
-void GrrModule::RecordDebug(vk::CommandBuffer cmdbuf, const GrrFrame& frame,
+void GrrModule::RecordDebug(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame& frame,
                             const GrrImages& images, Vulkan::Scheduler& scheduler) {
     const DebugView view = frame.settings.debug;
     const vk::Extent2D render = frame.draw.render_size;

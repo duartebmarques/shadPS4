@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
+class CommandRecorder;
 class Instance;
 class Scheduler;
 } // namespace Vulkan
@@ -120,7 +121,7 @@ struct DebugParams {
 
 /**
  * The host compute passes around the FSR dispatch and the host images they own. Every Record
- * function records into the command buffer it is given, outside dynamic rendering, and leaves the
+ * function records through the recorder it is given, outside dynamic rendering, and leaves the
  * guest images it writes in VK_IMAGE_LAYOUT_GENERAL. GPU command thread only.
  */
 class Passes {
@@ -154,17 +155,19 @@ public:
     /// The previous-frame character mask and the reprojection history start empty again.
     void ResetHistory();
 
-    void RecordMask(vk::CommandBuffer cmdbuf, const MaskParams& params);
-    void RecordCameraMotion(vk::CommandBuffer cmdbuf, const CameraMotionParams& params);
-    void RecordGrrCameraMotion(vk::CommandBuffer cmdbuf, const GrrCameraMotionParams& params);
+    void RecordMask(const Vulkan::CommandRecorder& cmdbuf, const MaskParams& params);
+    void RecordCameraMotion(const Vulkan::CommandRecorder& cmdbuf,
+                            const CameraMotionParams& params);
+    void RecordGrrCameraMotion(const Vulkan::CommandRecorder& cmdbuf,
+                               const GrrCameraMotionParams& params);
 
     /// Makes the mask and camera-motion writes of the frame visible to FSR and readies the output.
-    void PrepareFsr(vk::CommandBuffer cmdbuf);
+    void PrepareFsr(const Vulkan::CommandRecorder& cmdbuf);
 
-    void RecordFsr4Inputs(vk::CommandBuffer cmdbuf, const Fsr4InputsParams& params);
-    void RecordStore(vk::CommandBuffer cmdbuf, const StoreParams& params);
-    void RecordFallback(vk::CommandBuffer cmdbuf, const FallbackParams& params);
-    void RecordDebug(vk::CommandBuffer cmdbuf, const DebugParams& params);
+    void RecordFsr4Inputs(const Vulkan::CommandRecorder& cmdbuf, const Fsr4InputsParams& params);
+    void RecordStore(const Vulkan::CommandRecorder& cmdbuf, const StoreParams& params);
+    void RecordFallback(const Vulkan::CommandRecorder& cmdbuf, const FallbackParams& params);
+    void RecordDebug(const Vulkan::CommandRecorder& cmdbuf, const DebugParams& params);
 
     FsrImage ReactiveMask() const;
     FsrImage TransparencyMask() const;

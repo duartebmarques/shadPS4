@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdint>
 #include <future>
 #include <memory>
 #include <optional>
@@ -13,6 +14,7 @@
 
 #include <fmt/format.h>
 
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "video_core/gr2_fsr3/fsr3_context.h"
 #include "video_core/gr2_fsr3/fsr_worker.h"
@@ -98,7 +100,7 @@ struct Context::Impl {
 
     ContextState Update(Vulkan::Scheduler& scheduler, const std::optional<ContextKey>& wanted,
                         u64 extra_bytes);
-    bool RecordDispatch(vk::CommandBuffer cmdbuf, const FsrDispatch& dispatch, bool log_issues);
+    bool RecordDispatch(Vulkan::Scheduler& scheduler, const FsrDispatch& dispatch);
     Created Create(const ContextKey& key) const;
     void EnqueueDestroy(FfxVkPortableUpscaleContext* context);
 
@@ -120,7 +122,7 @@ struct Context::Impl {
     // most one context holds device memory.
     std::atomic<u32> destroying{};
     std::string notice;
-    std::vector<std::pair<FfxVkPortableResult, u64>> reported_failures;
+    std::vector<u64> reported_issues;
 
     // FidelityFX creates contexts through one process-global device copy. Creations and
     // destructions run on this worker, one at a time.
@@ -230,11 +232,11 @@ ContextState Context::Impl::Update(Vulkan::Scheduler& scheduler,
     return failed_key ? ContextState::Failed : ContextState::Creating;
 }
 
-bool Context::Impl::RecordDispatch(vk::CommandBuffer cmdbuf, const FsrDispatch& dispatch,
-                                   bool log_issues) {
+bool Context::Impl::RecordDispatch(Vulkan::Scheduler& scheduler, const FsrDispatch& dispatch) {
     FfxVkPortableUpscaleDispatchInfo info{};
     info.structSize = sizeof(info);
-    info.commandBuffer = static_cast<VkCommandBuffer>(cmdbuf);
+    // Validation rejects a null command buffer; the recorded call passes the one it records into.
+    info.commandBuffer = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{1});
     info.color = Describe(dispatch.color);
     info.depth = Describe(dispatch.depth);
     info.motionVectors = Describe(dispatch.motion_vectors);
@@ -258,26 +260,27 @@ bool Context::Impl::RecordDispatch(vk::CommandBuffer cmdbuf, const FsrDispatch& 
     info.frameId = dispatch.frame_id;
 
     // The library validates every dispatch the same way and rejects it on any issue.
-    u64 issues = log_issues ? ffxVkPortableValidateUpscaleDispatchInfo(&current_create, &info) : 0;
-    const FfxVkPortableResult result =
-        issues == FFX_VK_PORTABLE_VALIDATION_NONE
-            ? ffxVkPortableUpscaleContextRecordDispatch(current, &info)
-            : FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
-    if (result == FFX_VK_PORTABLE_OK) {
-        return true;
+    const u64 issues = ffxVkPortableValidateUpscaleDispatchInfo(&current_create, &info);
+    if (issues != FFX_VK_PORTABLE_VALIDATION_NONE) {
+        const FfxVkPortableResult result = FFX_VK_PORTABLE_ERROR_INVALID_ARGUMENT;
+        notice = fmt::format("FSR 3.1 rejected the dispatch: {}", ResultName(result));
+        if (!std::ranges::contains(reported_issues, issues)) {
+            reported_issues.push_back(issues);
+            LOG_ERROR(Render_Vulkan, "GR2 FSR3: dispatch {} rejected: {}, validation issues: {}",
+                      FormatSizes(dispatch.render_size, dispatch.output_size), ResultName(result),
+                      IssueNames(issues));
+        }
+        return false;
     }
-    if (!log_issues) {
-        issues = ffxVkPortableValidateUpscaleDispatchInfo(&current_create, &info);
-    }
-    notice = fmt::format("FSR 3.1 rejected the dispatch: {}", ResultName(result));
-    const std::pair failure{result, issues};
-    if (!std::ranges::contains(reported_failures, failure)) {
-        reported_failures.push_back(failure);
-        LOG_ERROR(Render_Vulkan, "GR2 FSR3: dispatch {} rejected: {}, validation issues: {}",
-                  FormatSizes(dispatch.render_size, dispatch.output_size), ResultName(result),
-                  IssueNames(issues));
-    }
-    return false;
+    scheduler.Record([context = current, info](vk::CommandBuffer cmdbuf) {
+        FfxVkPortableUpscaleDispatchInfo recorded = info;
+        recorded.commandBuffer = static_cast<VkCommandBuffer>(cmdbuf);
+        const FfxVkPortableResult result =
+            ffxVkPortableUpscaleContextRecordDispatch(context, &recorded);
+        ASSERT_MSG(result == FFX_VK_PORTABLE_OK, "GR2 FSR3: validated dispatch rejected: {}",
+                   ResultName(result));
+    });
+    return true;
 }
 
 Context::Impl::Created Context::Impl::Create(const ContextKey& key) const {
@@ -367,9 +370,8 @@ std::string Context::Notice() const {
     return impl->notice;
 }
 
-bool Context::RecordDispatch(vk::CommandBuffer cmdbuf, const FsrDispatch& dispatch,
-                             bool log_issues) {
-    return impl->RecordDispatch(cmdbuf, dispatch, log_issues);
+bool Context::RecordDispatch(Vulkan::Scheduler& scheduler, const FsrDispatch& dispatch) {
+    return impl->RecordDispatch(scheduler, dispatch);
 }
 
 u64 AvailableDeviceMemory(const Vulkan::Instance& instance) {

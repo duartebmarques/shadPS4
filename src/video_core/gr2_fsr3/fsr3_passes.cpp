@@ -246,7 +246,8 @@ vk::ImageMemoryBarrier2 AfterWriteBarrier(vk::Image image, vk::AccessFlags2 dst_
     return ComputeBarrier(image, vk::ImageLayout::eGeneral, dst_access);
 }
 
-void Barrier(vk::CommandBuffer cmdbuf, std::span<const vk::ImageMemoryBarrier2> barriers) {
+void Barrier(const Vulkan::CommandRecorder& cmdbuf,
+             std::span<const vk::ImageMemoryBarrier2> barriers) {
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
@@ -255,7 +256,7 @@ void Barrier(vk::CommandBuffer cmdbuf, std::span<const vk::ImageMemoryBarrier2> 
 
 /// Binds the pass, pushes one descriptor per binding and dispatches 8x8 groups over `size`.
 template <std::size_t N, typename Constants>
-void Record(vk::CommandBuffer cmdbuf, const Pass& pass,
+void Record(const Vulkan::CommandRecorder& cmdbuf, const Pass& pass,
             const std::array<vk::DescriptorType, N>& types,
             const std::array<vk::DescriptorImageInfo, N>& images, const Constants& constants,
             vk::Extent2D size) {
@@ -269,8 +270,7 @@ void Record(vk::CommandBuffer cmdbuf, const Pass& pass,
         };
     }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pass.pipeline);
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pass.layout, 0,
-                                static_cast<u32>(writes.size()), writes.data());
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pass.layout, 0, writes);
     cmdbuf.pushConstants(*pass.layout, vk::ShaderStageFlagBits::eCompute, 0,
                          static_cast<u32>(sizeof(Constants)), &constants);
     cmdbuf.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
@@ -493,7 +493,7 @@ void Passes::ResetHistory() {
     impl->debug_history_valid = false;
 }
 
-void Passes::RecordMask(vk::CommandBuffer cmdbuf, const MaskParams& params) {
+void Passes::RecordMask(const Vulkan::CommandRecorder& cmdbuf, const MaskParams& params) {
     Impl& state = *impl;
     constexpr vk::AccessFlags2 read_write =
         vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite;
@@ -528,7 +528,8 @@ void Passes::RecordMask(vk::CommandBuffer cmdbuf, const MaskParams& params) {
     state.character_history_initialized = true;
 }
 
-void Passes::RecordCameraMotion(vk::CommandBuffer cmdbuf, const CameraMotionParams& params) {
+void Passes::RecordCameraMotion(const Vulkan::CommandRecorder& cmdbuf,
+                                const CameraMotionParams& params) {
     Impl& state = *impl;
     const std::array barriers{
         OverwriteBarrier(state.camera_mv.image, vk::AccessFlagBits2::eShaderStorageWrite)};
@@ -547,7 +548,8 @@ void Passes::RecordCameraMotion(vk::CommandBuffer cmdbuf, const CameraMotionPara
     state.camera_written = true;
 }
 
-void Passes::RecordGrrCameraMotion(vk::CommandBuffer cmdbuf, const GrrCameraMotionParams& params) {
+void Passes::RecordGrrCameraMotion(const Vulkan::CommandRecorder& cmdbuf,
+                                   const GrrCameraMotionParams& params) {
     Impl& state = *impl;
     const std::array barriers{
         OverwriteBarrier(state.camera_mv.image, vk::AccessFlagBits2::eShaderStorageWrite),
@@ -569,7 +571,7 @@ void Passes::RecordGrrCameraMotion(vk::CommandBuffer cmdbuf, const GrrCameraMoti
     state.depth_written = true;
 }
 
-void Passes::PrepareFsr(vk::CommandBuffer cmdbuf) {
+void Passes::PrepareFsr(const Vulkan::CommandRecorder& cmdbuf) {
     Impl& state = *impl;
     std::array<vk::ImageMemoryBarrier2, 5> barriers{
         OverwriteBarrier(state.output.image, vk::AccessFlagBits2::eShaderRead |
@@ -594,7 +596,8 @@ void Passes::PrepareFsr(vk::CommandBuffer cmdbuf) {
     state.depth_written = false;
 }
 
-void Passes::RecordFsr4Inputs(vk::CommandBuffer cmdbuf, const Fsr4InputsParams& params) {
+void Passes::RecordFsr4Inputs(const Vulkan::CommandRecorder& cmdbuf,
+                              const Fsr4InputsParams& params) {
     Impl& state = *impl;
     const Fsr4Images& targets = params.targets;
     std::array<vk::ImageMemoryBarrier2, 5> barriers{
@@ -635,7 +638,7 @@ void Passes::RecordFsr4Inputs(vk::CommandBuffer cmdbuf, const Fsr4InputsParams& 
         constants, params.render_size);
 }
 
-void Passes::RecordStore(vk::CommandBuffer cmdbuf, const StoreParams& params) {
+void Passes::RecordStore(const Vulkan::CommandRecorder& cmdbuf, const StoreParams& params) {
     Impl& state = *impl;
     const Fsr4Image source =
         params.source.image ? params.source
@@ -661,7 +664,7 @@ void Passes::RecordStore(vk::CommandBuffer cmdbuf, const StoreParams& params) {
            constants, params.output_size);
 }
 
-void Passes::RecordFallback(vk::CommandBuffer cmdbuf, const FallbackParams& params) {
+void Passes::RecordFallback(const Vulkan::CommandRecorder& cmdbuf, const FallbackParams& params) {
     Impl& state = *impl;
     const FallbackConstants constants{
         .destination_size = {params.destination_size.width, params.destination_size.height},
@@ -674,7 +677,7 @@ void Passes::RecordFallback(vk::CommandBuffer cmdbuf, const FallbackParams& para
            constants, params.destination_size);
 }
 
-void Passes::RecordDebug(vk::CommandBuffer cmdbuf, const DebugParams& params) {
+void Passes::RecordDebug(const Vulkan::CommandRecorder& cmdbuf, const DebugParams& params) {
     Impl& state = *impl;
     const bool masks = params.view == DebugView::Masks;
     const bool reprojection = params.view == DebugView::Reprojection;

@@ -79,8 +79,9 @@ public:
     /**
      * GPU command thread. Moves towards a ready context for `wanted`, or towards none when it is
      * empty: reads the files, creates the context once `may_allocate` holds and the budget check
-     * passes, takes a finished creation and retires a context that is not wanted. `extra_bytes`
-     * is the memory the caller allocates for the same sizes. Returns Idle when nothing is wanted.
+     * passes, takes a finished creation and retires a context that is not wanted or whose
+     * recorded call failed. `extra_bytes` is the memory the caller allocates for the same sizes.
+     * Returns Idle when nothing is wanted.
      */
     ContextState Update(Vulkan::Scheduler& scheduler, const std::optional<Fsr4Key>& wanted,
                         bool may_allocate, u64 extra_bytes);
@@ -104,20 +105,20 @@ public:
     const Fsr4Images& Images() const;
 
     /**
-     * GPU command thread, before anything of the frame is recorded: retires the frames the GPU
-     * has finished and waits for the oldest when three are in flight, which drops the guest-copy
-     * hold and can submit the open command buffer. Returns false, retiring the context, when the
-     * provider refuses.
+     * GPU command thread, before anything of the frame is recorded: records the release of the
+     * frames the GPU has finished and waits for the oldest when three are in flight, which drops
+     * the guest-copy hold and can submit the open command buffer. Returns false, retiring the
+     * context, when a recorded call of the context failed.
      */
     bool PrepareFrame(Vulkan::Rasterizer& rasterizer);
 
     /**
-     * GPU command thread. Records one dispatch of the ready context into cmdbuf, outside dynamic
-     * rendering, after the input images were written. Returns false, retiring the context and
-     * keeping its key failed, when FSR 4 rejects the dispatch.
+     * GPU command thread. Records one dispatch of the ready context, outside dynamic rendering,
+     * after the input images were written; the provider records its commands through
+     * Scheduler::Record, on the record thread when the scheduler has one. Returns false, retiring
+     * the context and keeping its key failed, when a recorded call of the context failed.
      */
-    bool RecordDispatch(Vulkan::Scheduler& scheduler, vk::CommandBuffer cmdbuf,
-                        const Fsr4Dispatch& dispatch);
+    bool RecordDispatch(Vulkan::Scheduler& scheduler, const Fsr4Dispatch& dispatch);
 
 private:
     struct Impl;

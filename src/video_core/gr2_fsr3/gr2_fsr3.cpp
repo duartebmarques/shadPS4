@@ -212,10 +212,10 @@ public:
 private:
     bool Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer);
     Mode Record(Mode mode, const Frame& frame, Vulkan::Rasterizer& rasterizer);
-    Mode RecordFsr(vk::CommandBuffer cmdbuf, const Frame& frame, const FrameImages& images,
-                   Vulkan::Scheduler& scheduler);
-    Mode RecordFsr4(vk::CommandBuffer cmdbuf, const Frame& frame, const FrameImages& images,
-                    Vulkan::Scheduler& scheduler);
+    Mode RecordFsr(const Vulkan::CommandRecorder& cmdbuf, const Frame& frame,
+                   const FrameImages& images, Vulkan::Scheduler& scheduler);
+    Mode RecordFsr4(const Vulkan::CommandRecorder& cmdbuf, const Frame& frame,
+                    const FrameImages& images, Vulkan::Scheduler& scheduler);
     void ArmJitter(Vulkan::Rasterizer& rasterizer, const Jitter::FramePlan& plan);
     void Publish(Mode mode, const Frame& frame, float interval_ms);
 
@@ -512,7 +512,7 @@ Mode Module::Record(Mode mode, const Frame& frame, Vulkan::Rasterizer& rasterize
     }
 
     rasterizer.ScopeMarkerBegin(mode == Mode::Fsr4 ? "Host/FSR4" : "Host/FSR3");
-    const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();
+    const Vulkan::CommandRecorder cmdbuf = scheduler.CommandBuffer();
     if (mode == Mode::Fsr) {
         mode = RecordFsr(cmdbuf, frame, images, scheduler);
     } else if (mode == Mode::Fsr4) {
@@ -555,8 +555,8 @@ Mode Module::Record(Mode mode, const Frame& frame, Vulkan::Rasterizer& rasterize
     return mode;
 }
 
-Mode Module::RecordFsr(vk::CommandBuffer cmdbuf, const Frame& frame, const FrameImages& images,
-                       Vulkan::Scheduler& scheduler) {
+Mode Module::RecordFsr(const Vulkan::CommandRecorder& cmdbuf, const Frame& frame,
+                       const FrameImages& images, Vulkan::Scheduler& scheduler) {
     const Settings::Values& settings = frame.settings;
     const auto& [render, output] = frame.sizes;
     passes->Resize(scheduler, render, output, settings.character_camera_motion, false);
@@ -615,7 +615,7 @@ Mode Module::RecordFsr(vk::CommandBuffer cmdbuf, const Frame& frame, const Frame
         .reset = frame.reset,
         .frame_id = frame_id++,
     };
-    if (!context.RecordDispatch(cmdbuf, dispatch, settings.validate)) {
+    if (!context.RecordDispatch(scheduler, dispatch)) {
         const bool native = frame.kind == Kind::Native;
         if (!logged_rejected) {
             logged_rejected = true;
@@ -636,8 +636,8 @@ Mode Module::RecordFsr(vk::CommandBuffer cmdbuf, const Frame& frame, const Frame
     return Mode::Fsr;
 }
 
-Mode Module::RecordFsr4(vk::CommandBuffer cmdbuf, const Frame& frame, const FrameImages& images,
-                        Vulkan::Scheduler& scheduler) {
+Mode Module::RecordFsr4(const Vulkan::CommandRecorder& cmdbuf, const Frame& frame,
+                        const FrameImages& images, Vulkan::Scheduler& scheduler) {
     const Settings::Values& settings = frame.settings;
     const auto& [render, output] = frame.sizes;
     passes->ResizeFsr4(scheduler, render, settings.character_camera_motion);
@@ -672,7 +672,7 @@ Mode Module::RecordFsr4(vk::CommandBuffer cmdbuf, const Frame& frame, const Fram
         .output_size = output,
         .reset = frame.reset,
     };
-    if (!fsr4.RecordDispatch(scheduler, cmdbuf, dispatch)) {
+    if (!fsr4.RecordDispatch(scheduler, dispatch)) {
         const bool native = frame.kind == Kind::Native;
         if (!logged_fsr4_rejected) {
             logged_fsr4_rejected = true;

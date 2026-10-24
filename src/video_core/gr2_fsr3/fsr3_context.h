@@ -106,12 +106,12 @@ public:
     std::string Notice() const;
 
     /**
-     * GPU command thread. Records one dispatch of the ready context into cmdbuf, outside dynamic
-     * rendering. Returns false when FSR rejects the dispatch. The validation issues of a rejected
-     * dispatch are logged once per distinct set; with `log_issues` every dispatch is validated
-     * before it is recorded.
+     * GPU command thread. Records one dispatch of the ready context outside dynamic rendering;
+     * FSR records its commands through Scheduler::Record, on the record thread when the scheduler
+     * has one. Returns false when validation rejects the dispatch, logging each distinct set of
+     * issues once.
      */
-    bool RecordDispatch(vk::CommandBuffer cmdbuf, const FsrDispatch& dispatch, bool log_issues);
+    bool RecordDispatch(Vulkan::Scheduler& scheduler, const FsrDispatch& dispatch);
 
 private:
     struct Impl;

@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -90,6 +91,35 @@ u64 EstimateBytes(const Fsr4Key& key) {
            40 * output_pixels + 16 * render_pixels + 2_MB;
 }
 
+// A failure of a provider call recorded through Scheduler::Record, kept with the generation of
+// its context. The recorded calls report it; the GPU command thread takes it.
+class RecordedFailure {
+public:
+    void Report(u64 generation, std::string text) {
+        std::scoped_lock lock{mutex};
+        failed_generation = generation;
+        message = std::move(text);
+    }
+
+    bool HasFailed(u64 generation) {
+        std::scoped_lock lock{mutex};
+        return failed_generation == generation;
+    }
+
+    std::optional<std::string> Take(u64 generation) {
+        std::scoped_lock lock{mutex};
+        if (failed_generation != generation) {
+            return std::nullopt;
+        }
+        return std::exchange(message, std::nullopt);
+    }
+
+private:
+    std::mutex mutex;
+    u64 failed_generation{}; ///< 0 until a context fails; generations count from 1.
+    std::optional<std::string> message;
+};
+
 } // namespace
 
 struct Fsr4Context::Impl {
@@ -132,11 +162,10 @@ struct Fsr4Context::Impl {
     ContextState Update(Vulkan::Scheduler& scheduler, const std::optional<Fsr4Key>& wanted,
                         bool may_allocate, u64 extra_bytes);
     bool PrepareFrame(Vulkan::Rasterizer& rasterizer);
-    bool RecordDispatch(Vulkan::Scheduler& scheduler, vk::CommandBuffer cmdbuf,
-                        const Fsr4Dispatch& dispatch);
+    bool RecordDispatch(Vulkan::Scheduler& scheduler, const Fsr4Dispatch& dispatch);
     Created Create(const Fsr4Key& key, const Fsr4Assets& assets) const;
     void Retire(Vulkan::Scheduler& scheduler);
-    void Fail(Vulkan::Scheduler& scheduler, std::string message);
+    bool TakeRecordedFailure(Vulkan::Scheduler& scheduler);
     void EnqueueDestroy(std::unique_ptr<Resources> resources);
 
     const Vulkan::Instance& instance;
@@ -165,6 +194,7 @@ struct Fsr4Context::Impl {
     std::deque<InFlight> frames;
     u64 next_frame_id{};
     bool logged_wait{};
+    RecordedFailure recorded_failure;
 
     // The provider creates contexts through one process-global interface pointer. Loads,
     // creations and destructions run on this worker, one at a time.
@@ -238,6 +268,7 @@ ContextState Fsr4Context::Impl::Update(Vulkan::Scheduler& scheduler,
     if (!supported) {
         return wanted ? ContextState::Unsupported : ContextState::Idle;
     }
+    TakeRecordedFailure(scheduler);
     if (IsReady(loading)) {
         Fsr4LoadResult result = loading.get();
         if (!result.assets) {
@@ -359,18 +390,23 @@ bool Fsr4Context::Impl::PrepareFrame(Vulkan::Rasterizer& rasterizer) {
         frames.pop_front();
     }
     if (newest) {
-        const s32 result = Gr2Fsr4Retire(current->context, *newest);
-        if (result != VK_SUCCESS) {
-            Fail(scheduler, fmt::format("FSR 4 cannot release frame {}: {}", *newest,
-                                        vk::to_string(static_cast<vk::Result>(result))));
-            return false;
-        }
+        scheduler.Record([context = current->context, completed = *newest, generation = generation,
+                          failure = &recorded_failure](vk::CommandBuffer) {
+            if (failure->HasFailed(generation)) {
+                return;
+            }
+            const s32 result = Gr2Fsr4Retire(context, completed);
+            if (result != VK_SUCCESS) {
+                failure->Report(generation,
+                                fmt::format("FSR 4 cannot release frame {}: {}", completed,
+                                            vk::to_string(static_cast<vk::Result>(result))));
+            }
+        });
     }
-    return true;
+    return !TakeRecordedFailure(scheduler);
 }
 
-bool Fsr4Context::Impl::RecordDispatch(Vulkan::Scheduler& scheduler, vk::CommandBuffer cmdbuf,
-                                       const Fsr4Dispatch& dispatch) {
+bool Fsr4Context::Impl::RecordDispatch(Vulkan::Scheduler& scheduler, const Fsr4Dispatch& dispatch) {
     // The output is written from scratch. The source scope also covers the reads of the previous
     // frame.
     const vk::ImageMemoryBarrier2 output_barrier{
@@ -386,7 +422,7 @@ bool Fsr4Context::Impl::RecordDispatch(Vulkan::Scheduler& scheduler, vk::Command
         .image = images.output.image,
         .subresourceRange = ColorRange,
     };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
         .imageMemoryBarrierCount = 1,
         .pImageMemoryBarriers = &output_barrier,
     });
@@ -400,7 +436,6 @@ bool Fsr4Context::Impl::RecordDispatch(Vulkan::Scheduler& scheduler, vk::Command
     };
     const vk::Extent2D render = current_key.max_render_size;
     const Gr2Fsr4DispatchInfo info{
-        .command_buffer = static_cast<VkCommandBuffer>(cmdbuf),
         .frame_id = next_frame_id,
         .color = image(images.color, render),
         .depth = image(images.depth, render),
@@ -416,9 +451,20 @@ bool Fsr4Context::Impl::RecordDispatch(Vulkan::Scheduler& scheduler, vk::Command
         .output_height = dispatch.output_size.height,
         .reset = dispatch.reset ? 1u : 0u,
     };
-    const Gr2Fsr4Status status = Gr2Fsr4Dispatch(current->context, &info);
-    if (status.stage != GR2_FSR4_STAGE_NONE) {
-        Fail(scheduler, fmt::format("FSR 4 rejected the dispatch: {}", StatusText(status)));
+    scheduler.Record([context = current->context, info, generation = generation,
+                      failure = &recorded_failure](vk::CommandBuffer cmdbuf) {
+        if (failure->HasFailed(generation)) {
+            return;
+        }
+        Gr2Fsr4DispatchInfo recorded = info;
+        recorded.command_buffer = static_cast<VkCommandBuffer>(cmdbuf);
+        const Gr2Fsr4Status status = Gr2Fsr4Dispatch(context, &recorded);
+        if (status.stage != GR2_FSR4_STAGE_NONE) {
+            failure->Report(generation,
+                            fmt::format("FSR 4 rejected the dispatch: {}", StatusText(status)));
+        }
+    });
+    if (TakeRecordedFailure(scheduler)) {
         return false;
     }
     frames.push_back({.frame_id = next_frame_id++, .tick = scheduler.CurrentTick()});
@@ -506,23 +552,41 @@ Fsr4Context::Impl::Created Fsr4Context::Impl::Create(const Fsr4Key& key,
 }
 
 void Fsr4Context::Impl::Retire(Vulkan::Scheduler& scheduler) {
+    const u64 tick = scheduler.CurrentTick();
     LOG_INFO(Render_Vulkan, "GR2 FSR4: context {} retired, destroyed after GPU tick {}",
-             FormatSizes(current_key.max_render_size, current_key.max_output_size),
-             scheduler.CurrentTick());
+             FormatSizes(current_key.max_render_size, current_key.max_output_size), tick);
     ++destroying;
-    scheduler.DeferOperation(
-        [this, resources = std::move(current)]() mutable { EnqueueDestroy(std::move(resources)); });
+    // With a record thread, the provider calls recorded up to this tick run there; waiting for
+    // its submit of the tick orders them before the destruction on the worker. A failure they
+    // report after the last TakeRecordedFailure is logged here.
+    scheduler.DeferOperation([this, &scheduler, tick, generation = generation, key = current_key,
+                              resources = std::move(current)]() mutable {
+        scheduler.WaitSubmitted(tick);
+        if (const std::optional<std::string> message = recorded_failure.Take(generation)) {
+            LOG_ERROR(Render_Vulkan, "GR2 FSR4: context {}: {}",
+                      FormatSizes(key.max_render_size, key.max_output_size), *message);
+        }
+        EnqueueDestroy(std::move(resources));
+    });
     images = {};
     memory_bytes = 0;
     frames.clear();
 }
 
-void Fsr4Context::Impl::Fail(Vulkan::Scheduler& scheduler, std::string message) {
+bool Fsr4Context::Impl::TakeRecordedFailure(Vulkan::Scheduler& scheduler) {
+    if (!current) {
+        return false;
+    }
+    std::optional<std::string> message = recorded_failure.Take(generation);
+    if (!message) {
+        return false;
+    }
     LOG_ERROR(Render_Vulkan, "GR2 FSR4: context {}: {}",
-              FormatSizes(current_key.max_render_size, current_key.max_output_size), message);
+              FormatSizes(current_key.max_render_size, current_key.max_output_size), *message);
     failed_key = current_key;
-    notice = std::move(message);
+    notice = std::move(*message);
     Retire(scheduler);
+    return true;
 }
 
 void Fsr4Context::Impl::EnqueueDestroy(std::unique_ptr<Resources> resources) {
@@ -610,9 +674,8 @@ bool Fsr4Context::PrepareFrame(Vulkan::Rasterizer& rasterizer) {
     return impl->PrepareFrame(rasterizer);
 }
 
-bool Fsr4Context::RecordDispatch(Vulkan::Scheduler& scheduler, vk::CommandBuffer cmdbuf,
-                                 const Fsr4Dispatch& dispatch) {
-    return impl->RecordDispatch(scheduler, cmdbuf, dispatch);
+bool Fsr4Context::RecordDispatch(Vulkan::Scheduler& scheduler, const Fsr4Dispatch& dispatch) {
+    return impl->RecordDispatch(scheduler, dispatch);
 }
 
 } // namespace Gr2Fsr3
