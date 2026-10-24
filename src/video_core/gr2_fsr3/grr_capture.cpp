@@ -225,7 +225,8 @@ GrrViewport ViewportOf(const AmdGpu::Regs& regs) {
     const bool at_origin = std::abs(viewport.x_offset - std::abs(viewport.x_scale)) <= 0.5f &&
                            std::abs(viewport.y_offset - std::abs(viewport.y_scale)) <= 0.5f;
     if (at_origin && whole(width) && whole(height)) {
-        viewport.size = {static_cast<u32>(std::round(width)), static_cast<u32>(std::round(height))};
+        viewport.size =
+            vk::Extent2D{static_cast<u32>(std::round(width)), static_cast<u32>(std::round(height))};
     }
     return viewport;
 }
@@ -652,7 +653,7 @@ bool GrrCapture::IdentifyFxaa(const Vulkan::GraphicsPipeline& pipeline,
     }
     const GrrViewport viewport = ViewportOf(regs);
     const AmdGpu::Scissor scissor = ScissorOf(regs);
-    draw.render_size = {draw.color.Width(), draw.color.Height()};
+    draw.render_size = vk::Extent2D{draw.color.Width(), draw.color.Height()};
     draw.output_size = viewport.size;
 
     const AmdGpu::Image& input = draw.color.tsharp;
