@@ -126,8 +126,8 @@ MaskParams MasksOf(const GrrFrame& frame, const GrrImages& images) {
     return {
         .stencil = images.stencil.view,
         .render_size = frame.draw.render_size,
-        .reactive_characters = static_cast<float>(settings.reactive_characters) / 100.0f,
-        .tc_characters = static_cast<float>(settings.tc_characters) / 100.0f,
+        .reactive_characters = static_cast<float>(settings.grr_reactive_characters) / 100.0f,
+        .tc_characters = static_cast<float>(settings.grr_tc_characters) / 100.0f,
         .character_history = (settings.test & TestBit::CharacterMaskHistory) != 0,
         .character_stencil = GrrCharacterStencil,
         .geometry_stencil = 0,
@@ -139,7 +139,7 @@ MaskParams MasksOf(const GrrFrame& frame, const GrrImages& images) {
 // target, alpha 1. It reads output, a null image for the FSR 3.1 output.
 StoreParams StoreOf(const GrrFrame& frame, const GrrImages& images, const Fsr4Image& output) {
     const Settings::Values& settings = frame.settings;
-    const float sharpness = static_cast<float>(settings.sharpness) / 100.0f;
+    const float sharpness = static_cast<float>(settings.grr_sharpness) / 100.0f;
     return {
         .destination = images.output.view,
         .output_size = frame.draw.output_size,
@@ -412,7 +412,7 @@ bool GrrModule::OnFxaa(const Vulkan::GraphicsPipeline& pipeline, const AmdGpu::L
     if (stock) {
         LogStock(*stock);
     }
-    frame.masks = settings.reactive_characters > 0 || settings.tc_characters > 0 ||
+    frame.masks = settings.grr_reactive_characters > 0 || settings.grr_tc_characters > 0 ||
                   (settings.test & TestBit::CharacterMaskHistory) != 0;
 
     if (mode != Mode::Stock && !passes && !passes_failed) {
@@ -569,7 +569,7 @@ Mode GrrModule::RecordFsr(const Vulkan::CommandRecorder& cmdbuf, const GrrFrame&
         .motion_vectors = passes->CameraMotionVectors(),
         .reactive = frame.masks ? passes->ReactiveMask() : FsrImage{},
         .transparency =
-            frame.masks && settings.tc_characters > 0 ? passes->TransparencyMask() : FsrImage{},
+            frame.masks && settings.grr_tc_characters > 0 ? passes->TransparencyMask() : FsrImage{},
         .output = passes->Output(),
         .jitter_x = motion.jitter_x,
         .jitter_y = motion.jitter_y,

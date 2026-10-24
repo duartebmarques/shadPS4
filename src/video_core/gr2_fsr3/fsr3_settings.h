@@ -20,6 +20,9 @@ struct Values {
     bool fsr4_enable{false};
     bool grr_enable{false};
     bool grr_fsr4_enable{false};
+    s32 grr_sharpness{30};
+    s32 grr_reactive_characters{9};
+    s32 grr_tc_characters{9};
     Fsr4Model fsr4_model{Fsr4Model::Auto};
     s32 sharpness{0};
     Fxaa fxaa{Fxaa::Off};

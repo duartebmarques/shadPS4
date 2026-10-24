@@ -85,6 +85,9 @@ std::atomic<u32> g_enable{};
 std::atomic<u32> g_fsr4_enable{};
 std::atomic<u32> g_grr_enable{};
 std::atomic<u32> g_grr_fsr4_enable{};
+std::atomic<u32> g_grr_sharpness{};
+std::atomic<u32> g_grr_reactive_characters{};
+std::atomic<u32> g_grr_tc_characters{};
 std::atomic<u32> g_fsr4_model{};
 std::atomic<u32> g_sharpness{};
 std::atomic<u32> g_fxaa{};
@@ -109,6 +112,10 @@ constexpr auto Keys = std::to_array<Key>({
     {"fsr4Enable", Type::Bool, &g_fsr4_enable, Defaults.fsr4_enable},
     {"grrFsr3Enable", Type::Bool, &g_grr_enable, Defaults.grr_enable},
     {"grrFsr4Enable", Type::Bool, &g_grr_fsr4_enable, Defaults.grr_fsr4_enable},
+    {"grrFsr3Sharpness", Type::Percent, &g_grr_sharpness, Defaults.grr_sharpness},
+    {"grrFsr3ReactiveCharacters", Type::Percent, &g_grr_reactive_characters,
+     Defaults.grr_reactive_characters},
+    {"grrFsr3TcCharacters", Type::Percent, &g_grr_tc_characters, Defaults.grr_tc_characters},
     {"fsr4Model", Type::Name, &g_fsr4_model, static_cast<u32>(Defaults.fsr4_model), Fsr4ModelNames},
     {"fsr3Sharpness", Type::Percent, &g_sharpness, Defaults.sharpness},
     {"fsr3Fxaa", Type::Index, &g_fxaa, static_cast<u32>(Defaults.fxaa), FxaaNames},
@@ -350,6 +357,9 @@ Settings::Values Settings::Snapshot() {
         .fsr4_enable = load(g_fsr4_enable) != 0,
         .grr_enable = load(g_grr_enable) != 0,
         .grr_fsr4_enable = load(g_grr_fsr4_enable) != 0,
+        .grr_sharpness = static_cast<s32>(load(g_grr_sharpness)),
+        .grr_reactive_characters = static_cast<s32>(load(g_grr_reactive_characters)),
+        .grr_tc_characters = static_cast<s32>(load(g_grr_tc_characters)),
         .fsr4_model = static_cast<Fsr4Model>(load(g_fsr4_model)),
         .sharpness = static_cast<s32>(load(g_sharpness)),
         .fxaa = static_cast<Fxaa>(load(g_fxaa)),
@@ -408,14 +418,14 @@ void DrawMenu() {
     EditBool("Enable FSR 3.1", is_gr2 ? g_enable : g_grr_enable);
     EditBool("Enable FSR 4 (INT8, experimental)", is_gr2 ? g_fsr4_enable : g_grr_fsr4_enable);
     EditChoice("FSR 4 model", g_fsr4_model, Fsr4ModelNames);
-    EditPercent("Sharpness", g_sharpness);
+    EditPercent("Sharpness", is_gr2 ? g_sharpness : g_grr_sharpness);
     EditChoice("FXAA", g_fxaa, FxaaNames);
-    EditPercent("Reactive characters", g_reactive_characters);
+    EditPercent("Reactive characters", is_gr2 ? g_reactive_characters : g_grr_reactive_characters);
     if (is_gr2) {
         EditPercent("Reactive effects", g_reactive_effects);
         EditPercent("Reactive outlines", g_reactive_outline);
     }
-    EditPercent("T&C characters", g_tc_characters);
+    EditPercent("T&C characters", is_gr2 ? g_tc_characters : g_grr_tc_characters);
     if (is_gr2) {
         EditBool("Character camera motion", g_character_camera_motion);
     }
