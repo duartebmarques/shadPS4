@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -39,11 +40,21 @@ using Core::FileSys::FileStat;
 using Core::FileSys::IFile;
 using Core::FileSys::MmapPolicy;
 
-constexpr u64 PackFormat = 1;
+constexpr u64 MaxPackFormat = 2;
 constexpr u64 HeaderSize = 32;
 constexpr u64 EntrySize = 30;
 constexpr u32 EncryptedTocFlag = 4;
 constexpr u64 MaxTocLength = 64_MB;
+
+// An original member, possibly of another archive, whose bytes a delta copies after those of the
+// member it rebuilds.
+struct Source {
+    std::string archive_name;
+    std::string archive;
+    std::string path;
+    u64 size{};
+    u32 crc{};
+};
 
 struct Member {
     std::string archive_name; // As the pack writes it.
@@ -54,13 +65,32 @@ struct Member {
     u64 new_size{};
     u32 new_crc{};
     std::filesystem::path delta;
+    std::vector<Source> sources;
 };
 
 struct Pack {
+    std::string name; // The layout or the mod.
     std::filesystem::path dir;
     bool motion_controls{true};
     bool has_input_override{};
     std::vector<Member> members;
+};
+
+// The packs of the running game in the order they apply: the button prompt layout, then the mods.
+struct PackSet {
+    std::vector<Pack> packs;
+    std::optional<std::size_t> layout;
+};
+
+// A mod pack of Gravity Rush 2 and the GR2Fork setting that turns it off. Mods are on unless the
+// setting is false.
+struct ModPack {
+    const char* folder;
+    const char* key;
+};
+
+constexpr std::array Gr2ModPacks{
+    ModPack{"halloween", "gr2HalloweenItems"},
 };
 
 // An archive as the game sees it with the pack applied: the patched table of contents, the
@@ -180,9 +210,10 @@ std::optional<std::vector<u8>> ReadHostFile(const std::filesystem::path& path) {
     return bytes;
 }
 
-// Reads the layout key from the per-game file first, then from config.json, like the other
-// GR2Fork settings.
-std::string ReadLayout(const char* key) {
+// Reads a GR2Fork setting from the per-game file first, then from config.json, like the other
+// GR2Fork settings. A value of another type is ignored.
+template <typename T>
+std::optional<T> ReadSetting(const char* key) {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
     const std::array files{
         Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (serial + ".json"),
@@ -201,15 +232,44 @@ std::string ReadLayout(const char* key) {
         if (section == root.end() || !section->is_object()) {
             continue;
         }
-        if (const auto value = Field<std::string>(*section, key)) {
-            return Common::ToLower(*value);
+        if (const auto value = Field<T>(*section, key)) {
+            return value;
         }
         if (section->contains(key)) {
             LOG_WARNING(Loader, "Prompt packs: ignoring {} = {} in {}", key,
                         section->at(key).dump(), Common::FS::PathToUTF8String(path));
         }
     }
-    return "off";
+    return std::nullopt;
+}
+
+std::string ReadLayout(const char* key) {
+    const auto layout = ReadSetting<std::string>(key);
+    return layout ? Common::ToLower(*layout) : "off";
+}
+
+bool IsSafeRelative(const std::filesystem::path& path) {
+    return !path.is_absolute() &&
+           std::none_of(path.begin(), path.end(),
+                        [](const std::filesystem::path& part) { return part == ".."; });
+}
+
+std::optional<Source> ParseSource(const nlohmann::json& object) {
+    const auto archive = Field<std::string>(object, "archive");
+    const auto path = Field<std::string>(object, "path");
+    const auto size = Field<u64>(object, "size");
+    const auto crc = Field<std::string>(object, "crc32");
+    const auto crc_value = crc ? ParseCrc(*crc) : std::nullopt;
+    if (!archive || !path || !size || !crc_value) {
+        return std::nullopt;
+    }
+    return Source{
+        .archive_name = *archive,
+        .archive = Common::ToLower(*archive),
+        .path = NormalizeMemberPath(*path),
+        .size = *size,
+        .crc = *crc_value,
+    };
 }
 
 std::optional<Member> ParseMember(const nlohmann::json& object, const std::filesystem::path& dir) {
@@ -226,12 +286,10 @@ std::optional<Member> ParseMember(const nlohmann::json& object, const std::files
     const auto orig_crc_value = ParseCrc(*orig_crc);
     const auto new_crc_value = ParseCrc(*new_crc);
     const std::filesystem::path delta_path{*delta};
-    if (!orig_crc_value || !new_crc_value || delta_path.is_absolute() ||
-        std::any_of(delta_path.begin(), delta_path.end(),
-                    [](const std::filesystem::path& part) { return part == ".."; })) {
+    if (!orig_crc_value || !new_crc_value || !IsSafeRelative(delta_path)) {
         return std::nullopt;
     }
-    return Member{
+    Member member{
         .archive_name = *archive,
         .archive = Common::ToLower(*archive),
         .path = NormalizeMemberPath(*path),
@@ -241,40 +299,44 @@ std::optional<Member> ParseMember(const nlohmann::json& object, const std::files
         .new_crc = *new_crc_value,
         .delta = dir / delta_path,
     };
+    if (const auto sources = object.find("sources"); sources != object.end()) {
+        if (!sources->is_array()) {
+            return std::nullopt;
+        }
+        for (const auto& item : *sources) {
+            auto source = ParseSource(item);
+            if (!source) {
+                return std::nullopt;
+            }
+            member.sources.push_back(std::move(*source));
+        }
+    }
+    return member;
 }
 
-std::optional<Pack> LoadPack() {
-    const bool is_gr2 = Common::IsGravityRush2();
-    if (!is_gr2 && !Common::IsGravityRushRemastered()) {
-        return std::nullopt;
-    }
-    const std::string game = is_gr2 ? "GR2" : "GRR";
-    const std::string layout = ReadLayout(is_gr2 ? "gr2PromptLayout" : "grrPromptLayout");
-    if (layout == "off") {
-        return std::nullopt;
-    }
-    if (layout != "xbox" && layout != "switch") {
-        LOG_WARNING(Loader, "Prompt packs: unknown layout \"{}\", the game keeps its prompts",
-                    layout);
-        return std::nullopt;
-    }
-
-    Pack pack{.dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "prompt_mods" / game /
-                     layout};
+// Loads prompt_mods/<game>/<folder>/pack.json. kind names the field that holds the folder name:
+// "layout" for a button prompt pack, "mod" for a mod pack.
+std::optional<Pack> LoadPack(const std::string& game, const std::string& folder, const char* kind) {
+    Pack pack{
+        .name = folder,
+        .dir =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "prompt_mods" / game / folder,
+    };
     const auto manifest_path = pack.dir / "pack.json";
     std::ifstream file{manifest_path};
     if (!file) {
-        LOG_ERROR(Loader, "Prompt packs: {} is missing, the game keeps its prompts",
-                  Common::FS::PathToUTF8String(manifest_path));
+        LOG_ERROR(Loader, "Prompt packs: {} is missing, the {} pack is not applied",
+                  Common::FS::PathToUTF8String(manifest_path), folder);
         return std::nullopt;
     }
     const auto root = nlohmann::json::parse(file, nullptr, false);
     const auto members = root.is_object() ? root.find("members") : root.end();
-    if (!root.is_object() || Field<u64>(root, "format") != PackFormat ||
-        Field<std::string>(root, "game") != game || Field<std::string>(root, "layout") != layout ||
+    const auto format = root.is_object() ? Field<u64>(root, "format") : std::nullopt;
+    if (!format || *format == 0 || *format > MaxPackFormat ||
+        Field<std::string>(root, "game") != game || Field<std::string>(root, kind) != folder ||
         members == root.end() || !members->is_array()) {
-        LOG_ERROR(Loader, "Prompt packs: {} is not a format {} pack for {} {}",
-                  Common::FS::PathToUTF8String(manifest_path), PackFormat, game, layout);
+        LOG_ERROR(Loader, "Prompt packs: {} is not a {} pack for {} {}",
+                  Common::FS::PathToUTF8String(manifest_path), kind, game, folder);
         return std::nullopt;
     }
     for (const auto& object : *members) {
@@ -289,30 +351,75 @@ std::optional<Pack> LoadPack() {
     pack.motion_controls = Field<bool>(root, "motion_controls").value_or(true);
     std::error_code ec;
     pack.has_input_override = std::filesystem::is_regular_file(pack.dir / "input.ini", ec);
-    LOG_INFO(Loader, "Prompt packs: {} {} {} with {} members", game, layout,
+    LOG_INFO(Loader, "Prompt packs: {} {} {} with {} members", game, folder,
              Field<std::string>(root, "version").value_or("(no version)"), pack.members.size());
     return pack;
 }
 
-const Pack* ActivePack() {
+PackSet LoadPacks() {
+    PackSet set;
+    const bool is_gr2 = Common::IsGravityRush2();
+    if (!is_gr2 && !Common::IsGravityRushRemastered()) {
+        return set;
+    }
+    const std::string game = is_gr2 ? "GR2" : "GRR";
+    const std::string layout = ReadLayout(is_gr2 ? "gr2PromptLayout" : "grrPromptLayout");
+    if (layout == "xbox" || layout == "switch") {
+        if (auto pack = LoadPack(game, layout, "layout")) {
+            set.layout = set.packs.size();
+            set.packs.push_back(std::move(*pack));
+        }
+    } else if (layout != "off") {
+        LOG_WARNING(Loader, "Prompt packs: unknown layout \"{}\", the game keeps its prompts",
+                    layout);
+    }
+    if (!is_gr2) {
+        return set;
+    }
+    const auto mods = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "prompt_mods" / game;
+    for (const ModPack& mod : Gr2ModPacks) {
+        if (!ReadSetting<bool>(mod.key).value_or(true)) {
+            continue;
+        }
+        std::error_code ec;
+        if (!std::filesystem::is_directory(mods / mod.folder, ec)) {
+            LOG_INFO(Loader, "Prompt packs: the {} mod is not installed", mod.folder);
+            continue;
+        }
+        if (auto pack = LoadPack(game, mod.folder, "mod")) {
+            set.packs.push_back(std::move(*pack));
+        }
+    }
+    return set;
+}
+
+const PackSet& ActivePacks() {
+    static const PackSet none;
     static std::mutex mutex;
-    static std::optional<Pack> pack;
+    static PackSet set;
     static bool loaded{};
     std::scoped_lock lock{mutex};
     if (!loaded) {
-        // The layout is per game, so nothing is decided before the game serial is known.
+        // The settings are per game, so nothing is decided before the game serial is known.
         if (Common::ElfInfo::Instance().GameSerial().empty()) {
-            return nullptr;
+            return none;
         }
         loaded = true;
-        pack = LoadPack();
+        set = LoadPacks();
     }
-    return pack ? &*pack : nullptr;
+    return set;
 }
 
-bool HasArchive(const Pack& pack, const std::string& name) {
-    return std::ranges::any_of(pack.members,
-                               [&](const Member& member) { return member.archive == name; });
+const Pack* LayoutPack() {
+    const PackSet& set = ActivePacks();
+    return set.layout ? &set.packs[*set.layout] : nullptr;
+}
+
+bool HasArchive(const PackSet& set, const std::string& name) {
+    return std::ranges::any_of(set.packs, [&](const Pack& pack) {
+        return std::ranges::any_of(pack.members,
+                                   [&](const Member& member) { return member.archive == name; });
+    });
 }
 
 bool ReadAt(IFile& file, u64 offset, std::span<u8> dst) {
@@ -517,33 +624,42 @@ void AppendBlocks(std::span<const u8> member, const Toc& toc, std::vector<u8>& t
     }
 }
 
-// Patches every member the pack replaces in one archive, or returns nothing when any of them
-// fails to verify.
-std::shared_ptr<const Overlay> BuildOverlay(IFile& file, const Pack& pack,
-                                            const std::string& archive) {
-    auto overlay = std::make_shared<Overlay>();
-    overlay->base_size = file.Size();
-    const auto toc = ReadToc(file, overlay->toc);
+// Set while the packs open their other archives, so those opens return the original files.
+thread_local bool g_opening_archives{};
+
+// An archive the packs replace members of or read source members from.
+struct Archive {
+    std::string name; // As a pack writes it.
+    std::unique_ptr<IFile> owned;
+    IFile* file{};
+    Toc toc;
+    std::vector<u8> toc_bytes;
+    bool compress{};
+    std::unordered_map<std::string, u64> entries; // Member path -> entry index, 0 when absent.
+};
+
+using MemberKey = std::pair<std::string, std::string>; // Archive, member path.
+
+// Reads the table of contents and finds the entry of every path the packs ask for.
+bool IndexArchive(Archive& archive) {
+    const auto toc = ReadToc(*archive.file, archive.toc_bytes);
     if (!toc) {
-        LOG_ERROR(Loader, "Prompt packs: {} is not a PSARC archive the pack can patch", archive);
-        return nullptr;
+        LOG_ERROR(Loader, "Prompt packs: {} is not a PSARC archive the packs can patch",
+                  archive.name);
+        return false;
     }
-    const auto manifest = ReadMember(file, *toc, overlay->toc, ReadEntry(overlay->toc, 0));
+    archive.toc = *toc;
+    const auto manifest =
+        ReadMember(*archive.file, *toc, archive.toc_bytes, ReadEntry(archive.toc_bytes, 0));
     if (!manifest) {
-        LOG_ERROR(Loader, "Prompt packs: the file list of {} is unreadable", archive);
-        return nullptr;
+        LOG_ERROR(Loader, "Prompt packs: the file list of {} is unreadable", archive.name);
+        return false;
     }
     // The new blocks follow the archive's own convention, so a reader that only ever sees raw
     // blocks in it gets raw blocks.
-    const bool compress = HasZlibBlocks(overlay->toc, *toc);
+    archive.compress = HasZlibBlocks(archive.toc_bytes, *toc);
 
     // Line i of the file list names entry i + 1.
-    std::unordered_map<std::string, u64> entries;
-    for (const Member& member : pack.members) {
-        if (member.archive == archive) {
-            entries.emplace(member.path, 0);
-        }
-    }
     const std::string_view list{reinterpret_cast<const char*>(manifest->data()), manifest->size()};
     u64 line_index = 0;
     for (u64 start = 0; start < list.size() && line_index + 1 < toc->entry_count; ++line_index) {
@@ -552,95 +668,182 @@ std::shared_ptr<const Overlay> BuildOverlay(IFile& file, const Pack& pack,
         if (line.ends_with('\r')) {
             line.remove_suffix(1);
         }
-        if (const auto it = entries.find(NormalizeMemberPath(line)); it != entries.end()) {
+        if (const auto it = archive.entries.find(NormalizeMemberPath(line));
+            it != archive.entries.end()) {
             it->second = line_index + 1;
         }
         start = end + 1;
     }
-
-    u64 replaced = 0;
-    for (const Member& member : pack.members) {
-        if (member.archive != archive) {
-            continue;
-        }
-        const u64 index = entries.at(member.path);
-        if (index == 0) {
-            LOG_ERROR(Loader, "Prompt packs: {} has no {}", archive, member.path);
-            return nullptr;
-        }
-        const Entry entry = ReadEntry(overlay->toc, index);
-        const auto orig = entry.length == member.orig_size
-                              ? ReadMember(file, *toc, overlay->toc, entry)
-                              : std::nullopt;
-        if (!orig || Crc32(*orig) != member.orig_crc) {
-            LOG_ERROR(Loader, "Prompt packs: {} in {} is not the version the pack was made for",
-                      member.path, archive);
-            return nullptr;
-        }
-        const auto delta = ReadHostFile(member.delta);
-        const auto updated = delta ? ApplyDelta(*orig, *delta) : std::nullopt;
-        if (!updated || updated->size() != member.new_size || Crc32(*updated) != member.new_crc ||
-            BlockCount(updated->size(), toc->block_size) !=
-                BlockCount(entry.length, toc->block_size)) {
-            LOG_ERROR(Loader, "Prompt packs: the delta for {} in {} is missing or damaged",
-                      member.path, archive);
-            return nullptr;
-        }
-        u8* entry_bytes = EntryBytes(overlay->toc, index);
-        WriteBe(entry_bytes + 20, 5, updated->size());
-        WriteBe(entry_bytes + 25, 5, overlay->Size());
-        AppendBlocks(*updated, *toc, overlay->toc, entry.block, compress, overlay->data);
-        ++replaced;
-    }
-    LOG_INFO(Loader, "Prompt packs: replaced {} members in {}", replaced, archive);
-    return overlay;
+    return true;
 }
 
-// Set while the pack opens its other archives, so those opens return the original files.
-thread_local bool g_opening_archives{};
+std::optional<std::vector<u8>> ReadOriginal(std::map<std::string, Archive>& archives,
+                                            const std::string& name, const std::string& path) {
+    Archive& archive = archives.at(name);
+    const u64 index = archive.file != nullptr ? archive.entries.at(path) : 0;
+    if (index == 0) {
+        LOG_ERROR(Loader, "Prompt packs: {} has no {}", archive.name, path);
+        return std::nullopt;
+    }
+    return ReadMember(*archive.file, archive.toc, archive.toc_bytes,
+                      ReadEntry(archive.toc_bytes, index));
+}
 
-// Patches every archive of the pack at the first open of one of them. The archives of a pack sit
-// in one folder. The pack applies only when every member of every archive verifies.
-std::unordered_map<std::string, std::shared_ptr<const Overlay>> BuildOverlays(
-    std::string_view guest_path, const std::string& opened, IFile& opened_file, const Pack& pack) {
-    const std::string folder{guest_path.substr(0, guest_path.find_last_of('/') + 1)};
-    std::unordered_map<std::string, std::shared_ptr<const Overlay>> overlays;
+// Applies one pack on top of the members the packs before it replaced, or changes nothing when
+// any member fails to verify. A pack may list a path once per version of it the pack accepts;
+// the member whose original is the path's current content applies.
+bool ApplyPack(const Pack& pack, std::map<std::string, Archive>& archives,
+               std::map<MemberKey, std::vector<u8>>& members, std::vector<MemberKey>& order) {
+    std::map<MemberKey, std::vector<u8>> updates;
     for (const Member& member : pack.members) {
-        if (overlays.contains(member.archive)) {
+        MemberKey key{member.archive, member.path};
+        if (updates.contains(key)) {
             continue;
         }
-        std::shared_ptr<const Overlay> overlay;
-        if (member.archive == opened) {
-            overlay = BuildOverlay(opened_file, pack, member.archive);
+        std::optional<std::vector<u8>> current;
+        if (const auto it = members.find(key); it != members.end()) {
+            current = it->second;
         } else {
-            g_opening_archives = true;
-            const auto file = Common::Singleton<Core::FileSys::MntPoints>::Instance()->Open(
-                folder + member.archive_name, false);
-            g_opening_archives = false;
-            if (file) {
-                overlay = BuildOverlay(*file, pack, member.archive);
-            } else {
-                LOG_ERROR(Loader, "Prompt packs: {}{} is missing", folder, member.archive_name);
+            current = ReadOriginal(archives, member.archive, member.path);
+        }
+        if (!current) {
+            return false;
+        }
+        const u32 crc = Crc32(*current);
+        const auto match = std::ranges::find_if(pack.members, [&](const Member& other) {
+            return other.archive == member.archive && other.path == member.path &&
+                   other.orig_size == current->size() && other.orig_crc == crc;
+        });
+        if (match == pack.members.end()) {
+            LOG_ERROR(Loader, "Prompt packs: {} in {} is not the version the {} pack was made for",
+                      member.path, member.archive_name, pack.name);
+            return false;
+        }
+        for (const Source& source : match->sources) {
+            const auto bytes = ReadOriginal(archives, source.archive, source.path);
+            if (!bytes || bytes->size() != source.size || Crc32(*bytes) != source.crc) {
+                LOG_ERROR(Loader,
+                          "Prompt packs: {} in {} is not the version the {} pack was made for",
+                          source.path, source.archive_name, pack.name);
+                return false;
+            }
+            current->insert(current->end(), bytes->begin(), bytes->end());
+        }
+        Archive& archive = archives.at(member.archive);
+        const Entry entry = ReadEntry(archive.toc_bytes, archive.entries.at(member.path));
+        const auto delta = ReadHostFile(match->delta);
+        auto updated = delta ? ApplyDelta(*current, *delta) : std::nullopt;
+        if (!updated || updated->size() != match->new_size || Crc32(*updated) != match->new_crc ||
+            BlockCount(updated->size(), archive.toc.block_size) !=
+                BlockCount(entry.length, archive.toc.block_size)) {
+            LOG_ERROR(Loader, "Prompt packs: the delta for {} in {} is missing or damaged",
+                      member.path, member.archive_name);
+            return false;
+        }
+        updates.emplace(std::move(key), std::move(*updated));
+    }
+    for (const Member& member : pack.members) {
+        MemberKey key{member.archive, member.path};
+        if (!members.contains(key) && std::ranges::find(order, key) == order.end()) {
+            order.push_back(key);
+        }
+    }
+    for (auto& [key, bytes] : updates) {
+        members[key] = std::move(bytes);
+    }
+    return true;
+}
+
+// Applies every pack at the first open of an archive one of them replaces members of. The
+// archives sit in one folder. A pack that fails to verify is left out and the others still apply.
+std::unordered_map<std::string, std::shared_ptr<const Overlay>> BuildOverlays(
+    std::string_view guest_path, const std::string& opened, IFile& opened_file,
+    const PackSet& set) {
+    const std::string folder{guest_path.substr(0, guest_path.find_last_of('/') + 1)};
+    std::map<std::string, Archive> archives;
+    const auto want = [&](const std::string& archive, const std::string& name,
+                          const std::string& path) {
+        Archive& entry = archives[archive];
+        if (entry.name.empty()) {
+            entry.name = name;
+        }
+        entry.entries.emplace(path, 0);
+    };
+    for (const Pack& pack : set.packs) {
+        for (const Member& member : pack.members) {
+            want(member.archive, member.archive_name, member.path);
+            for (const Source& source : member.sources) {
+                want(source.archive, source.archive_name, source.path);
             }
         }
-        if (!overlay) {
-            LOG_ERROR(Loader, "Prompt packs: the pack is not applied, the game keeps its prompts");
-            return {};
+    }
+    for (auto& [name, archive] : archives) {
+        if (name == opened) {
+            archive.file = &opened_file;
+        } else {
+            g_opening_archives = true;
+            archive.owned = Common::Singleton<Core::FileSys::MntPoints>::Instance()->Open(
+                folder + archive.name, false);
+            g_opening_archives = false;
+            archive.file = archive.owned.get();
+            if (archive.file == nullptr) {
+                LOG_ERROR(Loader, "Prompt packs: {}{} is missing", folder, archive.name);
+            }
         }
-        overlays.emplace(member.archive, std::move(overlay));
+        if (archive.file != nullptr && !IndexArchive(archive)) {
+            archive.file = nullptr;
+        }
+    }
+
+    std::map<MemberKey, std::vector<u8>> members;
+    std::vector<MemberKey> order;
+    for (const Pack& pack : set.packs) {
+        if (!ApplyPack(pack, archives, members, order)) {
+            LOG_ERROR(Loader, "Prompt packs: the {} pack is not applied", pack.name);
+        }
+    }
+
+    std::unordered_map<std::string, std::shared_ptr<Overlay>> built;
+    std::unordered_map<std::string, u64> replaced;
+    for (const MemberKey& key : order) {
+        const auto member = members.find(key);
+        if (member == members.end()) {
+            continue;
+        }
+        Archive& archive = archives.at(key.first);
+        auto& overlay = built[key.first];
+        if (!overlay) {
+            overlay = std::make_shared<Overlay>();
+            overlay->base_size = archive.file->Size();
+            overlay->toc = archive.toc_bytes;
+        }
+        const u64 index = archive.entries.at(key.second);
+        const Entry entry = ReadEntry(overlay->toc, index);
+        u8* entry_bytes = EntryBytes(overlay->toc, index);
+        WriteBe(entry_bytes + 20, 5, member->second.size());
+        WriteBe(entry_bytes + 25, 5, overlay->Size());
+        AppendBlocks(member->second, archive.toc, overlay->toc, entry.block, archive.compress,
+                     overlay->data);
+        ++replaced[key.first];
+    }
+    std::unordered_map<std::string, std::shared_ptr<const Overlay>> overlays;
+    for (auto& [name, overlay] : built) {
+        LOG_INFO(Loader, "Prompt packs: replaced {} members in {}", replaced[name],
+                 archives.at(name).name);
+        overlays.emplace(name, std::move(overlay));
     }
     return overlays;
 }
 
 std::shared_ptr<const Overlay> GetOverlay(std::string_view guest_path, const std::string& archive,
-                                          IFile& file, const Pack& pack) {
+                                          IFile& file, const PackSet& set) {
     static std::mutex mutex;
     static std::unordered_map<std::string, std::shared_ptr<const Overlay>> overlays;
     static bool built{};
     std::scoped_lock lock{mutex};
     if (!built) {
         built = true;
-        overlays = BuildOverlays(guest_path, archive, file, pack);
+        overlays = BuildOverlays(guest_path, archive, file, set);
     }
     const auto it = overlays.find(archive);
     // Another archive of the same name is served unchanged.
@@ -768,11 +971,10 @@ std::unique_ptr<IFile> WrapArchive(std::string_view guest_path, std::unique_ptr<
         return file;
     }
     const auto name = ArchiveName(guest_path);
-    const Pack* pack = name ? ActivePack() : nullptr;
-    if (pack == nullptr || !HasArchive(*pack, *name)) {
+    if (!name || !HasArchive(ActivePacks(), *name)) {
         return file;
     }
-    auto overlay = GetOverlay(guest_path, *name, *file, *pack);
+    auto overlay = GetOverlay(guest_path, *name, *file, ActivePacks());
     if (!overlay) {
         return file;
     }
@@ -781,8 +983,7 @@ std::unique_ptr<IFile> WrapArchive(std::string_view guest_path, std::unique_ptr<
 
 void FixArchiveStat(std::string_view guest_path, FileStat& stat) {
     const auto name = ArchiveName(guest_path);
-    const Pack* pack = name ? ActivePack() : nullptr;
-    if (pack == nullptr || !HasArchive(*pack, *name)) {
+    if (!name || !HasArchive(ActivePacks(), *name)) {
         return;
     }
     // Opening the archive builds its overlay if no open has built it yet.
@@ -794,13 +995,13 @@ void FixArchiveStat(std::string_view guest_path, FileStat& stat) {
 }
 
 std::filesystem::path InputOverrideFile() {
-    const Pack* pack = ActivePack();
+    const Pack* pack = LayoutPack();
     return pack != nullptr && pack->has_input_override ? pack->dir / "input.ini"
                                                        : std::filesystem::path{};
 }
 
 bool MotionAllowed() {
-    const Pack* pack = ActivePack();
+    const Pack* pack = LayoutPack();
     return pack == nullptr || pack->motion_controls;
 }
 
