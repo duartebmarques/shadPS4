@@ -24,6 +24,7 @@
 #include "common/elf_info.h"
 #include "common/gravity_rush.h"
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
 #include "common/string_util.h"
@@ -40,7 +41,11 @@ using Core::FileSys::FileStat;
 using Core::FileSys::IFile;
 using Core::FileSys::MmapPolicy;
 
-constexpr u64 MaxPackFormat = 2;
+constexpr u64 MaxPackFormat = 3;
+// Code patch addresses are in the address space of the game's GoldHEN patches: the executable's
+// first segment at 0x400000.
+constexpr u64 CodeBase = 0x400000;
+constexpr u64 MaxCodePatchSize = 4096;
 constexpr u64 HeaderSize = 32;
 constexpr u64 EntrySize = 30;
 constexpr u32 EncryptedTocFlag = 4;
@@ -68,12 +73,28 @@ struct Member {
     std::vector<Source> sources;
 };
 
+// Bytes a pack replaces in the game's executable, which its members depend on.
+struct CodePatch {
+    u64 address{};
+    std::vector<u8> orig;
+    std::vector<u8> patched;
+};
+
+enum class CodeState {
+    None,    // The pack has no code patches.
+    Pending, // Not applied yet: the executable is not loaded.
+    Applied,
+    Failed, // The executable is not the version the pack was made for.
+};
+
 struct Pack {
     std::string name; // The layout or the mod.
     std::filesystem::path dir;
     bool motion_controls{true};
     bool has_input_override{};
     std::vector<Member> members;
+    std::vector<CodePatch> code;
+    CodeState code_state{CodeState::None};
 };
 
 // The packs of the running game in the order they apply: the button prompt layout, then the mods.
@@ -254,6 +275,45 @@ bool IsSafeRelative(const std::filesystem::path& path) {
                         [](const std::filesystem::path& part) { return part == ".."; });
 }
 
+std::optional<std::vector<u8>> ParseHex(const std::string& text) {
+    if (text.empty() || text.size() % 2 != 0) {
+        return std::nullopt;
+    }
+    std::vector<u8> bytes(text.size() / 2);
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        const char* first = text.data() + 2 * i;
+        const auto result = std::from_chars(first, first + 2, bytes[i], 16);
+        if (result.ec != std::errc{} || result.ptr != first + 2) {
+            return std::nullopt;
+        }
+    }
+    return bytes;
+}
+
+std::optional<CodePatch> ParseCodePatch(const nlohmann::json& object) {
+    const auto address = Field<std::string>(object, "address");
+    const auto orig = Field<std::string>(object, "orig");
+    const auto patched = Field<std::string>(object, "new");
+    if (!address || !orig || !patched || !address->starts_with("0x")) {
+        return std::nullopt;
+    }
+    u64 value{};
+    const char* end = address->data() + address->size();
+    const auto result = std::from_chars(address->data() + 2, end, value, 16);
+    auto orig_bytes = ParseHex(*orig);
+    auto patched_bytes = ParseHex(*patched);
+    if (result.ec != std::errc{} || result.ptr != end || value < CodeBase || !orig_bytes ||
+        !patched_bytes || orig_bytes->size() != patched_bytes->size() ||
+        orig_bytes->size() > MaxCodePatchSize) {
+        return std::nullopt;
+    }
+    return CodePatch{
+        .address = value,
+        .orig = std::move(*orig_bytes),
+        .patched = std::move(*patched_bytes),
+    };
+}
+
 std::optional<Source> ParseSource(const nlohmann::json& object) {
     const auto archive = Field<std::string>(object, "archive");
     const auto path = Field<std::string>(object, "path");
@@ -348,6 +408,25 @@ std::optional<Pack> LoadPack(const std::string& game, const std::string& folder,
         }
         pack.members.push_back(std::move(*member));
     }
+    if (const auto code = root.find("code"); code != root.end()) {
+        if (!code->is_array()) {
+            LOG_ERROR(Loader, "Prompt packs: {} holds malformed code patches",
+                      Common::FS::PathToUTF8String(manifest_path));
+            return std::nullopt;
+        }
+        for (const auto& object : *code) {
+            auto patch = ParseCodePatch(object);
+            if (!patch) {
+                LOG_ERROR(Loader, "Prompt packs: {} holds a malformed code patch {}",
+                          Common::FS::PathToUTF8String(manifest_path), object.dump());
+                return std::nullopt;
+            }
+            pack.code.push_back(std::move(*patch));
+        }
+        if (!pack.code.empty()) {
+            pack.code_state = CodeState::Pending;
+        }
+    }
     pack.motion_controls = Field<bool>(root, "motion_controls").value_or(true);
     std::error_code ec;
     pack.has_input_override = std::filesystem::is_regular_file(pack.dir / "input.ini", ec);
@@ -393,8 +472,10 @@ PackSet LoadPacks() {
     return set;
 }
 
-const PackSet& ActivePacks() {
-    static const PackSet none;
+// The code state of a pack changes only in ApplyCodePatches, which runs while the executable loads,
+// before any game thread reads the packs.
+PackSet& LoadedPacks() {
+    static PackSet none;
     static std::mutex mutex;
     static PackSet set;
     static bool loaded{};
@@ -408,6 +489,33 @@ const PackSet& ActivePacks() {
         set = LoadPacks();
     }
     return set;
+}
+
+const PackSet& ActivePacks() {
+    return LoadedPacks();
+}
+
+u8* CodeAddress(const CodePatch& patch) {
+    const u64 offset = patch.address - CodeBase;
+    if (offset > MemoryPatcher::g_eboot_image_size ||
+        patch.orig.size() > MemoryPatcher::g_eboot_image_size - offset) {
+        return nullptr;
+    }
+    return reinterpret_cast<u8*>(MemoryPatcher::g_eboot_address + offset);
+}
+
+// Puts back the original bytes of an applied pack whose members failed to apply. Bytes that are no
+// longer the pack's are left alone.
+void RevertCodePatches(const Pack& pack) {
+    for (const CodePatch& patch : pack.code) {
+        u8* code = CodeAddress(patch);
+        if (code != nullptr && std::memcmp(code, patch.patched.data(), patch.patched.size()) == 0) {
+            std::memcpy(code, patch.orig.data(), patch.orig.size());
+        } else {
+            LOG_ERROR(Loader, "Prompt packs: the code at {:#x} changed, the {} pack leaves it",
+                      patch.address, pack.name);
+        }
+    }
 }
 
 const Pack* LayoutPack() {
@@ -798,8 +906,17 @@ std::unordered_map<std::string, std::shared_ptr<const Overlay>> BuildOverlays(
     std::map<MemberKey, std::vector<u8>> members;
     std::vector<MemberKey> order;
     for (const Pack& pack : set.packs) {
+        if (pack.code_state == CodeState::Pending || pack.code_state == CodeState::Failed) {
+            LOG_ERROR(Loader,
+                      "Prompt packs: the {} pack is not applied because its code patches are not",
+                      pack.name);
+            continue;
+        }
         if (!ApplyPack(pack, archives, members, order)) {
             LOG_ERROR(Loader, "Prompt packs: the {} pack is not applied", pack.name);
+            if (pack.code_state == CodeState::Applied) {
+                RevertCodePatches(pack);
+            }
         }
     }
 
@@ -965,6 +1082,35 @@ private:
 };
 
 } // namespace
+
+void ApplyCodePatches() {
+    for (Pack& pack : LoadedPacks().packs) {
+        if (pack.code_state != CodeState::Pending) {
+            continue;
+        }
+        const bool matches = std::ranges::all_of(pack.code, [&](const CodePatch& patch) {
+            const u8* code = CodeAddress(patch);
+            if (code == nullptr || std::memcmp(code, patch.orig.data(), patch.orig.size()) != 0) {
+                LOG_ERROR(Loader,
+                          "Prompt packs: the code at {:#x} is not the version the {} pack was made "
+                          "for",
+                          patch.address, pack.name);
+                return false;
+            }
+            return true;
+        });
+        if (!matches) {
+            pack.code_state = CodeState::Failed;
+            continue;
+        }
+        for (const CodePatch& patch : pack.code) {
+            std::memcpy(CodeAddress(patch), patch.patched.data(), patch.patched.size());
+        }
+        pack.code_state = CodeState::Applied;
+        LOG_INFO(Loader, "Prompt packs: applied {} code patches of the {} pack", pack.code.size(),
+                 pack.name);
+    }
+}
 
 std::unique_ptr<IFile> WrapArchive(std::string_view guest_path, std::unique_ptr<IFile> file) {
     if (g_opening_archives || !file || !file->IsOpen() || !file->IsReadOnly()) {

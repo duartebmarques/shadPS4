@@ -15,6 +15,7 @@
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
 #include "core/module.h"
+#include "core/prompt_packs/prompt_packs.h"
 #include "core/tls.h"
 
 namespace Core {
@@ -370,6 +371,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::g_eboot_name = name;
             MemoryPatcher::OnGameLoaded();
+            PromptPacks::ApplyCodePatches();
         }
     }
 

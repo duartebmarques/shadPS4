@@ -13,8 +13,14 @@
 // members of the game's PSARC archives: a button prompt pack with Xbox or Switch Pro button art and
 // text, a mod pack with its own content, applied after the button prompt pack. The game files stay
 // as they are: the archive the game opens is served with a patched table of contents and the new
-// member data appended after the original bytes.
+// member data appended after the original bytes. A pack may also replace bytes of the game's
+// executable that its members depend on.
 namespace PromptPacks {
+
+/// Applies the code patches of the active packs to the loaded executable. A pack whose code does
+/// not match is not applied at all. Runs once the executable is loaded, before its code is decoded
+/// for the CPU patches.
+void ApplyCodePatches();
 
 /// Returns the handle the game reads an archive through: the original one, or one that serves
 /// the archive with the members the active packs replace.
