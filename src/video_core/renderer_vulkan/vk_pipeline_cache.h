@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -261,14 +262,17 @@ private:
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
-    void QueueProgramCompilation(Program& program, Shader::HwStage stage, Shader::SwStage l_stage,
-                                 const Shader::ShaderParams& params,
-                                 Shader::Backend::Bindings binding,
-                                 Shader::StageSpecialization* spec, size_t perm_idx, u64 perm_hash);
+    bool CompileProgramOnWorker(Program& program, Shader::HwStage stage, Shader::SwStage l_stage,
+                                const Shader::ShaderParams& params,
+                                Shader::Backend::Bindings& binding,
+                                Shader::StageSpecialization* spec, size_t perm_idx, u64 perm_hash);
     void EmitProgram(ShaderCompileResult& result);
     bool PublishPendingCompilation(Program& program);
+    template <typename T>
+    bool WaitForQueuedCompile(const std::future<T>& compile);
     SHAD_NO_INLINE const GraphicsPipeline* CreateGraphicsPipeline();
-    void QueueGraphicsPipeline(u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
+    std::future<std::unique_ptr<GraphicsPipeline>> QueueGraphicsPipeline(
+        u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
     const GraphicsPipeline* InstallGraphicsPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
     bool DrawsPhoto() const;
     void CompileWorker(u32 index);
@@ -330,6 +334,8 @@ private:
     u64 key_reuse_diff_decisions{};
     u64 nonfull_mask_pipelines{};
     u64 graphics_lookups{};
+    // Cleared by every graphics lookup; the first compile wait of the draw sets compile_deadline.
+    bool compile_deadline_armed{};
     bool key_stamp_reuse{};
     bool key_reuse_validate{}; // ValidateOnly mode: every reuse is rebuilt and compared
     u64 key_reuse_hits{};
@@ -532,6 +538,10 @@ private:
     // Shader compile workers. They emit the SPIR-V of the programs the GPU thread translates,
     // ahead of the graphics pipelines they compile.
     bool async_shader_recompiling{};
+    // The draw that queues a compile waits for it within this budget, spread over every compile
+    // the draw queues.
+    std::chrono::milliseconds sync_budget{};
+    std::chrono::steady_clock::time_point compile_deadline{};
     static constexpr u32 NumCompileWorkers = 6;
     std::array<std::thread, NumCompileWorkers> compile_workers;
     std::deque<std::function<void()>> compile_tasks;
