@@ -74,11 +74,10 @@ static void StartPgoDumper() {
         !__llvm_profile_get_filename) {
         return;
     }
-    g_pgo_path = __llvm_profile_get_filename();
-    const auto pos = g_pgo_path.find("%p");
-    if (pos != std::string::npos) {
-        g_pgo_path.replace(pos, 2, std::to_string(getpid()));
-    }
+    // train-<pid>.profraw next to the profile the build names, also for CSPGO (default_%m.profraw).
+    g_pgo_path = (std::filesystem::path(__llvm_profile_get_filename()).parent_path() /
+                  fmt::format("train-{}.profraw", getpid()))
+                     .string();
     g_pgo_start = std::chrono::steady_clock::now();
     std::at_quick_exit(WritePgoProfile);
     std::thread([] {
