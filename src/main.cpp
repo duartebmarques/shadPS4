@@ -78,6 +78,7 @@ static void StartPgoDumper() {
     g_pgo_path = (std::filesystem::path(__llvm_profile_get_filename()).parent_path() /
                   fmt::format("train-{}.profraw", getpid()))
                      .string();
+    __llvm_profile_set_filename(g_pgo_path.c_str());
     g_pgo_start = std::chrono::steady_clock::now();
     std::at_quick_exit(WritePgoProfile);
     std::thread([] {
