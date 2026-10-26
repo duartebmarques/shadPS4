@@ -4,9 +4,13 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
 #include <deque>
+#include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "common/assert.h"
@@ -43,6 +47,7 @@ class Instance;
 class Rasterizer;
 class Scheduler;
 class ShaderCache;
+struct ShaderCompileResult;
 
 // Dwords of the flat user-data window the gather-input memo records per stage. A program whose
 // window is wider never arms the memo and is counted as GIMEMO big=.
@@ -58,6 +63,8 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    // The permutation whose SPIR-V a shader compile worker emits, added to the modules once done.
+    std::shared_ptr<ShaderCompileResult> pending_compilation{};
     // Index of the permutation matched by the previous lookup; probed first when
     // the MRU probe setting is enabled. Always bounds-checked before use.
     u32 last_hit_perm{};
@@ -254,6 +261,18 @@ private:
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
+    void QueueProgramCompilation(Program& program, Shader::HwStage stage, Shader::SwStage l_stage,
+                                 const Shader::ShaderParams& params,
+                                 Shader::Backend::Bindings binding,
+                                 Shader::StageSpecialization* spec, size_t perm_idx, u64 perm_hash);
+    void EmitProgram(ShaderCompileResult& result);
+    bool PublishPendingCompilation(Program& program);
+    SHAD_NO_INLINE const GraphicsPipeline* CreateGraphicsPipeline();
+    void QueueGraphicsPipeline(u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
+    const GraphicsPipeline* InstallGraphicsPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
+    bool DrawsPhoto() const;
+    void CompileWorker(u32 index);
+    void QueueCompileTask(std::function<void()>&& task, bool front);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
@@ -279,6 +298,9 @@ private:
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    // Graphics pipelines a shader compile worker compiles.
+    tsl::robin_map<GraphicsPipelineKey, std::future<std::unique_ptr<GraphicsPipeline>>>
+        pending_graphics_pipelines;
     // Pipelines ReplaceShader erased, each released by a deferred operation once the GPU passed
     // the draws binding it; owned here so they die before desc_heap. ReplaceShader pushes from
     // the devtools thread while the operations pop on the GPU command thread.
@@ -506,6 +528,21 @@ private:
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.
     bool spec_fp_cache{};
     u32 num_unchained_pipelines{};
+
+    // Shader compile workers. They emit the SPIR-V of the programs the GPU thread translates,
+    // ahead of the graphics pipelines they compile.
+    bool async_shader_recompiling{};
+    static constexpr u32 NumCompileWorkers = 6;
+    std::array<std::thread, NumCompileWorkers> compile_workers;
+    std::deque<std::function<void()>> compile_tasks;
+    std::mutex compile_mutex;
+    std::condition_variable compile_cv;
+    std::condition_variable compile_idle_cv;
+    u32 compile_tasks_in_flight{};
+    bool compile_workers_stopping{};
+    // Translated IR stays in its pools until a worker emits it.
+    std::mutex free_pools_mutex;
+    std::vector<std::unique_ptr<Shader::Pools>> free_pools;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

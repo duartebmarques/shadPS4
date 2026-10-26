@@ -549,6 +549,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "GPU trackerLockSpinRounds: {}", EmulatorSettings.GetTrackerLockSpinRounds());
     LOG_INFO(Config, "GPU oneCoreGpuThreadPin: {}", EmulatorSettings.IsOneCoreGpuThreadPin());
     LOG_INFO(Config, "GPU vkRecordThread: {}", EmulatorSettings.IsVkRecordThread());
+    LOG_INFO(Config, "GPU asyncShaderRecompiling: {}", EmulatorSettings.IsAsyncShaderRecompiling());
     LOG_INFO(Config, "GPU vertexLayoutMemo: {}", EmulatorSettings.IsVertexLayoutMemo());
     LOG_INFO(Config, "GPU coveredRangeSkip: {}", EmulatorSettings.IsCoveredRangeSkip());
     LOG_INFO(Config, "GPU residencyBitmap: {}", EmulatorSettings.IsResidencyBitmap());

@@ -85,6 +85,16 @@ public:
     /// plain single-layer colour image the GPU has written.
     static bool Download(Frame& frame);
 
+    /// The guest draws a photo between creating the JPEG encoder and encoding the photo. While
+    /// set, draws wait for the shaders and pipelines they need instead of being skipped.
+    static void SetCapturing(bool value) noexcept {
+        capturing.store(value, std::memory_order_relaxed);
+    }
+
+    static bool IsCapturing() noexcept {
+        return capturing.load(std::memory_order_relaxed);
+    }
+
 private:
     static constexpr u64 PackExtent(u32 width, u32 height) noexcept {
         return u64{width} << 32 | height;
@@ -94,6 +104,7 @@ private:
 
     static inline std::atomic<u64> armed_extent{};
     static inline std::atomic<u32> tracked_index{ImageId::INVALID_INDEX};
+    static inline std::atomic<bool> capturing{};
 };
 
 } // namespace VideoCore

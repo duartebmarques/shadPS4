@@ -335,14 +335,19 @@ void EmitContext::DefineInputs() {
                 DefineVariable(U32[1], spv::BuiltIn::BaseInstance, spv::StorageClass::Input);
         }
 
-        Shader::Gcn::FetchShaderData fetch_shader;
-        if (!Gcn::ParseFetchShader(info, fetch_shader)) {
-            break;
+        Shader::Gcn::FetchShaderData parsed_fetch_shader;
+        const auto* fetch_shader = info.emit_fetch_shader;
+        if (!fetch_shader) {
+            if (!Gcn::ParseFetchShader(info, parsed_fetch_shader)) {
+                break;
+            }
+            fetch_shader = &parsed_fetch_shader;
         }
-        ASSERT(fetch_shader.attributes.size() <= IR::NumParams);
-        for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
-            const auto& attrib = fetch_shader.attributes[semantic];
-            const auto sharp = attrib.GetSharp(info);
+        ASSERT(fetch_shader->attributes.size() <= IR::NumParams);
+        for (u32 semantic = 0; semantic < fetch_shader->attributes.size(); ++semantic) {
+            const auto& attrib = fetch_shader->attributes[semantic];
+            const auto sharp =
+                info.emit_fetch_shader ? info.emit_vertex_sharps[semantic] : attrib.GetSharp(info);
             const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
             Id id{DefineInput(type, semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {

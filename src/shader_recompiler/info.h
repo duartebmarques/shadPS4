@@ -25,6 +25,10 @@ struct Archive;
 
 namespace Shader {
 
+namespace Gcn {
+struct FetchShaderData;
+}
+
 enum class Qualifier : u8 {
     None,
     Smooth,
@@ -107,6 +111,10 @@ struct Info : InfoPersistent {
     // (liverpool->regs.*_program, mapped_queues[].cs_state); a GetParams over a stack copy of a
     // ShaderProgram would leave this dangling.
     const u32* flat_ud{};
+    // Read at translation for a SPIR-V emission on a shader compile worker, which uses these in
+    // place of the guest memory the user data points to.
+    const Gcn::FetchShaderData* emit_fetch_shader{};
+    std::span<const AmdGpu::Buffer> emit_vertex_sharps;
     PersistentSrtInfo srt_info;
 
     AttributeFlags loads{};
