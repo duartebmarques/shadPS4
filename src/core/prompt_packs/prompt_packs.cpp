@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <unordered_map>
@@ -113,6 +114,9 @@ struct ModPack {
 constexpr std::array Gr2ModPacks{
     ModPack{"halloween", "gr2HalloweenItems"},
 };
+
+// Button prompt layouts; each one's pack is the folder of the same name.
+constexpr std::array<std::string_view, 4> Layouts{"xbox", "switch", "steamdeck", "steamcontroller"};
 
 // An archive as the game sees it with the pack applied: the patched table of contents, the
 // original bytes after it, then the replaced members.
@@ -443,7 +447,7 @@ PackSet LoadPacks() {
     }
     const std::string game = is_gr2 ? "GR2" : "GRR";
     const std::string layout = ReadLayout(is_gr2 ? "gr2PromptLayout" : "grrPromptLayout");
-    if (layout == "xbox" || layout == "switch") {
+    if (std::find(Layouts.begin(), Layouts.end(), layout) != Layouts.end()) {
         if (auto pack = LoadPack(game, layout, "layout")) {
             set.layout = set.packs.size();
             set.packs.push_back(std::move(*pack));
