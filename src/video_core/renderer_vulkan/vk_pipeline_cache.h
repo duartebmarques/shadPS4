@@ -4,12 +4,9 @@
 #pragma once
 
 #include <array>
-#include <chrono>
 #include <deque>
-#include <future>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "common/assert.h"
@@ -225,8 +222,8 @@ public:
         return profile;
     }
 
-    /// Runs before the GPU thread compiles or waits for a new pipeline; the rasterizer
-    /// drops its guest-copy hold there so a compile never holds the memory map open.
+    /// Runs before every inline pipeline compile; the rasterizer drops its
+    /// guest-copy hold there so a compile never holds the memory map open.
     void SetPreCompileHook(void (*hook)(void*), void* user) {
         pre_compile_hook_ = hook;
         pre_compile_user_ = user;
@@ -249,33 +246,6 @@ private:
     bool RefreshGraphicsStages(bool track_hash_diff);
     bool ReuseGraphicsKey(u64 pipe_gen);
     bool RefreshComputeKey();
-
-    /// A graphics pipeline compiling on a worker thread. The worker reads the copies held here,
-    /// never the members the following lookups overwrite.
-    struct PendingGraphicsPipeline {
-        std::future<std::unique_ptr<GraphicsPipeline>> future;
-        std::chrono::steady_clock::time_point start;
-        u64 hash{};
-        GraphicsPipeline::SerializationSupport sdata{};
-        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
-        std::array<const Shader::Info*, MaxShaderStages> copied_infos{};
-        std::array<std::optional<Shader::Info>, MaxShaderStages> info_copies{};
-        /// The user data the copies read their sharps from.
-        std::array<std::array<u32, Shader::NUM_USER_DATA_REGS>, MaxShaderStages> user_data{};
-        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
-        std::array<vk::ShaderModule, MaxShaderStages> modules{};
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
-        VertexInputs<AmdGpu::Buffer> vertex_sharps{};
-        bool photo_waited{}; ///< A photo draw has waited for the compile once
-        bool slow_logged{};
-        bool abandoned{};
-    };
-    std::unique_ptr<PendingGraphicsPipeline> StartGraphicsPipeline(
-        u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
-    bool IsCompileDone(PendingGraphicsPipeline& pending, std::chrono::milliseconds wait);
-    void InstallGraphicsPipeline(PendingGraphicsPipeline& pending);
-    std::chrono::milliseconds SyncBudget(bool photo) const;
-    bool DrawsPhoto() const;
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
@@ -314,9 +284,6 @@ private:
     // the devtools thread while the operations pop on the GPU command thread.
     std::deque<std::unique_ptr<Pipeline>> retired_pipelines;
     std::mutex retired_pipelines_mutex;
-    // Compiles past the sync budget. Their keys enter graphics_pipelines once installed.
-    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
-        pending_graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};

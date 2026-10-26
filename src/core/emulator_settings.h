@@ -493,10 +493,6 @@ struct GPUSettings {
     // a queue of its own copies them; a GPU write marked in the window meanwhile keeps its pages
     // GPU modified.
     Setting<bool> readback_offload{false};
-    // Milliseconds the GPU command thread waits for a new graphics pipeline, which compiles on a
-    // worker thread. Past the wait the draws that need it are skipped until the compile is done:
-    // a lower value means shorter hitches and more pop-in. Clamped to 50000.
-    Setting<int> pipeline_sync_budget_ms{50};
     // Guest memory in place (ported from bbport, deadinside28/bloodborne_pc). Read once at boot.
     // 0: off. 1: honest fences only - EOP/EOS/RELEASE_MEM labels, their interrupts and the GPU
     // idle interrupt are signalled after the GPU really finished the work recorded before them,
@@ -811,7 +807,6 @@ struct GPUSettings {
             GPU_OVERRIDE(stream_barrier_skip),
             GPU_OVERRIDE(clean_sync_peek),
             GPU_OVERRIDE(readback_offload),
-            GPU_OVERRIDE(pipeline_sync_budget_ms),
             GPU_OVERRIDE(inplace_guest_memory),
             GPU_OVERRIDE(guest_sync_barriers),
             GPU_OVERRIDE(barrier_tracker),
@@ -914,7 +909,7 @@ struct GPUSettings {
     runtime_info_stamp_gate, userfaultfd, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
-    clean_sync_peek, readback_offload, fast_shader_math, pipeline_sync_budget_ms, \
+    clean_sync_peek, readback_offload, fast_shader_math, \
     one_core_gpu_thread_pin, inplace_guest_memory, guest_sync_barriers, inplace_image_downloads, \
     draw_pipe, async_submit, tick_query_interval_us, guest_gpu_time_percent, barrier_tracker, \
     present_pacing, frame_cap, vk_record_thread
@@ -1260,7 +1255,6 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, StreamBarrierSkip, stream_barrier_skip)
     SETTING_FORWARD_BOOL(m_gpu, CleanSyncPeek, clean_sync_peek)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
-    SETTING_FORWARD(m_gpu, PipelineSyncBudgetMs, pipeline_sync_budget_ms)
     SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
     SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
     SETTING_FORWARD(m_gpu, BarrierTracker, barrier_tracker)
