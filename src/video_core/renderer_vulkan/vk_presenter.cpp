@@ -410,6 +410,28 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
     return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
 }
 
+// Diagnostic frame dump (local only, claude/frame-dump.patch): SHAD_FRAME_DUMP=<file> appends
+// every presented guest frame as 16-byte header (u32 w, u32 h, u64 ns) + 8-bit luma, after
+// SHAD_FRAME_DUMP_SKIP frames, for SHAD_FRAME_DUMP_FRAMES frames.
+static void AppendDumpFrame(const ScreenshotReadback& readback, u64 ns) {
+    static std::ofstream out{std::getenv("SHAD_FRAME_DUMP"), std::ios::binary};
+    std::vector<u8> rgba;
+    if (!ConvertReadbackToRgba8(readback, rgba)) {
+        return;
+    }
+    const u64 n = static_cast<u64>(readback.width) * readback.height;
+    std::vector<u8> luma(n);
+    for (u64 i = 0; i < n; ++i) {
+        const u8* p = &rgba[i * 4];
+        luma[i] = static_cast<u8>((54 * p[0] + 183 * p[1] + 19 * p[2]) >> 8);
+    }
+    const u32 hdr[2] = {readback.width, readback.height};
+    out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+    out.write(reinterpret_cast<const char*>(&ns), sizeof(ns));
+    out.write(reinterpret_cast<const char*>(luma.data()), luma.size());
+    out.flush();
+}
+
 static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     if (readback.paths.empty()) {
         return;
@@ -734,6 +756,35 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
     }
 
+    static const char* dump_path = std::getenv("SHAD_FRAME_DUMP");
+    static const u64 dump_skip =
+        std::getenv("SHAD_FRAME_DUMP_SKIP") ? std::atoll(std::getenv("SHAD_FRAME_DUMP_SKIP")) : 900;
+    static const u64 dump_frames = std::getenv("SHAD_FRAME_DUMP_FRAMES")
+                                       ? std::atoll(std::getenv("SHAD_FRAME_DUMP_FRAMES"))
+                                       : 1500;
+    static u64 dump_index = 0;
+    std::optional<ScreenshotReadback> pending_dump;
+    if (const char* sig_path = std::getenv("SHAD_FRAME_SIG")) {
+        static std::ofstream sig_out{sig_path, std::ios::binary};
+        const u64 sig_hdr[2] = {dump_index - dump_skip, g_sig_list.size()};
+        sig_out.write(reinterpret_cast<const char*>(sig_hdr), sizeof(sig_hdr));
+        sig_out.write(reinterpret_cast<const char*>(g_sig_list.data()), g_sig_list.size() * 8);
+        g_sig_list.clear();
+    }
+    if (dump_path && dump_index++ >= dump_skip && dump_index <= dump_skip + dump_frames) {
+        auto& readback = pending_dump.emplace(
+            instance, ScreenshotKind::GameOnly, std::vector<std::filesystem::path>{},
+            image_size.width, image_size.height, view_info.format, false);
+        const vk::BufferImageCopy copy_region = {
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .layerCount = 1,
+            },
+            .imageExtent = {readback.width, readback.height, 1},
+        };
+        runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
+    }
+
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -757,6 +808,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             [deferred_screenshot = std::move(pending_screenshot)]() {
                 SavePendingScreenshot(deferred_screenshot.value());
             });
+    }
+
+    if (pending_dump) {
+        const u64 ns = std::chrono::steady_clock::now().time_since_epoch().count();
+        draw_scheduler.DeferPriorityOperation([deferred_dump = std::move(pending_dump), ns]() {
+            AppendDumpFrame(deferred_dump.value(), ns);
+        });
     }
 
     // Flush frame creation commands.

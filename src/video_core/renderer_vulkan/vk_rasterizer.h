@@ -24,6 +24,10 @@ namespace Vulkan {
 class GraphicsPipeline;
 class Runtime;
 
+// Diagnostic per-frame pipeline list (local only, claude/frame-diag.patch, SHAD_FRAME_SIG).
+inline std::vector<u64> g_sig_list;
+inline const bool g_sig_on = std::getenv("SHAD_FRAME_SIG") != nullptr;
+
 class Rasterizer {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
