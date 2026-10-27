@@ -4,12 +4,10 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <deque>
 #include <filesystem>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -19,6 +17,7 @@
 
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "video_core/gr2_fsr3/context_images.h"
 #include "video_core/gr2_fsr3/fsr3_context.h"
 #include "video_core/gr2_fsr3/fsr3_settings.h"
 #include "video_core/gr2_fsr3/fsr4_assets.h"
@@ -26,10 +25,8 @@
 #include "video_core/gr2_fsr3/fsr4_device.h"
 #include "video_core/gr2_fsr3/fsr_worker.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/texture_cache/image.h"
 
 // <vulkan/vulkan.h> must first be included through vk_common.h, which configures it.
 #include "video_core/gr2_fsr3/fsr4_v07_bridge.h"
@@ -53,19 +50,6 @@ constexpr std::array<const char*, GR2_FSR4_STAGE_COUNT> StageNames{
     "none",        "out of host memory", "backend context", "provider context",
     "frame start", "image state",        "dispatch",
 };
-
-// The images of a context, in the order of Fsr4Images.
-struct ImageSpec {
-    vk::Format format;
-    bool output_size;
-    const char* name;
-};
-constexpr std::array<ImageSpec, 4> ImageSpecs{{
-    {vk::Format::eR16G16B16A16Sfloat, false, "GR2 FSR4 colour"},
-    {vk::Format::eR16G16Sfloat, false, "GR2 FSR4 motion vectors"},
-    {vk::Format::eR32Sfloat, false, "GR2 FSR4 depth"},
-    {vk::Format::eR16G16B16A16Sfloat, true, "GR2 FSR4 output"},
-}};
 
 std::string StatusText(const Gr2Fsr4Status& status) {
     const char* stage = StageNames[status.stage];
@@ -91,43 +75,9 @@ u64 EstimateBytes(const Fsr4Key& key) {
            40 * output_pixels + 16 * render_pixels + 2_MB;
 }
 
-// A failure of a provider call recorded through Scheduler::Record, kept with the generation of
-// its context. The recorded calls report it; the GPU command thread takes it.
-class RecordedFailure {
-public:
-    void Report(u64 generation, std::string text) {
-        std::scoped_lock lock{mutex};
-        failed_generation = generation;
-        message = std::move(text);
-    }
-
-    bool HasFailed(u64 generation) {
-        std::scoped_lock lock{mutex};
-        return failed_generation == generation;
-    }
-
-    std::optional<std::string> Take(u64 generation) {
-        std::scoped_lock lock{mutex};
-        if (failed_generation != generation) {
-            return std::nullopt;
-        }
-        return std::exchange(message, std::nullopt);
-    }
-
-private:
-    std::mutex mutex;
-    u64 failed_generation{}; ///< 0 until a context fails; generations count from 1.
-    std::optional<std::string> message;
-};
-
 } // namespace
 
 struct Fsr4Context::Impl {
-    struct OwnedImage {
-        VideoCore::UniqueImage image{};
-        vk::UniqueImageView view{};
-    };
-
     // A provider context and its images. The provider context is destroyed first.
     struct Resources {
         Resources() = default;
@@ -141,8 +91,7 @@ struct Fsr4Context::Impl {
         Resources& operator=(const Resources&) = delete;
 
         Gr2Fsr4Context* context{};
-        std::array<OwnedImage, ImageSpecs.size()> images{};
-        Fsr4Images handles{};
+        ContextImages images;
         u64 bytes{};
     };
 
@@ -292,7 +241,7 @@ ContextState Fsr4Context::Impl::Update(Vulkan::Scheduler& scheduler,
         } else if (wanted == pending_key) {
             current = std::move(created.resources);
             current_key = pending_key;
-            images = current->handles;
+            images = current->images.handles;
             memory_bytes = current->bytes;
             ++generation;
             next_frame_id = 0;
@@ -501,51 +450,15 @@ Fsr4Context::Impl::Created Fsr4Context::Impl::Create(const Fsr4Key& key,
         return created;
     }
 
-    const vk::Device device = instance.GetDevice();
-    u64 image_bytes = 0;
-    for (std::size_t i = 0; i < ImageSpecs.size(); ++i) {
-        const ImageSpec& spec = ImageSpecs[i];
-        const vk::Extent2D extent = spec.output_size ? key.max_output_size : key.max_render_size;
-        OwnedImage& owned = resources->images[i];
-        owned.image = VideoCore::UniqueImage{device, instance.GetAllocator()};
-        owned.image.Create({
-            .imageType = vk::ImageType::e2D,
-            .format = spec.format,
-            .extent = {extent.width, extent.height, 1},
-            .mipLevels = 1,
-            .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
-            .tiling = vk::ImageTiling::eOptimal,
-            .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-            .initialLayout = vk::ImageLayout::eUndefined,
-        });
-        auto [view_result, view] = device.createImageViewUnique({
-            .image = owned.image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = spec.format,
-            .subresourceRange = ColorRange,
-        });
-        if (view_result != vk::Result::eSuccess) {
-            created.notice = fmt::format("FSR 4 cannot create the {} view: {}", spec.name,
-                                         vk::to_string(view_result));
-            return created;
-        }
-        owned.view = std::move(view);
-        Vulkan::SetObjectName(device, static_cast<vk::Image>(owned.image), spec.name);
-        Vulkan::SetObjectName(device, *owned.view, spec.name);
-        image_bytes += owned.image.size_bytes;
+    std::string why;
+    std::optional<ContextImages> images =
+        CreateContextImages(instance, key.max_render_size, key.max_output_size, "GR2 FSR4", why);
+    if (!images) {
+        created.notice = fmt::format("FSR 4 {}", why);
+        return created;
     }
-    const auto handle = [&resources](std::size_t index) {
-        const OwnedImage& owned = resources->images[index];
-        return Fsr4Image{.image = owned.image, .view = *owned.view};
-    };
-    resources->handles = Fsr4Images{
-        .color = handle(0),
-        .motion_vectors = handle(1),
-        .depth = handle(2),
-        .output = handle(3),
-    };
-    resources->bytes = Gr2Fsr4MemoryBytes(resources->context) + image_bytes;
+    resources->images = std::move(*images);
+    resources->bytes = Gr2Fsr4MemoryBytes(resources->context) + resources->images.bytes;
     created.resources = std::move(resources);
     created.milliseconds = std::chrono::duration<float, std::milli>(Clock::now() - start).count();
     return created;
@@ -604,11 +517,8 @@ Fsr4Key Fsr4KeyFor(vk::Extent2D render_size, vk::Extent2D output_size, Fsr4Model
         key.preset = static_cast<u32>(model) - 1;
         return key;
     }
-    // The provider's thresholds on the width ratio, rounded to two decimals: the split patches
-    // round the render width to a multiple of 8, which gives 1280 <- 856 the ratio 1.4953.
-    const float ratio = std::round(100.0f * static_cast<float>(output_size.width) /
-                                   static_cast<float>(render_size.width)) /
-                        100.0f;
+    // The provider's thresholds on the width ratio.
+    const float ratio = RoundedWidthRatio(render_size, output_size);
     key.preset = ratio >= 2.99f   ? GR2_FSR4_PRESET_ULTRA_PERFORMANCE
                  : ratio >= 1.99f ? GR2_FSR4_PRESET_PERFORMANCE
                  : ratio >= 1.69f ? GR2_FSR4_PRESET_BALANCED

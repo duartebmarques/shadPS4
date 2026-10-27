@@ -5,9 +5,9 @@
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_GOOGLE_include_directive : require
 
-// Copies the FSR 4 inputs of a frame into the images of the FSR 4 context: colour as RGBA16F,
-// motion vectors as RG16F and depth as R32F, all at the render size. The colour is read through
-// its view in the T# format, so an sRGB view gives linear values.
+// Copies the FSR 4 inputs of a frame into the images of the FSR 4 or DLSS context: colour as
+// RGBA16F, motion vectors as RG16F and depth as R32F, all at the render size. The colour is read
+// through its view in the T# format, so an sRGB view gives linear values.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -28,6 +28,7 @@ layout(push_constant) uniform Fsr4InputsConstants {
 const uint INPUTS_ENCODE_SRGB = 1u;
 const uint INPUTS_DEPTH_INVERTED = 2u;
 const uint INPUTS_DEPTH_LINEAR = 4u;
+const uint INPUTS_ZERO_MOTION = 8u;
 
 #include "fsr3_color.glsl"
 
@@ -41,7 +42,9 @@ void main() {
         color.rgb = Fsr3SrgbEncode(color.rgb);
     }
     imageStore(color_out, p, color);
-    imageStore(mv_out, p, vec4(texelFetch(mv_tex, p, 0).rg, 0.0, 0.0));
+    const vec2 motion =
+        (pc.flags & INPUTS_ZERO_MOTION) != 0u ? vec2(0.0) : texelFetch(mv_tex, p, 0).rg;
+    imageStore(mv_out, p, vec4(motion, 0.0, 0.0));
     float depth = texelFetch(depth_tex, p, 0).r;
     if ((pc.flags & INPUTS_DEPTH_LINEAR) != 0u) {
         // Distance from the camera for a conventional [0, 1] device depth.

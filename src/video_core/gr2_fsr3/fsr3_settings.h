@@ -9,7 +9,7 @@
 #include "common/types.h"
 #include "video_core/gr2_fsr3/fsr3_types.h"
 
-// The fsr3*, fsr4* and grrFsr* keys of the "GR2Fork" section, read from
+// The fsr3*, fsr4*, dlss*, grrFsr* and grrDlss* keys of the "GR2Fork" section, read from
 // custom_configs/<serial>.json first and config.json second. The values live in atomics: the GPU
 // command thread takes snapshots while the menu edits them.
 namespace Gr2Fsr3::Settings {
@@ -41,6 +41,9 @@ struct Values {
     bool validate{false};
     bool log{false};
     u32 test{0};
+    bool dlss_enable{false};
+    bool grr_dlss_enable{false};
+    DlssPreset dlss_preset{DlssPreset::Default};
 };
 
 /// State of the module shown by the menu.
@@ -61,6 +64,10 @@ struct Status {
     const char* fsr4_model{""}; ///< Preset of the wanted FSR 4 context, or empty.
     const char* fsr4_tier{""};  ///< Tier of the wanted FSR 4 context, or empty.
     std::string fsr4_notice;
+    ContextState dlss_context{ContextState::Idle};
+    u64 dlss_bytes{};
+    const char* dlss_quality{""}; ///< Mode of the wanted DLSS context, or empty.
+    std::string dlss_notice;
 };
 
 /// Returns the current values, reading the files on the first call. Any thread.
@@ -71,6 +78,9 @@ Values Snapshot();
  * user folder, or its fsr4_v07 folder when the key is empty or absent. Any thread.
  */
 std::filesystem::path Fsr4AssetDir();
+
+/// The folder of NVIDIA's Streamline and DLSS libraries: dlss in the user folder. Any thread.
+std::filesystem::path DlssDir();
 
 /// Replaces the published status. GPU command thread.
 void PublishStatus(const Status& status);

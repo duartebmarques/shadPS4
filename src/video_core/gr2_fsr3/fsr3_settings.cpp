@@ -63,11 +63,13 @@ constexpr std::array LodBiasExtraNames{"0", "-0.5", "-1.0", "-1.5"};
 constexpr std::array DebugViewNames{
     "Off", "Motion vectors", "Stencil", "Depth", "Masks", "Reprojection error", "FSR bypass",
 };
+constexpr std::array DlssPresetNames{"default", "J", "K", "L", "M"};
 static_assert(Fsr4ModelNames.size() == magic_enum::enum_count<Fsr4Model>());
 static_assert(FxaaNames.size() == magic_enum::enum_count<Fxaa>());
 static_assert(ColorSpaceNames.size() == magic_enum::enum_count<ColorSpace>());
 static_assert(DepthSourceNames.size() == magic_enum::enum_count<DepthSource>());
 static_assert(DebugViewNames.size() == magic_enum::enum_count<DebugView>());
+static_assert(DlssPresetNames.size() == magic_enum::enum_count<DlssPreset>());
 
 constexpr auto TestBitLabels = std::to_array<std::pair<const char*, u32>>({
     {"Bit 0: jitter off", TestBit::JitterOff},
@@ -79,6 +81,7 @@ constexpr auto TestBitLabels = std::to_array<std::pair<const char*, u32>>({
     {"Bit 8: character mask history", TestBit::CharacterMaskHistory},
     {"Bit 12: FSR 4 depth 1 - z", TestBit::Fsr4DepthInverted},
     {"Bit 13: FSR 4 linear view depth", TestBit::Fsr4DepthLinear},
+    {"Bit 14: LOD bias on native frames", TestBit::NativeLodBias},
 });
 
 std::atomic<u32> g_enable{};
@@ -106,6 +109,9 @@ std::atomic<u32> g_debug{};
 std::atomic<u32> g_validate{};
 std::atomic<u32> g_log{};
 std::atomic<u32> g_test{};
+std::atomic<u32> g_dlss_enable{};
+std::atomic<u32> g_grr_dlss_enable{};
+std::atomic<u32> g_dlss_preset{};
 
 constexpr auto Keys = std::to_array<Key>({
     {"fsr3Enable", Type::Bool, &g_enable, Defaults.enable},
@@ -138,6 +144,10 @@ constexpr auto Keys = std::to_array<Key>({
     {"fsr3Validate", Type::Bool, &g_validate, Defaults.validate},
     {"fsr3Log", Type::Bool, &g_log, Defaults.log},
     {"fsr3Test", Type::Bits, &g_test, Defaults.test},
+    {"dlssEnable", Type::Bool, &g_dlss_enable, Defaults.dlss_enable},
+    {"grrDlssEnable", Type::Bool, &g_grr_dlss_enable, Defaults.grr_dlss_enable},
+    {"dlssPreset", Type::Name, &g_dlss_preset, static_cast<u32>(Defaults.dlss_preset),
+     DlssPresetNames},
 });
 
 using KeySet = std::array<bool, Keys.size()>;
@@ -378,12 +388,19 @@ Settings::Values Settings::Snapshot() {
         .validate = load(g_validate) != 0,
         .log = load(g_log) != 0,
         .test = load(g_test),
+        .dlss_enable = load(g_dlss_enable) != 0,
+        .grr_dlss_enable = load(g_grr_dlss_enable) != 0,
+        .dlss_preset = static_cast<DlssPreset>(load(g_dlss_preset)),
     };
 }
 
 std::filesystem::path Settings::Fsr4AssetDir() {
     std::call_once(g_load_once, LoadFiles);
     return g_fsr4_asset_dir;
+}
+
+std::filesystem::path Settings::DlssDir() {
+    return Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "dlss";
 }
 
 void Settings::PublishStatus(const Status& status) {
@@ -418,6 +435,11 @@ void DrawMenu() {
     EditBool("Enable FSR 3.1", is_gr2 ? g_enable : g_grr_enable);
     EditBool("Enable FSR 4 (INT8, experimental)", is_gr2 ? g_fsr4_enable : g_grr_fsr4_enable);
     EditChoice("FSR 4 model", g_fsr4_model, Fsr4ModelNames);
+#ifdef _WIN32
+    // DLSS runs through Streamline, which exists only for Windows.
+    EditBool("Enable DLSS (NVIDIA)", is_gr2 ? g_dlss_enable : g_grr_dlss_enable);
+    EditChoice("DLSS preset", g_dlss_preset, DlssPresetNames);
+#endif
     EditPercent("Sharpness", is_gr2 ? g_sharpness : g_grr_sharpness);
     EditChoice("FXAA", g_fxaa, FxaaNames);
     EditPercent("Reactive characters", is_gr2 ? g_reactive_characters : g_grr_reactive_characters);
@@ -468,6 +490,20 @@ void DrawMenu() {
     if (!status.fsr4_notice.empty()) {
         ImGui::TextWrapped("%s", status.fsr4_notice.c_str());
     }
+#ifdef _WIN32
+    const char* dlss_state = magic_enum::enum_name(status.dlss_context).data();
+    if (status.dlss_quality[0] != '\0') {
+        ImGui::Text("DLSS: %s, %s, %.1f MiB", dlss_state, status.dlss_quality,
+                    static_cast<double>(status.dlss_bytes) / (1024.0 * 1024.0));
+    } else {
+        ImGui::Text("DLSS: %s", dlss_state);
+    }
+    ImGui::TextWrapped("DLSS folder: %s",
+                       Common::FS::PathToUTF8String(Settings::DlssDir()).c_str());
+    if (!status.dlss_notice.empty()) {
+        ImGui::TextWrapped("%s", status.dlss_notice.c_str());
+    }
+#endif
     ImGui::Text("Render %ux%u -> output %ux%u", status.render_width, status.render_height,
                 status.output_width, status.output_height);
     ImGui::Text("FSR dispatches: %llu", static_cast<unsigned long long>(status.fsr_dispatches));

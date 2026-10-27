@@ -76,7 +76,7 @@ struct StoreParams {
 };
 
 /// Inputs of the FSR 4 inputs pass, which copies the FSR 4 inputs of a frame into the images of
-/// the FSR 4 context at the render size.
+/// the FSR 4 or DLSS context at the render size.
 struct Fsr4InputsParams {
     vk::ImageView color{};          ///< Sampled view in the T# format.
     vk::ImageView motion_vectors{}; ///< Game motion vectors.
@@ -90,6 +90,7 @@ struct Fsr4InputsParams {
     bool encode_srgb{};    ///< Writes sRGB-encoded colour.
     bool depth_inverted{}; ///< Writes 1 - depth.
     bool depth_linear{};   ///< Writes the distance from the camera.
+    bool zero_motion{};    ///< Writes zero motion vectors.
 };
 
 /// Inputs of the fallback pass, which scales the colour input into the guest image of the replaced

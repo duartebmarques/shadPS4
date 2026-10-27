@@ -141,6 +141,11 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
     # vk_trampolines.cpp defines the Vulkan commands that the FidelityFX libraries and the FSR 4 v07
     # provider call.
     target_sources(shadps4 PRIVATE
+        ${GR2_FSR3_DIR}/context_images.cpp
+        ${GR2_FSR3_DIR}/context_images.h
+        ${GR2_FSR3_DIR}/dlss_context.cpp
+        ${GR2_FSR3_DIR}/dlss_context.h
+        ${GR2_FSR3_DIR}/dlss_streamline.h
         ${GR2_FSR3_DIR}/fsr3_context.cpp
         ${GR2_FSR3_DIR}/fsr3_context.h
         ${GR2_FSR3_DIR}/fsr3_inputs.cpp
@@ -169,6 +174,13 @@ if (ENABLE_GR2_FSR3 AND NOT APPLE)
         ${GR2_FSR3_DIR}/grr_survey.cpp
         ${GR2_FSR3_DIR}/grr_survey.h
         ${GR2_FSR3_DIR}/vk_trampolines.cpp)
+    # Streamline's MIT headers. The Streamline and DLSS libraries load at run time from the dlss
+    # folder of the user folder.
+    if (WIN32)
+        target_sources(shadps4 PRIVATE ${GR2_FSR3_DIR}/dlss_streamline.cpp)
+        target_include_directories(shadps4 PRIVATE
+            ${PROJECT_SOURCE_DIR}/third_party/streamline/include)
+    endif()
     target_include_directories(shadps4 PRIVATE ${GR2_FSR3_SHADER_INCLUDE})
     add_dependencies(shadps4 gr2_fsr3_shaders)
     target_link_libraries(shadps4 PRIVATE gr2_ffx_portable gr2_fsr4_bridge)

@@ -54,6 +54,9 @@ s32 PhaseCount(u32 render_width, u32 output_width);
 /// computes it.
 s32 Fsr4PhaseCount(u32 render_width, u32 output_width);
 
+/// Length of the DLSS jitter sequence for a render and output width.
+s32 DlssPhaseCount(u32 render_width, u32 output_width);
+
 /// FSR 3.1 jitter offset of a frame index: Halton(2, 3) of (index % phase_count) + 1, minus 0.5.
 Offset PhaseOffset(s32 index, s32 phase_count);
 

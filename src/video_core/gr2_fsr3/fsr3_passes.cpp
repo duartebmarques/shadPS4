@@ -43,6 +43,7 @@ constexpr u32 DebugDepthMain = 1u << 2;
 constexpr u32 Fsr4InputsEncodeSrgb = 1u << 0;
 constexpr u32 Fsr4InputsDepthInverted = 1u << 1;
 constexpr u32 Fsr4InputsDepthLinear = 1u << 2;
+constexpr u32 Fsr4InputsZeroMotion = 1u << 3;
 
 // fsr3_debug.comp switches on the DebugView values 1 to 5.
 static_assert(static_cast<u32>(DebugView::MotionVectors) == 1 &&
@@ -623,7 +624,8 @@ void Passes::RecordFsr4Inputs(const Vulkan::CommandRecorder& cmdbuf,
         .size = {params.render_size.width, params.render_size.height},
         .flags = (params.encode_srgb ? Fsr4InputsEncodeSrgb : 0u) |
                  (params.depth_inverted ? Fsr4InputsDepthInverted : 0u) |
-                 (params.depth_linear ? Fsr4InputsDepthLinear : 0u),
+                 (params.depth_linear ? Fsr4InputsDepthLinear : 0u) |
+                 (params.zero_motion ? Fsr4InputsZeroMotion : 0u),
         .near_plane = params.near_plane,
         .far_plane = params.far_plane,
     };

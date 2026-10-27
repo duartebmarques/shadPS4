@@ -34,6 +34,7 @@ constexpr u32 RepeatZeroingOff = 1u << 7;
 constexpr u32 CharacterMaskHistory = 1u << 8;
 constexpr u32 Fsr4DepthInverted = 1u << 12;
 constexpr u32 Fsr4DepthLinear = 1u << 13;
+constexpr u32 NativeLodBias = 1u << 14;
 } // namespace TestBit
 
 /// Encoding of the colour input as FSR reads it.
@@ -74,7 +75,13 @@ enum class Mode : u8 {
     Fallback, ///< The fallback pass scales the colour input into the guest image.
     Debug,    ///< The debug pass writes the guest image.
     Fsr4,     ///< FSR 4 (INT8, experimental) followed by the store pass.
+    Dlss,     ///< DLSS Super Resolution or DLAA followed by the store pass.
 };
+
+/// Whether the mode runs FSR 3.1, FSR 4 or DLSS.
+constexpr bool RunsUpscaler(Mode mode) {
+    return mode == Mode::Fsr || mode == Mode::Fsr4 || mode == Mode::Dlss;
+}
 
 /// Model set of FSR 4. The values are the fsr4Model names; Auto selects by the upscale ratio.
 enum class Fsr4Model : u8 {
@@ -86,6 +93,9 @@ enum class Fsr4Model : u8 {
     UltraPerformance,
     Drs,
 };
+
+/// Preset of DLSS. The values are the dlssPreset names; Default lets the DLSS library choose.
+enum class DlssPreset : u8 { Default, J, K, L, M };
 
 /// Extent of the output of the replaced pass relative to its colour input.
 enum class Kind : u8 {

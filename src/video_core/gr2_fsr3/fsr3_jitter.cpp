@@ -71,6 +71,11 @@ s32 Fsr4PhaseCount(u32 render_width, u32 output_width) {
     return std::clamp(static_cast<s32>(std::ceil(8.0f * ratio * ratio)), 1, 256);
 }
 
+s32 DlssPhaseCount(u32 render_width, u32 output_width) {
+    // The DLSS guide asks for at least 16 phases and for 8 times the squared upscale ratio.
+    return std::max(16, Fsr4PhaseCount(render_width, output_width));
+}
+
 Offset PhaseOffset(s32 index, s32 phase_count) {
     const s32 i = (index % phase_count) + 1;
     return {.x = Halton(i, 2) - 0.5f, .y = Halton(i, 3) - 0.5f};

@@ -10,12 +10,14 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/elf_info.h"
 #include "common/gravity_rush.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/info.h"
+#include "video_core/gr2_fsr3/dlss_context.h"
 #include "video_core/gr2_fsr3/fsr3_context.h"
 #include "video_core/gr2_fsr3/fsr3_inputs.h"
 #include "video_core/gr2_fsr3/fsr3_jitter.h"
@@ -44,7 +46,9 @@ constexpr std::array TrackedHashes{
     Hash::Contour,           Hash::Ibl0,     Hash::Ibl1,
 };
 
-constexpr std::array<std::string_view, 5> ModeNames{"stock", "fsr", "fallback", "debug", "fsr4"};
+constexpr std::array<std::string_view, 6> ModeNames{"stock", "fsr",  "fallback",
+                                                    "debug", "fsr4", "dlss"};
+static_assert(ModeNames.size() == static_cast<size_t>(Mode::Dlss) + 1);
 constexpr std::array<std::string_view, 3> KindNames{"native", "upscale", "other"};
 
 constexpr u64 PeriodicLogFrames = 300;
@@ -75,7 +79,7 @@ struct Frame {
 };
 
 AcquireRequest RequestFor(Mode mode, const Frame& frame) {
-    if (mode == Mode::Fsr || mode == Mode::Fsr4) {
+    if (RunsUpscaler(mode)) {
         return {
             .color = true,
             .velocity = true,
@@ -99,12 +103,13 @@ AcquireRequest RequestFor(Mode mode, const Frame& frame) {
     return {.color = true, .output = true};
 }
 
-// The jitter and motion-vector scale that FSR 3.1 and FSR 4 receive.
+// The jitter and motion-vector scale that FSR 3.1, FSR 4 and DLSS receive.
 struct MotionTerms {
     float jitter_x{};
     float jitter_y{};
     float motion_vector_scale_x{};
     float motion_vector_scale_y{};
+    bool repeated{}; ///< A repeated view: no motion.
 };
 
 MotionTerms MotionTermsOf(const Frame& frame) {
@@ -118,6 +123,7 @@ MotionTerms MotionTermsOf(const Frame& frame) {
         .jitter_y = jitter_sign * frame.report.applied.y,
         .motion_vector_scale_x = repeated ? 0.0f : 0.5f * static_cast<float>(render.width),
         .motion_vector_scale_y = repeated ? 0.0f : mv_scale_y * static_cast<float>(render.height),
+        .repeated = repeated,
     };
 }
 
@@ -185,7 +191,7 @@ FsrImage DeclareInput(const GuestImage& image, vk::Format format, vk::ImageAspec
 class Module {
 public:
     explicit Module(const Vulkan::Instance& instance)
-        : instance{instance}, context{instance}, fsr4{instance} {
+        : instance{instance}, context{instance}, fsr4{instance}, dlss{instance} {
         Jitter::SetMaxLodBias(instance.MaxSamplerLodBias());
     }
 
@@ -199,6 +205,8 @@ private:
                    const FrameImages& images, Vulkan::Scheduler& scheduler);
     Mode RecordFsr4(const Vulkan::CommandRecorder& cmdbuf, const Frame& frame,
                     const FrameImages& images, Vulkan::Scheduler& scheduler);
+    Mode RecordDlss(const Vulkan::CommandRecorder& cmdbuf, const Frame& frame,
+                    const FrameImages& images, Vulkan::Scheduler& scheduler);
     void ArmJitter(Vulkan::Rasterizer& rasterizer, const Jitter::FramePlan& plan);
     void Publish(Mode mode, const Frame& frame, float interval_ms);
 
@@ -206,12 +214,15 @@ private:
     Inputs inputs;
     Context context;
     Fsr4Context fsr4;
+    DlssContext dlss;
     std::unique_ptr<Passes> passes;
     bool passes_failed{};
     ContextState context_state{ContextState::Idle};
     ContextState fsr4_state{ContextState::Idle};
     std::optional<Fsr4Key> fsr4_key;
     bool fsr4_passes_failed{};
+    ContextState dlss_state{ContextState::Idle};
+    std::optional<DlssKey> dlss_key;
     u64 aa_count{};
     u64 cbresolve_frame{~0ULL};
     bool log_frame{};
@@ -224,14 +235,16 @@ private:
     bool last_fsr_depth_main{};
     bool last_frame_fsr{};
     bool last_frame_fsr4{};
+    bool last_frame_dlss{};
     u64 context_generation{};
     u64 fsr4_generation{};
+    u64 dlss_generation{};
     s32 phase_index{};
     bool jitter_was_enabled{};
     u64 frame_id{};
     u64 fsr_dispatches{};
     Mode last_mode{Mode::Stock};
-    u32 logged_mode_changes{};
+    u64 logged_mode_changes{};
     bool logged_cbresolve{};
     bool logged_no_depth{};
     bool logged_copy_unavailable{};
@@ -239,6 +252,7 @@ private:
     bool logged_color_format{};
     bool logged_rejected{};
     bool logged_fsr4_rejected{};
+    bool logged_dlss_rejected{};
 };
 
 // Created on the first tracked dispatch and never destroyed: static destruction can run after
@@ -285,6 +299,7 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
         ArmJitter(rasterizer, Jitter::FramePlan{});
         last_frame_fsr = false;
         last_frame_fsr4 = false;
+        last_frame_dlss = false;
         Publish(Mode::Stock, frame, interval_ms);
         return false;
     }
@@ -314,17 +329,27 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
 
     const bool coverage = (settings.test & TestBit::CoverageJitter) != 0;
     const bool session_fsr = !coverage && !cbresolve && KindOf(*session_sizes) != Kind::Other;
+    dlss_key.reset();
+    if (settings.dlss_enable && session_fsr && !fsr4_passes_failed) {
+        dlss_key = DlssKeyFor(session_sizes->render, session_sizes->output, settings.dlss_preset);
+    }
+    dlss_state = dlss.Update(
+        rasterizer.GetScheduler(), dlss_key, !context.HoldsMemory() && !fsr4.HoldsMemory(),
+        Passes::EstimateFsr4Bytes(session_sizes->render, settings.character_camera_motion));
+    // Once DLSS holds or awaits memory, FSR 4 and FSR 3.1 give their GPU memory to DLSS.
+    const bool dlss_blocks = dlss.HoldsMemory() || dlss_state == ContextState::Creating;
     fsr4_key.reset();
-    if (settings.fsr4_enable && session_fsr && !fsr4_passes_failed) {
+    if (settings.fsr4_enable && session_fsr && !fsr4_passes_failed && !dlss_blocks) {
         fsr4_key = Fsr4KeyFor(session_sizes->render, session_sizes->output, settings.fsr4_model);
     }
     fsr4_state = fsr4.Update(
-        rasterizer.GetScheduler(), fsr4_key, !context.HoldsMemory(),
+        rasterizer.GetScheduler(), fsr4_key, !context.HoldsMemory() && !dlss.HoldsMemory(),
         Passes::EstimateFsr4Bytes(session_sizes->render, settings.character_camera_motion));
-    // FSR 3.1 holds no context while FSR 4 holds one or its files have passed their checks; while
-    // the files load, a context FSR 3.1 already has keeps running.
+    // FSR 3.1 holds no context while DLSS holds or awaits memory, or while FSR 4 holds one or its
+    // files have passed their checks; while the files load, a context FSR 3.1 already has keeps
+    // running.
     const bool fsr3_blocked =
-        fsr4.HoldsMemory() ||
+        dlss_blocks || fsr4.HoldsMemory() ||
         (fsr4_state == ContextState::Loading && (fsr4.AssetsReady() || !context.HoldsMemory()));
     std::optional<ContextKey> wanted;
     if (settings.enable && session_fsr && !fsr3_blocked) {
@@ -380,6 +405,8 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
     } else if (settings.debug >= DebugView::MotionVectors &&
                settings.debug <= DebugView::Reprojection) {
         mode = Mode::Debug;
+    } else if (dlss_state == ContextState::Ready && session_frame) {
+        mode = Mode::Dlss;
     } else if (fsr4_ready) {
         mode = Mode::Fsr4;
     } else if (fsr_ready && has_depth) {
@@ -387,11 +414,13 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
     } else if (frame.kind == Kind::Native) {
         mode = Mode::Stock;
     }
-    if (mode == Mode::Fsr4) {
-        // The inputs pass samples either depth image, so FSR 4 reads the main depth without
-        // separate depth/stencil layouts.
+    if (mode == Mode::Fsr4 || mode == Mode::Dlss) {
+        // The inputs pass samples either depth image, so FSR 4 and DLSS read the main depth
+        // without separate depth/stencil layouts.
         frame.depth_main = settings.depth_source == DepthSource::Main || !frame.capture_current;
-        frame.reset = restarts(fsr4.Generation(), fsr4_generation, last_frame_fsr4);
+        frame.reset = mode == Mode::Fsr4
+                          ? restarts(fsr4.Generation(), fsr4_generation, last_frame_fsr4)
+                          : restarts(dlss.Generation(), dlss_generation, last_frame_dlss);
     }
     if (mode != Mode::Stock && !passes && !passes_failed) {
         passes = std::make_unique<Passes>(instance);
@@ -405,23 +434,30 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
     if (!passes) {
         mode = Mode::Stock;
     }
-    if (mode == Mode::Fsr4 && !passes->InitFsr4()) {
-        // From the next frame no FSR 4 context is wanted, and FSR 3.1 can take over.
+    if ((mode == Mode::Fsr4 || mode == Mode::Dlss) && !passes->InitFsr4()) {
+        // From the next frame no FSR 4 or DLSS context is wanted, and FSR 3.1 can take over.
         fsr4_passes_failed = true;
-        LOG_ERROR(Render_Vulkan, "GR2 FSR4: the FSR 4 inputs pass is unavailable, FSR 4 stays off");
+        LOG_ERROR(Render_Vulkan,
+                  "GR2 FSR4: the inputs pass is unavailable, FSR 4 and DLSS stay off");
         mode = frame.kind == Kind::Native ? Mode::Stock : Mode::Fallback;
     }
 
     const Mode executed = Record(mode, frame, rasterizer);
 
     Jitter::FramePlan plan{.scene_stencil_address = frame.bindings.stencil.tsharp.Address()};
-    if (executed == Mode::Fsr || executed == Mode::Fsr4) {
+    if (RunsUpscaler(executed)) {
         const bool fsr4_frame = executed == Mode::Fsr4;
-        const s32 phase_count =
-            fsr4_frame ? Jitter::Fsr4PhaseCount(frame.sizes.render.width, frame.sizes.output.width)
-                       : Jitter::PhaseCount(frame.sizes.render.width, frame.sizes.output.width);
-        const u64 executed_generation = fsr4_frame ? fsr4.Generation() : generation;
-        u64& seen_generation = fsr4_frame ? fsr4_generation : context_generation;
+        const bool dlss_frame = executed == Mode::Dlss;
+        const auto& [render, output] = frame.sizes;
+        const s32 phase_count = fsr4_frame   ? Jitter::Fsr4PhaseCount(render.width, output.width)
+                                : dlss_frame ? Jitter::DlssPhaseCount(render.width, output.width)
+                                             : Jitter::PhaseCount(render.width, output.width);
+        const u64 executed_generation = fsr4_frame   ? fsr4.Generation()
+                                        : dlss_frame ? dlss.Generation()
+                                                     : generation;
+        u64& seen_generation = fsr4_frame   ? fsr4_generation
+                               : dlss_frame ? dlss_generation
+                                            : context_generation;
         if (executed_generation != seen_generation) {
             phase_index = 0;
         }
@@ -434,7 +470,8 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
         if ((settings.test & TestBit::JitterOff) == 0) {
             plan.enabled = true;
             plan.offset = Jitter::PhaseOffset(phase_index, phase_count);
-            if (frame.kind == Kind::Upscale && settings.lod_bias) {
+            if ((frame.kind == Kind::Upscale || (settings.test & TestBit::NativeLodBias) != 0) &&
+                settings.lod_bias) {
                 const float ratio = static_cast<float>(frame.sizes.render.width) /
                                     static_cast<float>(frame.sizes.output.width);
                 plan.lod_bias =
@@ -448,6 +485,7 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
     }
     last_frame_fsr = executed == Mode::Fsr;
     last_frame_fsr4 = executed == Mode::Fsr4;
+    last_frame_dlss = executed == Mode::Dlss;
     ArmJitter(rasterizer, plan);
     Publish(executed, frame, interval_ms);
     if (log_this) {
@@ -457,10 +495,11 @@ bool Module::Antialias(const Shader::Info& info, Vulkan::Rasterizer& rasterizer)
             .kind = frame.kind,
             .context = context_state,
             .fsr4_context = fsr4_state,
+            .dlss_context = dlss_state,
             .render_size = frame.sizes.render,
             .output_size = frame.sizes.output,
             .interval_ms = interval_ms,
-            .reset = (executed == Mode::Fsr || executed == Mode::Fsr4) && frame.reset,
+            .reset = RunsUpscaler(executed) && frame.reset,
             .camera = frame.camera,
             .jitter = frame.report,
         });
@@ -483,7 +522,7 @@ Mode Module::Record(Mode mode, const Frame& frame, Vulkan::Rasterizer& rasterize
     scheduler.EndRendering();
     FrameImages images{};
     bool acquired = inputs.Acquire(frame.bindings, RequestFor(mode, frame), rasterizer, images);
-    if (!acquired && (mode == Mode::Fsr || mode == Mode::Fsr4) && frame.kind != Kind::Native) {
+    if (!acquired && RunsUpscaler(mode) && frame.kind != Kind::Native) {
         mode = Mode::Fallback;
         acquired = inputs.Acquire(frame.bindings, RequestFor(mode, frame), rasterizer, images);
     }
@@ -494,12 +533,16 @@ Mode Module::Record(Mode mode, const Frame& frame, Vulkan::Rasterizer& rasterize
         return Mode::Stock;
     }
 
-    rasterizer.ScopeMarkerBegin(mode == Mode::Fsr4 ? "Host/FSR4" : "Host/FSR3");
+    rasterizer.ScopeMarkerBegin(mode == Mode::Fsr4   ? "Host/FSR4"
+                                : mode == Mode::Dlss ? "Host/DLSS"
+                                                     : "Host/FSR3");
     const Vulkan::CommandRecorder cmdbuf = scheduler.CommandBuffer();
     if (mode == Mode::Fsr) {
         mode = RecordFsr(cmdbuf, frame, images, scheduler);
     } else if (mode == Mode::Fsr4) {
         mode = RecordFsr4(cmdbuf, frame, images, scheduler);
+    } else if (mode == Mode::Dlss) {
+        mode = RecordDlss(cmdbuf, frame, images, scheduler);
     } else if (mode == Mode::Fallback) {
         passes->RecordFallback(cmdbuf, FallbackOf(frame, images, frame.settings.fallback_easu));
     } else {
@@ -677,6 +720,62 @@ Mode Module::RecordFsr4(const Vulkan::CommandRecorder& cmdbuf, const Frame& fram
     return Mode::Fsr4;
 }
 
+Mode Module::RecordDlss(const Vulkan::CommandRecorder& cmdbuf, const Frame& frame,
+                        const FrameImages& images, Vulkan::Scheduler& scheduler) {
+    const Settings::Values& settings = frame.settings;
+    const auto& [render, output] = frame.sizes;
+    passes->ResizeFsr4(scheduler, render, settings.character_camera_motion);
+    if (frame.camera_motion) {
+        passes->RecordCameraMotion(cmdbuf, CameraMotionOf(frame, images, inputs.Velocity()));
+    }
+    // A copy: a rejected evaluation retires the context together with its images.
+    const Fsr4Images targets = dlss.Images();
+    const GuestImage& depth = frame.depth_main ? images.depth_main : images.depth_copy;
+    const MotionTerms motion = MotionTermsOf(frame);
+    // DLSS reads sRGB-encoded colour and needs a nonzero motion vector scale, so the inputs pass
+    // writes the vectors of a repeated view as zero.
+    passes->RecordFsr4Inputs(cmdbuf, Fsr4InputsParams{
+                                         .color = images.color.view,
+                                         .motion_vectors = images.velocity.view,
+                                         .depth = depth.view,
+                                         .targets = targets,
+                                         .render_size = render,
+                                         .camera_motion = frame.camera_motion,
+                                         .encode_srgb = true,
+                                         .zero_motion = motion.repeated,
+                                     });
+    const Fsr4Dispatch dispatch{
+        .jitter_x = motion.jitter_x,
+        .jitter_y = motion.jitter_y,
+        .motion_vector_scale_x = motion.repeated ? 1.0f : motion.motion_vector_scale_x,
+        .motion_vector_scale_y = motion.repeated ? 1.0f : motion.motion_vector_scale_y,
+        .render_size = render,
+        .output_size = output,
+        .reset = frame.reset,
+    };
+    if (!dlss.RecordDispatch(scheduler, dispatch)) {
+        const bool native = frame.kind == Kind::Native;
+        if (!std::exchange(logged_dlss_rejected, true)) {
+            LOG_ERROR(Render_Vulkan,
+                      "GR2 DLSS: DLSS rejected the evaluation, frame uses the {} pass",
+                      native ? "stock" : "fallback");
+        }
+        if (native) {
+            return Mode::Stock;
+        }
+        passes->RecordFallback(cmdbuf, FallbackOf(frame, images, settings.fallback_easu));
+        return Mode::Fallback;
+    }
+    if (settings.debug == DebugView::Bypass) {
+        passes->RecordFallback(cmdbuf, FallbackOf(frame, images, false));
+        return Mode::Dlss;
+    }
+    StoreParams store = StoreOf(frame, images, targets.output);
+    store.linear_input = false;
+    passes->RecordStore(cmdbuf, store);
+    return Mode::Dlss;
+}
+
 void Module::ArmJitter(Vulkan::Rasterizer& rasterizer, const Jitter::FramePlan& plan) {
     Jitter::BeginFrame(plan);
     // The offset changes at the next Composite draw; invalidating keeps the dynamic-state memos
@@ -706,10 +805,14 @@ void Module::Publish(Mode mode, const Frame& frame, float interval_ms) {
         .fsr4_model = fsr4_key ? Fsr4PresetName(fsr4_key->preset) : "",
         .fsr4_tier = fsr4_key ? Fsr4TierName(fsr4_key->max_output_size) : "",
         .fsr4_notice = fsr4.Notice(),
+        .dlss_context = dlss_state,
+        .dlss_bytes = dlss.MemoryBytes(),
+        .dlss_quality = dlss_key ? DlssModeName(dlss_key->mode) : "",
+        .dlss_notice = dlss.Notice(),
     });
     // Each distinct change is logged once, so modes alternating per frame cannot flood the log.
-    const u32 change =
-        1u << (static_cast<u32>(last_mode) * ModeNames.size() + static_cast<u32>(mode));
+    const u64 change =
+        u64{1} << (static_cast<u32>(last_mode) * ModeNames.size() + static_cast<u32>(mode));
     if (mode != last_mode && (logged_mode_changes & change) == 0) {
         logged_mode_changes |= change;
         LOG_INFO(Render_Vulkan, "GR2 FSR3: Antialias {}x{} -> {}x{}: mode {} -> {}", render.width,

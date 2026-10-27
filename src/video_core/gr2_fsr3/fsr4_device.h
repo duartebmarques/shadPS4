@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "common/types.h"
+#include "video_core/gr2_fsr3/dlss_streamline.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Gr2Fsr3 {
@@ -41,8 +42,8 @@ void ExtendDevice(vk::PhysicalDevice physical_device, vk::DeviceCreateInfo& crea
 /**
  * For Gravity Rush 2 with fsr4Enable or Gravity Rush Remastered with grrFsr4Enable set, enables
  * the supported features and the VK_KHR_compute_shader_derivatives extension that FSR 4 v07
- * shaders can declare, and records the features the device is created with. Call after the last
- * change to the chain, right before the device is created.
+ * shaders can declare, and records the features the device is created with. Then adds what DLSS
+ * needs. Call after the last change to the chain, right before the device is created.
  */
 template <typename... Chain>
 void ExtendDevice(vk::PhysicalDevice physical_device, vk::StructureChain<Chain...>& chain) {
@@ -50,6 +51,8 @@ void ExtendDevice(vk::PhysicalDevice physical_device, vk::StructureChain<Chain..
                  chain.template get<vk::PhysicalDeviceVulkan11Features>(),
                  chain.template get<vk::PhysicalDeviceVulkan12Features>(),
                  chain.template get<vk::PhysicalDeviceVulkan13Features>());
+    ExtendDeviceForDlss(physical_device, chain.get(),
+                        chain.template get<vk::PhysicalDeviceVulkan12Features>());
 }
 
 /// The features ExtendDevice recorded; empty unless it ran for one of the titles with its key set.

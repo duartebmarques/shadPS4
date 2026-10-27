@@ -8,9 +8,13 @@
 #include <deque>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
+#include <utility>
 
+#include "common/types.h"
 #include "common/unique_function.h"
 
 namespace Gr2Fsr3 {
@@ -34,6 +38,35 @@ private:
     std::condition_variable_any cv;
     std::deque<Common::UniqueFunction<void>> tasks;
     std::jthread thread;
+};
+
+// A failure of a provider call recorded through Scheduler::Record, kept with the generation of
+// its context. The recorded calls report it; the GPU command thread takes it.
+class RecordedFailure {
+public:
+    void Report(u64 generation, std::string text) {
+        std::scoped_lock lock{mutex};
+        failed_generation = generation;
+        message = std::move(text);
+    }
+
+    bool HasFailed(u64 generation) {
+        std::scoped_lock lock{mutex};
+        return failed_generation == generation;
+    }
+
+    std::optional<std::string> Take(u64 generation) {
+        std::scoped_lock lock{mutex};
+        if (failed_generation != generation) {
+            return std::nullopt;
+        }
+        return std::exchange(message, std::nullopt);
+    }
+
+private:
+    std::mutex mutex;
+    u64 failed_generation{}; ///< 0 until a context fails; generations count from 1.
+    std::optional<std::string> message;
 };
 
 /// Whether the future is valid and its get() returns without blocking.

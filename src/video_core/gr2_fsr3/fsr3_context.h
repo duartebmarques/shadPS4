@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,6 +46,14 @@ inline Kind KindOf(const SizePair& sizes) {
         return Kind::Upscale;
     }
     return Kind::Other;
+}
+
+/// The output-to-render width ratio rounded to two decimals. The split patches round the render
+/// width to a multiple of 8, which gives 1280 <- 856 the ratio 1.4953.
+inline float RoundedWidthRatio(vk::Extent2D render_size, vk::Extent2D output_size) {
+    return std::round(100.0f * static_cast<float>(output_size.width) /
+                      static_cast<float>(render_size.width)) /
+           100.0f;
 }
 
 /**
