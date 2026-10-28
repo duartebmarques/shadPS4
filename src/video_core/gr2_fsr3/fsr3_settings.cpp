@@ -25,6 +25,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/types.h"
+#include "video_core/gr2_fsr3/dlss_streamline.h"
 #include "video_core/gr2_fsr3/fsr3_settings.h"
 #include "video_core/gr2_fsr3/fsr3_types.h"
 #include "video_core/gr2_fsr3/gr2_fsr3.h"
@@ -355,6 +356,23 @@ void EditChoice(const char* label, std::atomic<u32>& setting, std::span<const ch
     }
 }
 
+// Draws a notice in bold red, wrapped at the right edge of the menu. The menu font has no bold
+// face, so the text is drawn twice, one pixel apart.
+void DrawAlert(const std::string& text) {
+    const char* const end = text.data() + text.size();
+    const ImVec2 position = ImGui::GetCursorScreenPos();
+    const float wrap_width = std::max(ImGui::GetContentRegionAvail().x - 1.0f, 1.0f);
+    const ImVec2 size = ImGui::CalcTextSize(text.data(), end, false, wrap_width);
+    const ImU32 color = ImGui::GetColorU32(ImVec4{1.0f, 0.2f, 0.2f, 1.0f});
+    ImDrawList* const draw_list = ImGui::GetWindowDrawList();
+    for (const float offset : {0.0f, 1.0f}) {
+        draw_list->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                           ImVec2{position.x + offset, position.y}, color, text.data(), end,
+                           wrap_width);
+    }
+    ImGui::Dummy(ImVec2{size.x + 1.0f, size.y});
+}
+
 } // namespace
 
 Settings::Values Settings::Snapshot() {
@@ -483,7 +501,7 @@ void DrawMenu() {
     ImGui::TextWrapped("FSR 4 assets: %s",
                        Common::FS::PathToUTF8String(Settings::Fsr4AssetDir()).c_str());
     if (!status.fsr4_notice.empty()) {
-        ImGui::TextWrapped("%s", status.fsr4_notice.c_str());
+        DrawAlert(status.fsr4_notice);
     }
     ImGui::Text("Render %ux%u -> output %ux%u", status.render_width, status.render_height,
                 status.output_width, status.output_height);
@@ -508,7 +526,14 @@ void DrawDlssMenu() {
         return;
     }
     std::call_once(g_load_once, LoadFiles);
-    EditBool("Enable DLSS (NVIDIA)", is_gr2 ? g_dlss_enable : g_grr_dlss_enable);
+    // DLSS runs only when the game starts with it on and its files in place, which the launcher
+    // sets up.
+    const bool running = DlssRunning();
+    ImGui::BeginDisabled(!running);
+    EditBool(running ? "Enable DLSS (NVIDIA)"
+                     : "Enable DLSS (NVIDIA) (DLSS not enabled/set up in launcher)",
+             is_gr2 ? g_dlss_enable : g_grr_dlss_enable);
+    ImGui::EndDisabled();
     EditChoice("DLSS preset", g_dlss_preset, DlssPresetNames);
 
     ImGui::Separator();
@@ -523,7 +548,7 @@ void DrawDlssMenu() {
     ImGui::TextWrapped("DLSS folder: %s",
                        Common::FS::PathToUTF8String(Settings::DlssDir()).c_str());
     if (!status.dlss_notice.empty()) {
-        ImGui::TextWrapped("%s", status.dlss_notice.c_str());
+        DrawAlert(status.dlss_notice);
     }
     if (ImGui::Button("Save")) {
         Settings::Save();
