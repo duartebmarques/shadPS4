@@ -128,6 +128,7 @@ void L::DrawMenuBar() {
             Gr2Fsr3::DrawMenu();
             ImGui::EndMenu();
         }
+        Gr2Fsr3::DrawDlssMenu();
         if (BeginMenu("Debug")) {
             MenuItem("Memory map", nullptr, &memory_map.open);
             MenuItem("Module list", nullptr, &module_list.open);

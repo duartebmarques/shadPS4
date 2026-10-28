@@ -435,11 +435,6 @@ void DrawMenu() {
     EditBool("Enable FSR 3.1", is_gr2 ? g_enable : g_grr_enable);
     EditBool("Enable FSR 4 (INT8, experimental)", is_gr2 ? g_fsr4_enable : g_grr_fsr4_enable);
     EditChoice("FSR 4 model", g_fsr4_model, Fsr4ModelNames);
-#ifdef _WIN32
-    // DLSS runs through Streamline, which exists only for Windows.
-    EditBool("Enable DLSS (NVIDIA)", is_gr2 ? g_dlss_enable : g_grr_dlss_enable);
-    EditChoice("DLSS preset", g_dlss_preset, DlssPresetNames);
-#endif
     EditPercent("Sharpness", is_gr2 ? g_sharpness : g_grr_sharpness);
     EditChoice("FXAA", g_fxaa, FxaaNames);
     EditPercent("Reactive characters", is_gr2 ? g_reactive_characters : g_grr_reactive_characters);
@@ -490,20 +485,6 @@ void DrawMenu() {
     if (!status.fsr4_notice.empty()) {
         ImGui::TextWrapped("%s", status.fsr4_notice.c_str());
     }
-#ifdef _WIN32
-    const char* dlss_state = magic_enum::enum_name(status.dlss_context).data();
-    if (status.dlss_quality[0] != '\0') {
-        ImGui::Text("DLSS: %s, %s, %.1f MiB", dlss_state, status.dlss_quality,
-                    static_cast<double>(status.dlss_bytes) / (1024.0 * 1024.0));
-    } else {
-        ImGui::Text("DLSS: %s", dlss_state);
-    }
-    ImGui::TextWrapped("DLSS folder: %s",
-                       Common::FS::PathToUTF8String(Settings::DlssDir()).c_str());
-    if (!status.dlss_notice.empty()) {
-        ImGui::TextWrapped("%s", status.dlss_notice.c_str());
-    }
-#endif
     ImGui::Text("Render %ux%u -> output %ux%u", status.render_width, status.render_height,
                 status.output_width, status.output_height);
     ImGui::Text("FSR dispatches: %llu", static_cast<unsigned long long>(status.fsr_dispatches));
@@ -516,6 +497,40 @@ void DrawMenu() {
         ImGui::CloseCurrentPopup();
     }
     ImGui::EndMenu();
+}
+
+void DrawDlssMenu() {
+#ifdef _WIN32
+    // DLSS runs through Streamline, which exists only for Windows.
+    static const bool is_gr2 = Common::IsGravityRush2();
+    static const bool is_grr = Common::IsGravityRushRemastered();
+    if (!(is_gr2 || is_grr) || !ImGui::BeginMenu(is_gr2 ? "DLSS (GR2)" : "DLSS (GRR)")) {
+        return;
+    }
+    std::call_once(g_load_once, LoadFiles);
+    EditBool("Enable DLSS (NVIDIA)", is_gr2 ? g_dlss_enable : g_grr_dlss_enable);
+    EditChoice("DLSS preset", g_dlss_preset, DlssPresetNames);
+
+    ImGui::Separator();
+    const Settings::Status status = Settings::ReadStatus();
+    const char* dlss_state = magic_enum::enum_name(status.dlss_context).data();
+    if (status.dlss_quality[0] != '\0') {
+        ImGui::Text("DLSS: %s, %s, %.1f MiB", dlss_state, status.dlss_quality,
+                    static_cast<double>(status.dlss_bytes) / (1024.0 * 1024.0));
+    } else {
+        ImGui::Text("DLSS: %s", dlss_state);
+    }
+    ImGui::TextWrapped("DLSS folder: %s",
+                       Common::FS::PathToUTF8String(Settings::DlssDir()).c_str());
+    if (!status.dlss_notice.empty()) {
+        ImGui::TextWrapped("%s", status.dlss_notice.c_str());
+    }
+    if (ImGui::Button("Save")) {
+        Settings::Save();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndMenu();
+#endif
 }
 
 } // namespace Gr2Fsr3

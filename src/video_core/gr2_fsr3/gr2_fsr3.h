@@ -21,8 +21,9 @@ class Rasterizer;
 } // namespace Vulkan
 
 // FSR 3.1 and FSR 4 (INT8, experimental) temporal upscaling and anti-aliasing for Gravity Rush 2
-// and Gravity Rush Remastered. Every function runs on the GPU command thread except DrawMenu,
-// which runs on the ImGui thread. For other titles a call costs one load and a few compares.
+// and Gravity Rush Remastered. Every function runs on the GPU command thread except DrawMenu and
+// DrawDlssMenu, which run on the ImGui thread. For other titles a call costs one load and a few
+// compares.
 namespace Gr2Fsr3 {
 
 #ifdef ENABLE_GR2_FSR3
@@ -117,6 +118,9 @@ inline void AdjustSampler(AmdGpu::Sampler& ssharp, const Shader::Info& stage) {
 /// Draws the "FSR 3.1 (GR2)" or "FSR 3.1 (GRR)" submenu of the Display menu.
 void DrawMenu();
 
+/// Draws the "DLSS (GR2)" or "DLSS (GRR)" menu of the menu bar, on Windows only.
+void DrawDlssMenu();
+
 #else
 
 inline bool OnDispatch(const Shader::Info&, const AmdGpu::ComputeProgram&, Vulkan::Rasterizer&) {
@@ -137,6 +141,8 @@ inline u32 DynFlagBits() {
 inline void AdjustSampler(AmdGpu::Sampler&, const Shader::Info&) {}
 
 inline void DrawMenu() {}
+
+inline void DrawDlssMenu() {}
 
 #endif
 
