@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/info.h"
+#include "video_core/gr2_fsr3/gr2_fsr3.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -116,7 +117,7 @@ bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
     default:
-        return false;
+        return Gr2Fsr3::OnDispatch(info, cs_program, rasterizer);
     }
 }
 

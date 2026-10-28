@@ -22,6 +22,7 @@
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/system/userservice.h"
+#include "core/prompt_packs/prompt_packs.h"
 #include "core/user_settings.h"
 #include "input/controller.h"
 
@@ -574,7 +575,7 @@ void GameControllers::TryOpenSDLControllers() {
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);
                 c->ConnectController(pad);
-                if (EmulatorSettings.IsMotionControlsEnabled()) {
+                if (EmulatorSettings.IsMotionControlsEnabled() && PromptPacks::MotionAllowed()) {
                     if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
                         const float poll_rate =
                             SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_GYRO);

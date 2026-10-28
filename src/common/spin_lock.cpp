@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <thread>
+
 #include "common/spin_lock.h"
+#include "common/types.h"
 
 #if _MSC_VER
 #include <intrin.h>
@@ -34,8 +37,17 @@ void ThreadPause() {
 namespace Common {
 
 void SpinLock::lock() {
+    // Spin on a plain load and yield after a short spin: with more runnable threads than cores the
+    // holder may be descheduled, and unbounded spinning then burns the time it needs to release.
+    u32 spins = 0;
     while (lck.test_and_set(std::memory_order_acquire)) {
-        ThreadPause();
+        while (lck.test(std::memory_order_relaxed)) {
+            if (++spins < 64) {
+                ThreadPause();
+            } else {
+                std::this_thread::yield();
+            }
+        }
     }
 }
 

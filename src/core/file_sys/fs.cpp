@@ -12,6 +12,7 @@
 #include "core/file_sys/devices/logger.h"
 #include "core/file_sys/devices/nop_device.h"
 #include "core/file_sys/fs.h"
+#include "core/prompt_packs/prompt_packs.h"
 
 namespace Core::FileSys {
 
@@ -508,7 +509,9 @@ bool MntPoints::Stat(std::string_view guest_path, FileStat& out) {
     const auto rel = RelativeToMount(*corrected, *mount);
     for (const auto& backend : mount->backends) {
         if (backend->Exists(rel)) {
-            return backend->Stat(rel, out);
+            const bool found = backend->Stat(rel, out);
+            PromptPacks::FixArchiveStat(*corrected, out);
+            return found;
         }
     }
     return false;
@@ -542,7 +545,7 @@ std::unique_ptr<IFile> MntPoints::Open(std::string_view guest_path,
 
     for (const auto& backend : mount->backends) {
         if (backend->Exists(rel) && !backend->IsDirectory(rel)) {
-            return backend->Open(rel_copy, mode);
+            return PromptPacks::WrapArchive(*corrected, backend->Open(rel_copy, mode));
         }
     }
     return nullptr;

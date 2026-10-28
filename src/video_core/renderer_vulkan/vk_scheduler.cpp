@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/rdtsc.h"
@@ -9,6 +11,7 @@
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_record_thread.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/skipcache/skipcache.h"
 
@@ -74,13 +77,18 @@ void SubmitThread(std::stop_token stoken, vk::Queue queue) {
 }
 } // Anonymous namespace
 
-Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
+    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore},
+      threaded_recording{threaded_recording} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
     pop_poll_throttle_ = std::max<u32>(EmulatorSettings.GetPendingPopThrottle(), 1u);
     tick_query_interval_ns_ = u64{EmulatorSettings.GetTickQueryIntervalUs()} * 1000;
+    if (threaded_recording) {
+        record_thread = std::make_unique<RecordThread>(instance, work_semaphore);
+        chunk = record_thread->AcquireChunk();
+    }
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -165,10 +173,11 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    CommandBuffer().endRendering();
+    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+    ASSERT_MSG(!threaded_recording, "The recording thread owns the command buffers");
     auto& upload_cmdbuf = sessions.back().upload;
     if (upload_cmdbuf) {
         return upload_cmdbuf;
@@ -230,7 +239,33 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    if (threaded_recording) {
+        if (const u64 blocked = record_thread->WaitSubmitted(tick)) {
+            RecordWait(WaitSite::RecordDrain, blocked);
+        }
+    }
     work_semaphore.Wait(tick);
+}
+
+void Scheduler::WaitSubmitted(u64 tick) {
+    if (threaded_recording) {
+        record_thread->WaitSubmitted(tick);
+    }
+}
+
+void Scheduler::ResetCommandBuffer() {
+    if (threaded_recording) {
+        record_thread->ResetCommandBuffer();
+        return;
+    }
+    Check(RawCommandBuffer().reset());
+}
+
+void Scheduler::DispatchChunk(const SubmitRequest* request) {
+    if (const u64 blocked = record_thread->Dispatch(std::move(chunk), request)) {
+        RecordWait(WaitSite::RecordDrain, blocked);
+    }
+    chunk = record_thread->AcquireChunk();
 }
 
 void Scheduler::PopPendingOperations() {
@@ -267,6 +302,20 @@ void Scheduler::DrainPendingOperations() {
 }
 
 void Scheduler::BeginSession() {
+    if (threaded_recording) {
+        // The record thread begins the next command buffer itself; only the dynamic state
+        // needs re-emitting into it.
+        ++session_seq;
+        if (span_pool) {
+            chunk_span_slot = span_next;
+            span_next = (span_next + 1) % TimestampSlots;
+            CommandBuffer().resetQueryPool(span_pool, chunk_span_slot * 2, 2);
+            CommandBuffer().writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, span_pool,
+                                            chunk_span_slot * 2);
+        }
+        dynamic_state.Invalidate();
+        return;
+    }
     EndSession();
 
     auto& session = sessions.emplace_back();
@@ -350,7 +399,7 @@ Scheduler::GpuTimestamp Scheduler::WriteGpuTimestamp() {
     timestamp_next = (timestamp_next + 1) % TimestampSlots;
     CommandBuffer().writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, timestamp_pool,
                                     slot);
-    return {slot, sessions.back().seq};
+    return {slot, session_seq};
 }
 
 void Scheduler::AccumulateBusy(u64 session_limit, u64 tick_limit) {
@@ -398,7 +447,12 @@ u64 Scheduler::ReadGpuBusyNs(const GpuTimestamp& timestamp) {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
-    std::scoped_lock lk{submit_mutex};
+    // The record thread takes submit_mutex for its queue submit; holding it here while a
+    // Record() below waits on the full queue would deadlock.
+    std::unique_lock lk{submit_mutex, std::defer_lock};
+    if (!threaded_recording) {
+        lk.lock();
+    }
     // Every stream-lane byte this command buffer reads must be in place
     // before the queue submit.
     VideoCore::StreamCopyLane::Instance().DrainProducer();
@@ -418,6 +472,31 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     if (on_submit) {
         on_submit(info);
+    }
+
+    if (threaded_recording) {
+        EndRendering();
+        if (chunk_span_slot != UINT32_MAX) {
+            CommandBuffer().writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, span_pool,
+                                            chunk_span_slot * 2 + 1);
+            std::scoped_lock busy_lk{busy_mutex};
+            if (busy_spans.size() >= TimestampSlots / 2) {
+                work_semaphore.Refresh();
+                AccumulateBusy(UINT64_MAX, work_semaphore.KnownGpuTick());
+            }
+            busy_spans.push_back({session_seq, signal_value, chunk_span_slot});
+            chunk_span_slot = UINT32_MAX;
+        }
+        info.AddSignal(work_semaphore.Handle(), signal_value);
+        const SubmitRequest request{
+            .info = info,
+            .signal_tick = signal_value,
+        };
+        DispatchChunk(&request);
+        work_semaphore.Refresh();
+        BeginSession();
+        PopPendingOperations();
+        return;
     }
 
     EndSession();
@@ -518,7 +597,271 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     }
 }
 
-void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+namespace {
+
+// The dynamic state setters of one Commit, stored for replay on the record thread. The method
+// names mirror vk::CommandBuffer, so Commit's decision code instantiates against either.
+struct DynamicStateSnapshot {
+    enum Emit : u32 {
+        EmitViewports = 1u << 0,
+        EmitScissors = 1u << 1,
+        EmitDepthTestEnable = 1u << 2,
+        EmitDepthWriteEnable = 1u << 3,
+        EmitDepthCompareOp = 1u << 4,
+        EmitDepthBoundsTestEnable = 1u << 5,
+        EmitDepthBounds = 1u << 6,
+        EmitDepthBiasEnable = 1u << 7,
+        EmitDepthBias = 1u << 8,
+        EmitStencilTestEnable = 1u << 9,
+        EmitStencilOp = 1u << 10,
+        EmitStencilReference = 1u << 11,
+        EmitStencilWriteMask = 1u << 12,
+        EmitStencilCompareMask = 1u << 13,
+        EmitPrimitiveRestartEnable = 1u << 14,
+        EmitRasterizerDiscardEnable = 1u << 15,
+        EmitCullMode = 1u << 16,
+        EmitFrontFace = 1u << 17,
+        EmitBlendConstants = 1u << 18,
+        EmitColorWriteMasks = 1u << 19,
+        EmitLineWidth = 1u << 20,
+        EmitFeedbackLoop = 1u << 21,
+    };
+    struct StencilOpCall {
+        vk::StencilFaceFlags face_mask;
+        StencilOps ops;
+    };
+    struct StencilValueCall {
+        vk::StencilFaceFlags face_mask;
+        u32 value;
+    };
+
+    u32 emit{};
+    u32 num_viewports{};
+    u32 num_scissors{};
+    u32 num_stencil_ops{};
+    u32 num_stencil_references{};
+    u32 num_stencil_write_masks{};
+    u32 num_stencil_compare_masks{};
+    std::array<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports{};
+    std::array<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors{};
+    std::array<StencilOpCall, 2> stencil_ops{};
+    std::array<StencilValueCall, 2> stencil_references{};
+    std::array<StencilValueCall, 2> stencil_write_masks{};
+    std::array<StencilValueCall, 2> stencil_compare_masks{};
+    vk::Bool32 depth_test_enable{};
+    vk::Bool32 depth_write_enable{};
+    vk::CompareOp depth_compare_op{};
+    vk::Bool32 depth_bounds_test_enable{};
+    float min_depth_bounds{};
+    float max_depth_bounds{};
+    vk::Bool32 depth_bias_enable{};
+    float depth_bias_constant_factor{};
+    float depth_bias_clamp{};
+    float depth_bias_slope_factor{};
+    vk::Bool32 stencil_test_enable{};
+    vk::Bool32 primitive_restart_enable{};
+    vk::Bool32 rasterizer_discard_enable{};
+    vk::CullModeFlags cull_mode{};
+    vk::FrontFace front_face{};
+    std::array<float, 4> blend_constants{};
+    u32 first_color_attachment{};
+    ColorWriteMasks color_write_masks{};
+    float line_width{};
+    vk::ImageAspectFlags feedback_loop_aspect{};
+
+    void setViewportWithCount(const Viewports& viewports_) {
+        num_viewports = static_cast<u32>(viewports_.size());
+        std::ranges::copy(viewports_, viewports.begin());
+        emit |= EmitViewports;
+    }
+    void setScissorWithCount(const Scissors& scissors_) {
+        num_scissors = static_cast<u32>(scissors_.size());
+        std::ranges::copy(scissors_, scissors.begin());
+        emit |= EmitScissors;
+    }
+    void setDepthTestEnable(vk::Bool32 enable) {
+        depth_test_enable = enable;
+        emit |= EmitDepthTestEnable;
+    }
+    void setDepthWriteEnable(vk::Bool32 enable) {
+        depth_write_enable = enable;
+        emit |= EmitDepthWriteEnable;
+    }
+    void setDepthCompareOp(vk::CompareOp compare_op) {
+        depth_compare_op = compare_op;
+        emit |= EmitDepthCompareOp;
+    }
+    void setDepthBoundsTestEnable(vk::Bool32 enable) {
+        depth_bounds_test_enable = enable;
+        emit |= EmitDepthBoundsTestEnable;
+    }
+    void setDepthBounds(float min_bounds, float max_bounds) {
+        min_depth_bounds = min_bounds;
+        max_depth_bounds = max_bounds;
+        emit |= EmitDepthBounds;
+    }
+    void setDepthBiasEnable(vk::Bool32 enable) {
+        depth_bias_enable = enable;
+        emit |= EmitDepthBiasEnable;
+    }
+    void setDepthBias(float constant_factor, float clamp, float slope_factor) {
+        depth_bias_constant_factor = constant_factor;
+        depth_bias_clamp = clamp;
+        depth_bias_slope_factor = slope_factor;
+        emit |= EmitDepthBias;
+    }
+    void setStencilTestEnable(vk::Bool32 enable) {
+        stencil_test_enable = enable;
+        emit |= EmitStencilTestEnable;
+    }
+    void setStencilOp(vk::StencilFaceFlags face_mask, vk::StencilOp fail_op, vk::StencilOp pass_op,
+                      vk::StencilOp depth_fail_op, vk::CompareOp compare_op) {
+        stencil_ops[num_stencil_ops++] = {face_mask, {fail_op, pass_op, depth_fail_op, compare_op}};
+        emit |= EmitStencilOp;
+    }
+    void setStencilReference(vk::StencilFaceFlags face_mask, u32 reference) {
+        stencil_references[num_stencil_references++] = {face_mask, reference};
+        emit |= EmitStencilReference;
+    }
+    void setStencilWriteMask(vk::StencilFaceFlags face_mask, u32 write_mask) {
+        stencil_write_masks[num_stencil_write_masks++] = {face_mask, write_mask};
+        emit |= EmitStencilWriteMask;
+    }
+    void setStencilCompareMask(vk::StencilFaceFlags face_mask, u32 compare_mask) {
+        stencil_compare_masks[num_stencil_compare_masks++] = {face_mask, compare_mask};
+        emit |= EmitStencilCompareMask;
+    }
+    void setPrimitiveRestartEnable(vk::Bool32 enable) {
+        primitive_restart_enable = enable;
+        emit |= EmitPrimitiveRestartEnable;
+    }
+    void setRasterizerDiscardEnable(vk::Bool32 enable) {
+        rasterizer_discard_enable = enable;
+        emit |= EmitRasterizerDiscardEnable;
+    }
+    void setCullMode(vk::CullModeFlags cull_mode_) {
+        cull_mode = cull_mode_;
+        emit |= EmitCullMode;
+    }
+    void setFrontFace(vk::FrontFace front_face_) {
+        front_face = front_face_;
+        emit |= EmitFrontFace;
+    }
+    void setBlendConstants(const float* constants) {
+        std::copy_n(constants, blend_constants.size(), blend_constants.begin());
+        emit |= EmitBlendConstants;
+    }
+    void setColorWriteMaskEXT(u32 first_attachment, const ColorWriteMasks& masks) {
+        first_color_attachment = first_attachment;
+        color_write_masks = masks;
+        emit |= EmitColorWriteMasks;
+    }
+    void setLineWidth(float width) {
+        line_width = width;
+        emit |= EmitLineWidth;
+    }
+    void setAttachmentFeedbackLoopEnableEXT(vk::ImageAspectFlags aspect_mask) {
+        feedback_loop_aspect = aspect_mask;
+        emit |= EmitFeedbackLoop;
+    }
+
+    /// Issues the stored setters in Commit's order.
+    void Replay(vk::CommandBuffer cmdbuf) const {
+        if (emit & EmitViewports) {
+            cmdbuf.setViewportWithCount(
+                vk::ArrayProxy<const vk::Viewport>(num_viewports, viewports.data()));
+        }
+        if (emit & EmitScissors) {
+            cmdbuf.setScissorWithCount(
+                vk::ArrayProxy<const vk::Rect2D>(num_scissors, scissors.data()));
+        }
+        if (emit & EmitDepthTestEnable) {
+            cmdbuf.setDepthTestEnable(depth_test_enable);
+        }
+        if (emit & EmitDepthWriteEnable) {
+            cmdbuf.setDepthWriteEnable(depth_write_enable);
+        }
+        if (emit & EmitDepthCompareOp) {
+            cmdbuf.setDepthCompareOp(depth_compare_op);
+        }
+        if (emit & EmitDepthBoundsTestEnable) {
+            cmdbuf.setDepthBoundsTestEnable(depth_bounds_test_enable);
+        }
+        if (emit & EmitDepthBounds) {
+            cmdbuf.setDepthBounds(min_depth_bounds, max_depth_bounds);
+        }
+        if (emit & EmitDepthBiasEnable) {
+            cmdbuf.setDepthBiasEnable(depth_bias_enable);
+        }
+        if (emit & EmitDepthBias) {
+            cmdbuf.setDepthBias(depth_bias_constant_factor, depth_bias_clamp,
+                                depth_bias_slope_factor);
+        }
+        if (emit & EmitStencilTestEnable) {
+            cmdbuf.setStencilTestEnable(stencil_test_enable);
+        }
+        for (u32 i = 0; i < num_stencil_ops; ++i) {
+            const auto& [face_mask, ops] = stencil_ops[i];
+            cmdbuf.setStencilOp(face_mask, ops.fail_op, ops.pass_op, ops.depth_fail_op,
+                                ops.compare_op);
+        }
+        for (u32 i = 0; i < num_stencil_references; ++i) {
+            cmdbuf.setStencilReference(stencil_references[i].face_mask,
+                                       stencil_references[i].value);
+        }
+        for (u32 i = 0; i < num_stencil_write_masks; ++i) {
+            cmdbuf.setStencilWriteMask(stencil_write_masks[i].face_mask,
+                                       stencil_write_masks[i].value);
+        }
+        for (u32 i = 0; i < num_stencil_compare_masks; ++i) {
+            cmdbuf.setStencilCompareMask(stencil_compare_masks[i].face_mask,
+                                         stencil_compare_masks[i].value);
+        }
+        if (emit & EmitPrimitiveRestartEnable) {
+            cmdbuf.setPrimitiveRestartEnable(primitive_restart_enable);
+        }
+        if (emit & EmitRasterizerDiscardEnable) {
+            cmdbuf.setRasterizerDiscardEnable(rasterizer_discard_enable);
+        }
+        if (emit & EmitCullMode) {
+            cmdbuf.setCullMode(cull_mode);
+        }
+        if (emit & EmitFrontFace) {
+            cmdbuf.setFrontFace(front_face);
+        }
+        if (emit & EmitBlendConstants) {
+            cmdbuf.setBlendConstants(blend_constants.data());
+        }
+        if (emit & EmitColorWriteMasks) {
+            cmdbuf.setColorWriteMaskEXT(first_color_attachment, color_write_masks);
+        }
+        if (emit & EmitLineWidth) {
+            cmdbuf.setLineWidth(line_width);
+        }
+        if (emit & EmitFeedbackLoop) {
+            cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_aspect);
+        }
+    }
+};
+static_assert(std::is_trivially_copyable_v<DynamicStateSnapshot>);
+
+} // namespace
+
+void DynamicState::Commit(const Instance& instance, Scheduler& scheduler) {
+    if (!scheduler.HasRecordingThread()) {
+        const vk::CommandBuffer cmdbuf = scheduler.RawCommandBuffer();
+        CommitTo(instance, cmdbuf);
+        return;
+    }
+    DynamicStateSnapshot snapshot{};
+    CommitTo(instance, snapshot);
+    if (snapshot.emit) {
+        scheduler.Record([snapshot](vk::CommandBuffer cmdbuf) { snapshot.Replay(cmdbuf); });
+    }
+}
+
+template <typename CmdBuf>
+void DynamicState::CommitTo(const Instance& instance, CmdBuf& cmdbuf) {
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

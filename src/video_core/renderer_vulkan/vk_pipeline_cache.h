@@ -4,10 +4,15 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <future>
 #include <memory>
-#include <optional>
+#include <mutex>
+#include <thread>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "common/assert.h"
@@ -44,6 +49,7 @@ class Instance;
 class Rasterizer;
 class Scheduler;
 class ShaderCache;
+struct ShaderCompileResult;
 
 // Dwords of the flat user-data window the gather-input memo records per stage. A program whose
 // window is wider never arms the memo and is counted as GIMEMO big=.
@@ -59,6 +65,8 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    // The permutation whose SPIR-V a shader compile worker emits, added to the modules once done.
+    std::shared_ptr<ShaderCompileResult> pending_compilation{};
     // Index of the permutation matched by the previous lookup; probed first when
     // the MRU probe setting is enabled. Always bounds-checked before use.
     u32 last_hit_perm{};
@@ -223,8 +231,8 @@ public:
         return profile;
     }
 
-    /// Runs before the GPU thread compiles or waits for a new pipeline; the rasterizer
-    /// drops its guest-copy hold there so a compile never holds the memory map open.
+    /// Runs before every inline pipeline compile; the rasterizer drops its
+    /// guest-copy hold there so a compile never holds the memory map open.
     void SetPreCompileHook(void (*hook)(void*), void* user) {
         pre_compile_hook_ = hook;
         pre_compile_user_ = user;
@@ -234,6 +242,7 @@ public:
     void DumpKeyReuseStats();
     void DumpProgramIdentityStats();
     void DumpColorMaskStats(u64 emit_skips);
+    void DumpAsyncSkipStats();
     void DumpRuntimeInfoMemoStats();
     void DumpLayoutStats();
     /// Pipelines whose set 0 takes the descriptor heap leg, against the pipeline count.
@@ -248,33 +257,6 @@ private:
     bool ReuseGraphicsKey(u64 pipe_gen);
     bool RefreshComputeKey();
 
-    /// A graphics pipeline compiling on a worker thread. The worker reads the copies held here,
-    /// never the members the following lookups overwrite.
-    struct PendingGraphicsPipeline {
-        std::future<std::unique_ptr<GraphicsPipeline>> future;
-        std::chrono::steady_clock::time_point start;
-        u64 hash{};
-        GraphicsPipeline::SerializationSupport sdata{};
-        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
-        std::array<const Shader::Info*, MaxShaderStages> copied_infos{};
-        std::array<std::optional<Shader::Info>, MaxShaderStages> info_copies{};
-        /// The user data the copies read their sharps from.
-        std::array<std::array<u32, Shader::NUM_USER_DATA_REGS>, MaxShaderStages> user_data{};
-        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
-        std::array<vk::ShaderModule, MaxShaderStages> modules{};
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
-        VertexInputs<AmdGpu::Buffer> vertex_sharps{};
-        bool photo_waited{}; ///< A photo draw has waited for the compile once
-        bool slow_logged{};
-        bool abandoned{};
-    };
-    std::unique_ptr<PendingGraphicsPipeline> StartGraphicsPipeline(
-        u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
-    bool IsCompileDone(PendingGraphicsPipeline& pending, std::chrono::milliseconds wait);
-    void InstallGraphicsPipeline(PendingGraphicsPipeline& pending);
-    std::chrono::milliseconds SyncBudget(bool photo) const;
-    bool DrawsPhoto() const;
-
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::HwStage stage, size_t perm_idx,
@@ -282,6 +264,21 @@ private:
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
+    bool CompileProgramOnWorker(Program& program, Shader::HwStage stage, Shader::SwStage l_stage,
+                                const Shader::ShaderParams& params,
+                                Shader::Backend::Bindings& binding,
+                                Shader::StageSpecialization* spec, size_t perm_idx, u64 perm_hash);
+    void EmitProgram(ShaderCompileResult& result);
+    bool PublishPendingCompilation(Program& program);
+    template <typename T>
+    bool WaitForQueuedCompile(const std::future<T>& compile);
+    SHAD_NO_INLINE const GraphicsPipeline* CreateGraphicsPipeline();
+    std::future<std::unique_ptr<GraphicsPipeline>> QueueGraphicsPipeline(
+        u64 hash, const Shader::Gcn::FetchShaderData* fetch_shader);
+    const GraphicsPipeline* InstallGraphicsPipeline(std::unique_ptr<GraphicsPipeline> pipeline);
+    bool DrawsPhoto() const;
+    void CompileWorker(u32 index);
+    void QueueCompileTask(std::function<void()>&& task, bool front);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
@@ -307,9 +304,14 @@ private:
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
-    // Compiles past the sync budget. Their keys enter graphics_pipelines once installed.
-    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>>
+    // Graphics pipelines a shader compile worker compiles.
+    tsl::robin_map<GraphicsPipelineKey, std::future<std::unique_ptr<GraphicsPipeline>>>
         pending_graphics_pipelines;
+    // Pipelines ReplaceShader erased, each released by a deferred operation once the GPU passed
+    // the draws binding it; owned here so they die before desc_heap. ReplaceShader pushes from
+    // the devtools thread while the operations pop on the GPU command thread.
+    std::deque<std::unique_ptr<Pipeline>> retired_pipelines;
+    std::mutex retired_pipelines_mutex;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
@@ -333,7 +335,18 @@ private:
     bool key_reuse_hash_diff{};
     u64 key_reuse_diff_decisions{};
     u64 nonfull_mask_pipelines{};
+    u64 async_skips{};
+    std::atomic<u64> heap_pipelines{};
+    std::atomic<u64> array_pipelines{};
+    std::atomic<u64> total_pipelines{};
+    void CountPipeline(const Pipeline& pipeline, s64 delta) {
+        heap_pipelines += static_cast<u64>(!pipeline.UsesPushDescriptors() ? delta : 0);
+        array_pipelines += static_cast<u64>(pipeline.HasDescriptorArrays() ? delta : 0);
+        total_pipelines += static_cast<u64>(delta);
+    }
     u64 graphics_lookups{};
+    // Cleared by every graphics lookup; the first compile wait of the draw sets compile_deadline.
+    bool compile_deadline_armed{};
     bool key_stamp_reuse{};
     bool key_reuse_validate{}; // ValidateOnly mode: every reuse is rebuilt and compared
     u64 key_reuse_hits{};
@@ -444,6 +457,7 @@ private:
                    ((reinterpret_cast<uintptr_t>(code) >> 8) * 0x9E3779B97F4A7C15ull) >> 40) &
                identity_table_mask;
     }
+    u64 PublishNotReady(u32 out_slot, Shader::SwStage l_stage);
     u64 pgmid_map_hits{};
     u64 pgmid_map_probes{};
     u64 params_hits{};
@@ -532,6 +546,25 @@ private:
     // (sig, sig2) permutation resolve in GetProgram; off means byte-identical legacy behavior.
     bool spec_fp_cache{};
     u32 num_unchained_pipelines{};
+
+    // Shader compile workers. They emit the SPIR-V of the programs the GPU thread translates,
+    // ahead of the graphics pipelines they compile.
+    bool async_shader_recompiling{};
+    // The draw that queues a compile waits for it within this budget, spread over every compile
+    // the draw queues.
+    std::chrono::milliseconds sync_budget{};
+    std::chrono::steady_clock::time_point compile_deadline{};
+    static constexpr u32 NumCompileWorkers = 6;
+    std::array<std::thread, NumCompileWorkers> compile_workers;
+    std::deque<std::function<void()>> compile_tasks;
+    std::mutex compile_mutex;
+    std::condition_variable compile_cv;
+    std::condition_variable compile_idle_cv;
+    u32 compile_tasks_in_flight{};
+    bool compile_workers_stopping{};
+    // Translated IR stays in its pools until a worker emits it.
+    std::mutex free_pools_mutex;
+    std::vector<std::unique_ptr<Shader::Pools>> free_pools;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

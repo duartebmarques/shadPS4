@@ -1,0 +1,53 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+// Copies the Gravity Rush 2 motion vectors and gives the stencil 0x20 pixels, which the game
+// leaves at zero, the camera reprojection of its Velocity pass (CS 0xaafa61e8). The encoding is
+// the game's: NDC, previous minus current, +y up.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D game_mv;
+layout(set = 0, binding = 1) uniform texture2D depth_tex;
+layout(set = 0, binding = 2) uniform utexture2D stencil_tex;
+layout(set = 0, binding = 3, rg16f) uniform writeonly image2D mv_out;
+
+// m0-m3 are the rows of the Velocity matrix, which maps current view space to previous clip
+// space; inverse_view is u_f4InverseView.
+layout(push_constant) uniform CameraMotionConstants {
+    vec4 m0;
+    vec4 m1;
+    vec4 m2;
+    vec4 m3;
+    vec4 inverse_view;
+    uvec2 size;
+    vec2 inv_size;
+} pc;
+
+const uint STENCIL_CHARACTER = 0x20u;
+
+void main() {
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, pc.size))) {
+        return;
+    }
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    vec2 mv = texelFetch(game_mv, p, 0).rg;
+    if ((texelFetch(stencil_tex, p, 0).r & STENCIL_CHARACTER) != 0u) {
+        const float depth = texelFetch(depth_tex, p, 0).r;
+        const vec2 pixel = vec2(p) * 2.0 + 1.0;
+        const vec2 ndc = vec2(pixel.x * pc.inv_size.x - 1.0, 1.0 - pixel.y * pc.inv_size.y);
+        const float view_depth =
+            1.0 / (pc.inverse_view.z * (2.0 * depth - 1.0) + pc.inverse_view.w);
+        const vec4 view_pos = vec4(pc.inverse_view.x * view_depth * ndc.x,
+                                   pc.inverse_view.y * view_depth * ndc.y, -view_depth, 1.0);
+        const float prev_x = dot(view_pos, vec4(pc.m0.x, pc.m1.x, pc.m2.x, pc.m3.x));
+        const float prev_y = dot(view_pos, vec4(pc.m0.y, pc.m1.y, pc.m2.y, pc.m3.y));
+        const float prev_w = dot(view_pos, vec4(pc.m0.w, pc.m1.w, pc.m2.w, pc.m3.w));
+        mv = vec2(prev_x, prev_y) / prev_w - ndc;
+    }
+    imageStore(mv_out, p, vec4(mv, 0.0, 0.0));
+}
