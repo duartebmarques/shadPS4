@@ -10,6 +10,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "core/libraries/kernel/threads.h"
+#include "core/libraries/kernel/threads/pthread.h"
 #include "save_backup.h"
 #include "save_instance.h"
 #include "savedata_error.h"
@@ -89,6 +90,7 @@ static std::deque<BackupRequest> g_result_queue;
 static std::atomic_int g_backup_progress = 0;
 static std::atomic g_backup_status = WorkerStatus::NotStarted;
 static std::atomic_bool g_backup_stopping = false;
+static std::atomic_bool g_backup_copying = false;
 
 static void backup(const std::filesystem::path& dir_name) {
     std::unique_lock lk{g_backup_running_mutex};
@@ -161,6 +163,7 @@ static void BackupThreadBody() {
             break;
         }
         g_backup_status = WorkerStatus::Running;
+        g_backup_copying = true;
 
         LOG_INFO(Lib_SaveData, "Backing up the following directory: {}",
                  fmt::UTF(req.save_path.u8string()));
@@ -187,6 +190,7 @@ static void BackupThreadBody() {
                 }
             }
         }
+        g_backup_copying = false;
         if (req.origin != OrbisSaveDataEventType::__DO_NOT_SAVE) {
             DispatchBackupEvent(req);
         }
@@ -220,6 +224,14 @@ void StopThread() {
         g_backup_queue.emplace_back(BackupRequest{});
     }
     g_backup_thread_semaphore.release();
+    if (!Kernel::g_curthread) {
+        // Emulator shutdown runs on a host thread, which cannot join a guest thread: let a
+        // running backup finish and leave the thread to the process exit.
+        while (g_backup_copying) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return;
+    }
     g_backup_thread.Join();
     std::scoped_lock lk{g_backup_queue_mutex};
     g_backup_queue.clear();
