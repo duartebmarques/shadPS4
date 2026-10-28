@@ -21,6 +21,7 @@ on:
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' || github.repository != 'shadps4-emu/shadPS4' || github.event_name != 'push' }}
+  queue: ${{ (github.ref != 'refs/heads/main' || github.repository != 'shadps4-emu/shadPS4' || github.event_name != 'push') && 'single' || 'max' }}
 
 env:
   BUILD_TYPE: Release
@@ -439,10 +440,26 @@ jobs:
         echo "PGO_PROFILE=$p" >> $GITHUB_ENV
 
     - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-use=${{ env.PGO_PROFILE }} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_CXX_FLAGS="-fprofile-instr-use=${{ env.PGO_PROFILE }} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_FLAGS="-fprofile-instr-use=${{ env.PGO_PROFILE }} -Wno-profile-instr-unprofiled -Wprofile-instr-missing" -DCMAKE_CXX_FLAGS="-fprofile-instr-use=${{ env.PGO_PROFILE }} -Wno-profile-instr-unprofiled -Wprofile-instr-missing" -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=mold" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
     - name: Build
-      run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc)
+      run: |
+        set -o pipefail
+        cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(nproc) 2>&1 | tee $RUNNER_TEMP/build.log
+
+    # Proof that the profile is used: discarded functions are reported, never hidden.
+    - name: PGO proof
+      run: |
+        python3 - $RUNNER_TEMP/build.log <<'EOF' | tee -a $GITHUB_STEP_SUMMARY
+        import re, sys
+        log = open(sys.argv[1], errors="replace").read()
+        r = re.findall(r"of (\d+) functions?, (\d+) ha(?:s|ve) (mismatched|no) data", log)
+        stale = sum(int(b) for a, b, k in r if k == "mismatched")
+        miss = sum(int(b) for a, b, k in r if k == "no")
+        uses = sum(int(a) for a, b, k in r)
+        ir = log.count("hash mismatch")
+        print(f"PGO proof: {stale} stale + {miss} missing of {uses} function uses (TU sum), {ir} IR mismatches")
+        EOF
 
     - name: Package and Upload Linux(ubuntu64) SDL artifact
       run: |

@@ -251,6 +251,7 @@ struct NetworkSettings {
     Setting<int> p2p_port{3658}; // 0 is any free port, 3658 is the default PS4 port. With UPnP
                                  // enabled it is forwarded on the router.
     Setting<bool> disable_https{false};
+    Setting<bool> enable_device_discovery{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -262,13 +263,15 @@ struct NetworkSettings {
                                            &NetworkSettings::shadnet_webapi_server),
             make_override<NetworkSettings>("enable_upnp", &NetworkSettings::enable_upnp),
             make_override<NetworkSettings>("p2p_port", &NetworkSettings::p2p_port),
-            make_override<NetworkSettings>("disable_https", &NetworkSettings::disable_https)};
+            make_override<NetworkSettings>("disable_https", &NetworkSettings::disable_https),
+            make_override<NetworkSettings>("enable_device_discovery",
+                                           &NetworkSettings::enable_device_discovery)};
     }
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(NetworkSettings, connected_to_network, shad_net_enabled,
                                    shadnet_server, shadnet_webapi_server, enable_upnp, p2p_port,
-                                   disable_https)
+                                   disable_https, enable_device_discovery)
 
 // -------------------------------
 // Log settings
@@ -466,6 +469,17 @@ struct GPUSettings {
     // which costs it a quarter to a third of its speed. Hosts with fewer than 6 logical CPUs or
     // 4 physical cores are left alone.
     Setting<bool> one_core_gpu_thread_pin{false};
+    // Record the draw scheduler's Vulkan commands and issue its queue submits on a dedicated
+    // thread; the GPU command thread stores each call as a closure instead of calling the driver.
+    Setting<bool> vk_record_thread{true};
+    // Compile new graphics shaders and pipelines on worker threads. A draw that needs one waits
+    // for it up to pipeline_sync_budget_ms and is skipped past that until it is done; the draws of
+    // a Gravity Rush 2 photo wait for it.
+    Setting<bool> async_shader_recompiling{true};
+    // Milliseconds a draw waits in total for the new shaders and graphics pipeline it needs while
+    // async_shader_recompiling is on: a lower value means shorter hitches and more pop-in, and 0
+    // skips the draw at once. Clamped to 50000.
+    Setting<int> pipeline_sync_budget_ms{50};
     // Rebuild the vertex input layout only when the pipeline, the instance step rates or an
     // attribute's format or stride changed, instead of on every draw.
     Setting<bool> vertex_layout_memo{true};
@@ -487,10 +501,6 @@ struct GPUSettings {
     // a queue of its own copies them; a GPU write marked in the window meanwhile keeps its pages
     // GPU modified.
     Setting<bool> readback_offload{false};
-    // Milliseconds the GPU command thread waits for a new graphics pipeline, which compiles on a
-    // worker thread. Past the wait the draws that need it are skipped until the compile is done:
-    // a lower value means shorter hitches and more pop-in. Clamped to 50000.
-    Setting<int> pipeline_sync_budget_ms{50};
     // Guest memory in place (ported from bbport, deadinside28/bloodborne_pc). Read once at boot.
     // 0: off. 1: honest fences only - EOP/EOS/RELEASE_MEM labels, their interrupts and the GPU
     // idle interrupt are signalled after the GPU really finished the work recorded before them,
@@ -798,13 +808,15 @@ struct GPUSettings {
             GPU_OVERRIDE(gather_input_memo),
             GPU_OVERRIDE(tracker_lock_spin_rounds),
             GPU_OVERRIDE(one_core_gpu_thread_pin),
+            GPU_OVERRIDE(vk_record_thread),
+            GPU_OVERRIDE(async_shader_recompiling),
+            GPU_OVERRIDE(pipeline_sync_budget_ms),
             GPU_OVERRIDE(vertex_layout_memo),
             GPU_OVERRIDE(covered_range_skip),
             GPU_OVERRIDE(residency_bitmap),
             GPU_OVERRIDE(stream_barrier_skip),
             GPU_OVERRIDE(clean_sync_peek),
             GPU_OVERRIDE(readback_offload),
-            GPU_OVERRIDE(pipeline_sync_budget_ms),
             GPU_OVERRIDE(inplace_guest_memory),
             GPU_OVERRIDE(guest_sync_barriers),
             GPU_OVERRIDE(barrier_tracker),
@@ -907,10 +919,11 @@ struct GPUSettings {
     runtime_info_stamp_gate, userfaultfd, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
     readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
-    clean_sync_peek, readback_offload, fast_shader_math, pipeline_sync_budget_ms, \
+    clean_sync_peek, readback_offload, fast_shader_math, \
     one_core_gpu_thread_pin, inplace_guest_memory, guest_sync_barriers, inplace_image_downloads, \
     draw_pipe, async_submit, tick_query_interval_us, guest_gpu_time_percent, barrier_tracker, \
-    present_pacing, frame_cap
+    present_pacing, frame_cap, vk_record_thread, async_shader_recompiling, \
+    pipeline_sync_budget_ms
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1208,6 +1221,7 @@ public:
     SETTING_FORWARD_BOOL(m_network, UPnPEnabled, enable_upnp)
     SETTING_FORWARD(m_network, P2PPort, p2p_port)
     SETTING_FORWARD_BOOL(m_network, ForcedHttpsDisabled, disable_https)
+    SETTING_FORWARD_BOOL(m_network, DeviceDiscoveryEnabled, enable_device_discovery)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)
@@ -1245,13 +1259,15 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, GatherInputMemo, gather_input_memo)
     SETTING_FORWARD(m_gpu, TrackerLockSpinRounds, tracker_lock_spin_rounds)
     SETTING_FORWARD_BOOL(m_gpu, OneCoreGpuThreadPin, one_core_gpu_thread_pin)
+    SETTING_FORWARD_BOOL(m_gpu, VkRecordThread, vk_record_thread)
+    SETTING_FORWARD_BOOL(m_gpu, AsyncShaderRecompiling, async_shader_recompiling)
+    SETTING_FORWARD(m_gpu, PipelineSyncBudgetMs, pipeline_sync_budget_ms)
     SETTING_FORWARD_BOOL(m_gpu, VertexLayoutMemo, vertex_layout_memo)
     SETTING_FORWARD_BOOL(m_gpu, CoveredRangeSkip, covered_range_skip)
     SETTING_FORWARD_BOOL(m_gpu, ResidencyBitmap, residency_bitmap)
     SETTING_FORWARD_BOOL(m_gpu, StreamBarrierSkip, stream_barrier_skip)
     SETTING_FORWARD_BOOL(m_gpu, CleanSyncPeek, clean_sync_peek)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackOffload, readback_offload)
-    SETTING_FORWARD(m_gpu, PipelineSyncBudgetMs, pipeline_sync_budget_ms)
     SETTING_FORWARD(m_gpu, InplaceGuestMemory, inplace_guest_memory)
     SETTING_FORWARD_BOOL(m_gpu, GuestSyncBarriers, guest_sync_barriers)
     SETTING_FORWARD(m_gpu, BarrierTracker, barrier_tracker)

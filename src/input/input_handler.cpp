@@ -27,6 +27,7 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
+#include "core/prompt_packs/prompt_packs.h"
 #include "imgui/big_picture/settings_dialog_layer.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
@@ -122,8 +123,8 @@ axis_right_x = axis_right_x
 axis_right_y = axis_right_y
 
 # Range of deadzones: 1 (almost none) to 127 (max)
-analog_deadzone = leftjoystick, 5, 127
-analog_deadzone = rightjoystick, 5, 127
+analog_deadzone = leftjoystick, 20, 127
+analog_deadzone = rightjoystick, 15, 127
 
 override_controller_color = false, 0, 0, 255
 
@@ -797,6 +798,11 @@ void ParseInputConfig(const std::string game_id = "") {
         ProcessLine();
     }
     config_stream.close();
+    lineCount = 0;
+    std::ifstream prompt_pack_stream(PromptPacks::InputOverrideFile());
+    while (std::getline(prompt_pack_stream, line)) {
+        ProcessLine();
+    }
 
     // Sanity-check the hold-combo swipe layer now that both files have been parsed.
     for (int dir = 0; dir < 4; dir++) {

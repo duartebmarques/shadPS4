@@ -15,6 +15,7 @@
 #include "imgui/imgui_std.h"
 #include "imgui_internal.h"
 #include "options.h"
+#include "video_core/gr2_fsr3/gr2_fsr3.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "widget/frame_dump.h"
 #include "widget/frame_graph.h"
@@ -124,8 +125,10 @@ void L::DrawMenuBar() {
 
                 ImGui::EndMenu();
             }
+            Gr2Fsr3::DrawMenu();
             ImGui::EndMenu();
         }
+        Gr2Fsr3::DrawDlssMenu();
         if (BeginMenu("Debug")) {
             MenuItem("Memory map", nullptr, &memory_map.open);
             MenuItem("Module list", nullptr, &module_list.open);
@@ -299,7 +302,7 @@ static void LoadSettings(const char* line) {
         return;
     }
     if (sscanf(line, "show_advanced_debug=%d", &i) == 1) {
-        DebugState.IsShowingDebugMenuBar() = i != 0;
+        // The debug menu bar starts hidden at every boot.
         return;
     }
     if (sscanf(line, "show_frame_graph=%d", &i) == 1) {

@@ -25,6 +25,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/buffer_cache/stream_copy_lane.h"
+#include "video_core/gr2_fsr3/gr2_fsr3.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -125,7 +126,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             "bind_image_lean needs bind_noop_memo; image bindings run the full constructor");
     }
     if (EmulatorSettings.IsAsyncSubmit()) {
-        scheduler.EnableAsyncSubmit();
+        if (scheduler.HasRecordingThread()) {
+            LOG_INFO(Render_Vulkan, "async_submit is off: the record thread submits");
+        } else {
+            scheduler.EnableAsyncSubmit();
+        }
     }
     if (EmulatorSettings.IsDrawPipe()) {
         if (host_markers_enabled || guest_markers_enabled) {
@@ -656,8 +661,28 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+void Rasterizer::EmitPipelineCacheTelemetry(u64 mask_skips) {
+    pipeline_cache.DumpColorMaskStats(mask_skips);
+    pipeline_cache.DumpKeyReuseStats();
+    pipeline_cache.DumpProgramIdentityStats();
+    pipeline_cache.DumpSpecFpStats();
+    pipeline_cache.DumpSharpReadStats();
+    pipeline_cache.DumpRuntimeInfoMemoStats();
+    pipeline_cache.DumpLayoutStats();
+    pipeline_cache.DumpHeapPipelineStats();
+    pipeline_cache.DumpAsyncSkipStats();
+}
+
+void Rasterizer::PollPipelineCacheTelemetry() {
+    if (pipeline_telemetry_due.load(std::memory_order_relaxed) &&
+        pipeline_telemetry_due.exchange(false, std::memory_order_acquire)) {
+        EmitPipelineCacheTelemetry(pending_mask_skips.exchange(0, std::memory_order_relaxed));
+    }
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (draw_pipe) {
+        PollPipelineCacheTelemetry();
         const PipeDraw args{is_indexed, index_offset};
         const Pipeline* pipeline = nullptr;
         if (pipe_select && ClassifyDraw(liverpool->regs).kind == DrawFilter::Kind::Draw) {
@@ -686,6 +711,9 @@ void Rasterizer::RecordDraw(bool is_indexed, u32 index_offset) {
     const GraphicsPipeline* pipeline =
         SelectedOr([this] { return pipeline_cache.GetGraphicsPipeline(); });
     if (!pipeline) {
+        return;
+    }
+    if (Gr2Fsr3::OnDraw(*pipeline, *liverpool, *this, false)) {
         return;
     }
 
@@ -760,7 +788,8 @@ void Rasterizer::RecordDraw(bool is_indexed, u32 index_offset) {
                             bind_image_n_);
     // Dyn term, after the scope replay wrote attachment_feedback_loop.
     if (glue) {
-        const u32 flags = 1u | (u32(attachment_feedback_loop) << 1) | (u32(is_indexed) << 2);
+        const u32 flags = 1u | (u32(attachment_feedback_loop) << 1) | (u32(is_indexed) << 2) |
+                          Gr2Fsr3::DynFlagBits();
         const bool dyn_ok_term =
             dyn_memo_.flags == flags &&
             scheduler.GetDynamicState().invalidate_gen == dyn_memo_.dyn_gen &&
@@ -958,6 +987,9 @@ void Rasterizer::RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offs
     if (!pipeline) {
         return;
     }
+    if (Gr2Fsr3::OnDraw(*pipeline, *liverpool, *this, true)) {
+        return;
+    }
 
     // One shared-lock hold for the whole setup; placement rationale: see Draw.
     std::optional<Core::MemoryManager::GuestCopyScope> copy_scope;
@@ -1034,6 +1066,7 @@ void Rasterizer::RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offs
 
 void Rasterizer::DispatchDirect() {
     if (draw_pipe) {
+        PollPipelineCacheTelemetry();
         const PipeDispatch args{.cs = liverpool->GetCsRegs()};
         const Pipeline* pipeline = pipe_select ? pipeline_cache.GetComputePipeline() : nullptr;
         if (pipe_select && !pipeline) {
@@ -1275,8 +1308,9 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
     }
     auto& ws = scheduler.WaitStats();
     LOG_INFO(Render_Skipcache,
-             "[SkipCache] WAITS finish={}/{}ms fault={}/{}ms dlimg={}/{}ms per300f", ws[0].count,
-             ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count, ms(ws[2].ns));
+             "[SkipCache] WAITS finish={}/{}ms fault={}/{}ms dlimg={}/{}ms rdrain={}/{}ms per300f",
+             ws[0].count, ms(ws[0].ns), ws[1].count, ms(ws[1].ns), ws[2].count, ms(ws[2].ns),
+             ws[3].count, ms(ws[3].ns));
     ws = {};
     if (const auto os = buffer_cache.DrainOffloadStats();
         os.faults || os.direct || os.lane_copies) {
@@ -1320,14 +1354,14 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
                  "per300f",
                  bw.calls, bw.hits, bw.hit_bytes >> 10, bw.miss_bytes >> 10, bw.multi);
     }
-    pipeline_cache.DumpColorMaskStats(scheduler.GetDynamicState().DrainColorWriteMaskSkips());
-    pipeline_cache.DumpKeyReuseStats();
-    pipeline_cache.DumpProgramIdentityStats();
-    pipeline_cache.DumpSpecFpStats();
-    pipeline_cache.DumpSharpReadStats();
-    pipeline_cache.DumpRuntimeInfoMemoStats();
-    pipeline_cache.DumpLayoutStats();
-    pipeline_cache.DumpHeapPipelineStats();
+    const u64 mask_skips = scheduler.GetDynamicState().DrainColorWriteMaskSkips();
+    if (pipe_select) {
+        // The command thread owns the pipeline cache then: it emits these at its next draw.
+        pending_mask_skips.fetch_add(mask_skips, std::memory_order_relaxed);
+        pipeline_telemetry_due.store(true, std::memory_order_release);
+    } else {
+        EmitPipelineCacheTelemetry(mask_skips);
+    }
     pipeline_cache.DumpDescHeapStats();
     if (const auto vm = texture_cache.DrainViewMemoStats(); vm.hits || vm.slow) {
         LOG_INFO(Render_Skipcache, "[SkipCache] VIEWMEMO hits={} slow={} writebacks={} per300f",
@@ -2634,6 +2668,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         Regs().ta_bc_base.Address());
             ssharp = AmdGpu::Sampler{};
         }
+        Gr2Fsr3::AdjustSampler(ssharp, stage);
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, Regs().ta_bc_base, sampler.is_depth);
         AppendImageInfo(image_infos, vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
@@ -3453,7 +3488,8 @@ bool Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         skipcache != nullptr && skipcache->Active() && skipcache->ShouldProbe(CacheId::DynState);
     // is_indexed stays keyed: the primitive-restart ASSERT_MSG is live in
     // release builds, so an indexed transition must re-evaluate it.
-    const u32 flags = 1u | (u32(attachment_feedback_loop) << 1) | (u32(is_indexed) << 2);
+    const u32 flags =
+        1u | (u32(attachment_feedback_loop) << 1) | (u32(is_indexed) << 2) | Gr2Fsr3::DynFlagBits();
     u64 dyn_stamp{}, dyn_gen{}, dyn_pipe_gen{};
     bool dyn_would_hit = false, verifying = false;
     if (probing) {
@@ -3498,7 +3534,7 @@ bool Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
             skipcache->RecordVerifyClean(CacheId::DynState);
         }
     }
-    dynamic_state.Commit(instance, scheduler.CommandBuffer());
+    dynamic_state.Commit(instance, scheduler);
 
     if (probing && !dyn_would_hit) {
         auto& ctr = skipcache->Counters(CacheId::DynState);
@@ -3603,6 +3639,7 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.y = yoffset - yscale;
             viewport.width = xscale * 2.0f;
             viewport.height = yscale * 2.0f;
+            Gr2Fsr3::JitterViewport(viewport.x, viewport.y);
         }
 
         viewports.push_back(viewport);

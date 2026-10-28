@@ -467,7 +467,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
-      draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
+      draw_scheduler{instance, EmulatorSettings.IsVkRecordThread()},
+      present_scheduler{instance, false}, flip_scheduler{instance, false},
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
@@ -513,9 +514,9 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
-    Check(draw_scheduler.CommandBuffer().reset());
-    Check(present_scheduler.CommandBuffer().reset());
-    Check(flip_scheduler.CommandBuffer().reset());
+    draw_scheduler.ResetCommandBuffer();
+    Check(present_scheduler.RawCommandBuffer().reset());
+    Check(flip_scheduler.RawCommandBuffer().reset());
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -885,7 +886,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     const vk::ImageView swapchain_image_view = swapchain.ImageView();
 
     auto& scheduler = present_scheduler;
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = scheduler.RawCommandBuffer();
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 
@@ -1070,6 +1071,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         scheduler.DeferPriorityOperation([deferred_screenshot = std::move(pending_screenshot)]() {
             SavePendingScreenshot(deferred_screenshot.value());
         });
+    }
+
+    // The submit below waits on the frame's draw tick; an ImGui texture upload inside it idles
+    // the queue under submit_mutex, the lock the record thread needs to submit that tick.
+    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+        draw_scheduler.WaitSubmitted(frame->ready_tick);
     }
 
     SubmitInfo info{};

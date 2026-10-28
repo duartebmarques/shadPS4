@@ -1,0 +1,49 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+// Camera motion vectors for Gravity Rush Remastered, which renders none: each render pixel is
+// reprojected from the scene depth into the previous frame, and a depth of 1 (the sky) follows the
+// camera rotation only. The depth is copied for FSR. Motion vectors are in render pixels, previous
+// minus current, without the jitter of this frame.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform texture2D depth_tex;
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D mv_out;
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D depth_out;
+
+// Columns x, y and w of the matrix that takes (x, y, depth, 1) of an unjittered render pixel of
+// this frame to the previous frame's render pixel times w. The sky columns leave out the camera
+// translation.
+layout(push_constant) uniform GrrCameraMotionConstants {
+    vec4 scene_x;
+    vec4 scene_y;
+    vec4 scene_w;
+    vec4 sky_x;
+    vec4 sky_y;
+    vec4 sky_w;
+    vec2 jitter;
+    uvec2 size;
+} pc;
+
+void main() {
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, pc.size))) {
+        return;
+    }
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const float depth = texelFetch(depth_tex, p, 0).r;
+    const vec4 position = vec4(vec2(p) + 0.5 - pc.jitter, depth, 1.0);
+    const bool sky = depth >= 1.0;
+    const float w = dot(position, sky ? pc.sky_w : pc.scene_w);
+    vec2 motion = vec2(0.0);
+    if (w > 1e-6) {
+        const vec2 previous = vec2(dot(position, sky ? pc.sky_x : pc.scene_x),
+                                   dot(position, sky ? pc.sky_y : pc.scene_y)) / w;
+        motion = previous - position.xy;
+    }
+    imageStore(mv_out, p, vec4(motion, 0.0, 0.0));
+    imageStore(depth_out, p, vec4(depth));
+}

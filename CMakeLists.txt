@@ -653,10 +653,14 @@ set(FIBER_LIB src/core/libraries/fiber/fiber_context.cpp
 
 set(VDEC_LIB src/core/libraries/videodec/video_utils.cpp
              src/core/libraries/videodec/video_utils.h
+             src/core/libraries/videodec/vdeccore.cpp
+             src/core/libraries/videodec/vdeccore.h
              src/core/libraries/videodec/vdecsw.cpp
              src/core/libraries/videodec/vdecsw.h
              src/core/libraries/videodec/vdecsw_impl.cpp
              src/core/libraries/videodec/vdecsw_impl.h
+             src/core/libraries/videodec/videocore_server.cpp
+             src/core/libraries/videodec/videocore_server.h
              src/core/libraries/videodec/videodec2_impl.cpp
              src/core/libraries/videodec/videodec2_impl.h
              src/core/libraries/videodec/videodec2.cpp
@@ -923,6 +927,8 @@ set(NET_CORE  src/core/net/guest_net.cpp
 
 set(NET_LIB   src/core/libraries/net/net.cpp
               src/core/libraries/net/net.h
+              src/core/libraries/net/net_discovery.cpp
+              src/core/libraries/net/net_discovery.h
               src/core/libraries/net/net_error.h
               src/core/libraries/net/net_kernel.cpp
               src/core/libraries/net/net_kernel.h
@@ -1221,6 +1227,9 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/liverpool_to_vk.h
                src/video_core/renderer_vulkan/vk_barrier_tracker.cpp
                src/video_core/renderer_vulkan/vk_barrier_tracker.h
+               src/video_core/renderer_vulkan/vk_command_chunk.h
+               src/video_core/renderer_vulkan/vk_command_recorder.cpp
+               src/video_core/renderer_vulkan/vk_command_recorder.h
                src/video_core/renderer_vulkan/vk_common.cpp
                src/video_core/renderer_vulkan/vk_common.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
@@ -1243,6 +1252,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
                src/video_core/renderer_vulkan/vk_rasterizer.h
+               src/video_core/renderer_vulkan/vk_record_thread.cpp
+               src/video_core/renderer_vulkan/vk_record_thread.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
                src/video_core/renderer_vulkan/vk_runtime.cpp
@@ -1515,6 +1526,24 @@ if (NOT MSVC)
     target_compile_options(shadps4 PRIVATE -Wno-invalid-offsetof)
 endif()
 
+# Codegen items for the Linux and Windows builds; macOS keeps upstream's defaults.
+if (NOT APPLE)
+    # Many small XXH3 calls per draw (user data words per stage, per-sharp specialization
+    # fingerprints, sampler keys, image hashes) each pay a cross-library call and a length
+    # dispatch while xxhash is linked as a plain C library. XXH_INLINE_ALL gives every
+    # translation unit a private inlined copy with internal linkage; the library stays linked
+    # for the externals and the hash values do not change.
+    target_compile_definitions(shadps4 PRIVATE XXH_INLINE_ALL)
+    # The toolchains emit stack-protector canaries by default, and they sit in most hot
+    # video_core prologues and epilogues at 0.3-0.6% of the GPU command thread. Hardening is
+    # traded for that time. clang-cl takes the MSVC spelling.
+    if (MSVC)
+        target_compile_options(shadps4 PRIVATE /GS-)
+    else()
+        target_compile_options(shadps4 PRIVATE -fno-stack-protector)
+    endif()
+endif()
+
 add_compile_definitions(BOOST_ASIO_STANDALONE)
 
 target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -1525,6 +1554,8 @@ set(HOST_SHADERS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/host_shaders
 add_subdirectory(${HOST_SHADERS_INCLUDE})
 add_dependencies(shadps4 host_shaders)
 target_include_directories(shadps4 PRIVATE ${HOST_SHADERS_INCLUDE})
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/gr2_fsr3/gr2_fsr3.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/src/core/prompt_packs/prompt_packs.cmake")
 
 # embed resources
 
