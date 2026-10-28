@@ -126,7 +126,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             "bind_image_lean needs bind_noop_memo; image bindings run the full constructor");
     }
     if (EmulatorSettings.IsAsyncSubmit()) {
-        scheduler.EnableAsyncSubmit();
+        if (scheduler.HasRecordingThread()) {
+            LOG_INFO(Render_Vulkan, "async_submit is off: the record thread submits");
+        } else {
+            scheduler.EnableAsyncSubmit();
+        }
     }
     if (EmulatorSettings.IsDrawPipe()) {
         if (host_markers_enabled || guest_markers_enabled) {

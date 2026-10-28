@@ -155,7 +155,6 @@ void RecordThread::Submit(const SubmitRequest& request) {
 
     {
         std::scoped_lock lk{Scheduler::submit_mutex};
-        Scheduler::DrainSubmits();
         std::scoped_lock queue_lk{Scheduler::queue_mutex};
         ImGui::Core::TextureManager::Submit();
         const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
