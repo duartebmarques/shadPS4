@@ -66,9 +66,9 @@ constexpr const char* ProjectId = "23459be6-f898-4aad-9dbc-18fbdd716555";
 constexpr uintptr_t CudaLowestAddress = 512_GB;
 
 // Indexed by DlssPreset.
-constexpr std::array Presets{sl::DLSSPreset::eDefault, sl::DLSSPreset::ePresetJ,
-                             sl::DLSSPreset::ePresetK, sl::DLSSPreset::ePresetL,
-                             sl::DLSSPreset::ePresetM};
+constexpr std::array Presets{sl::DLSSPreset::eDefault, sl::DLSSPreset::ePresetE,
+                             sl::DLSSPreset::ePresetJ, sl::DLSSPreset::ePresetK,
+                             sl::DLSSPreset::ePresetL, sl::DLSSPreset::ePresetM};
 static_assert(Presets.size() == magic_enum::enum_count<DlssPreset>());
 
 // The import library is not linked: the core functions come from GetProcAddress and the DLSS

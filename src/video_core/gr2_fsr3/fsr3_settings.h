@@ -43,7 +43,7 @@ struct Values {
     u32 test{0};
     bool dlss_enable{false};
     bool grr_dlss_enable{false};
-    DlssPreset dlss_preset{DlssPreset::Default};
+    DlssPreset dlss_preset{DlssPreset::E}; ///< The CNN model, the cheapest preset.
 };
 
 /// State of the module shown by the menu.

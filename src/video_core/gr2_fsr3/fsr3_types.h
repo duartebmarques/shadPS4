@@ -95,7 +95,7 @@ enum class Fsr4Model : u8 {
 };
 
 /// Preset of DLSS. The values are the dlssPreset names; Default lets the DLSS library choose.
-enum class DlssPreset : u8 { Default, J, K, L, M };
+enum class DlssPreset : u8 { Default, E, J, K, L, M };
 
 /// Extent of the output of the replaced pass relative to its colour input.
 enum class Kind : u8 {

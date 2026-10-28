@@ -63,7 +63,7 @@ constexpr std::array LodBiasExtraNames{"0", "-0.5", "-1.0", "-1.5"};
 constexpr std::array DebugViewNames{
     "Off", "Motion vectors", "Stencil", "Depth", "Masks", "Reprojection error", "FSR bypass",
 };
-constexpr std::array DlssPresetNames{"default", "J", "K", "L", "M"};
+constexpr std::array DlssPresetNames{"default", "E", "J", "K", "L", "M"};
 static_assert(Fsr4ModelNames.size() == magic_enum::enum_count<Fsr4Model>());
 static_assert(FxaaNames.size() == magic_enum::enum_count<Fxaa>());
 static_assert(ColorSpaceNames.size() == magic_enum::enum_count<ColorSpace>());
