@@ -47,6 +47,10 @@ struct DlssEvaluateInfo {
 
 #if defined(ENABLE_GR2_FSR3) && defined(_WIN32)
 
+/// Main thread, before the guest address space is reserved: for a Gravity Rush game with DLSS on,
+/// starts CUDA, which NGX needs, while address space below 1 TiB is free.
+void StartCudaForDlss();
+
 /**
  * Main thread, while the instance extensions are chosen. For Gravity Rush 2 with dlssEnable or
  * Gravity Rush Remastered with grrDlssEnable set, loads Streamline from Settings::DlssDir(),
@@ -91,6 +95,7 @@ void DlssFree();
 
 #else
 
+inline void StartCudaForDlss() {}
 inline void ExtendInstance(std::vector<const char*>&) {}
 inline void ExtendDeviceForDlss(vk::PhysicalDevice, vk::DeviceCreateInfo&,
                                 vk::PhysicalDeviceVulkan12Features&) {}

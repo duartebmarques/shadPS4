@@ -24,6 +24,7 @@
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
 
+#include "common/alignment.h"
 #include "common/error.h"
 #include "common/gravity_rush.h"
 #include "common/logging/log.h"
@@ -59,6 +60,10 @@ constexpr std::array<std::wstring_view, 4> RequiredFiles{L"sl.interposer.dll", L
 // With an engine version and a project ID, NGX needs no application ID from NVIDIA.
 constexpr const char* EngineVersion = "GR2fork-EXODUS";
 constexpr const char* ProjectId = "23459be6-f898-4aad-9dbc-18fbdd716555";
+
+// cuInit reserves address space below 1 TiB, and the Gravity Rush games map their memory below
+// 64 GiB. The free space below this address is held while cuInit runs.
+constexpr uintptr_t CudaLowestAddress = 512_GB;
 
 // Indexed by DlssPreset.
 constexpr std::array Presets{sl::DLSSPreset::eDefault, sl::DLSSPreset::ePresetJ,
@@ -117,6 +122,16 @@ void Disable(std::string notice) {
     LOG_WARNING(Render_Vulkan, "GR2 DLSS: off: {}", notice);
     g_notice = std::move(notice);
     g_stage.store(Stage::Off, std::memory_order_release);
+}
+
+// Whether the title is a Gravity Rush game with its DLSS setting on.
+bool DlssRequested() {
+    const bool gr2 = Common::IsGravityRush2();
+    if (!gr2 && !Common::IsGravityRushRemastered()) {
+        return false;
+    }
+    const Settings::Values settings = Settings::Snapshot();
+    return gr2 ? settings.dlss_enable : settings.grr_dlss_enable;
 }
 
 // Streamline ends the messages it formats with a newline.
@@ -236,15 +251,49 @@ sl::Resource ResourceOf(const Fsr4Image& image, vk::Format format, vk::Extent2D 
 
 } // namespace
 
+void StartCudaForDlss() {
+    if (!DlssRequested()) {
+        return;
+    }
+    const HMODULE module = LoadLibraryW(L"nvcuda.dll");
+    const auto cu_init =
+        module ? reinterpret_cast<int (*)(unsigned int)>(GetProcAddress(module, "cuInit"))
+               : nullptr;
+    if (!cu_init) {
+        return;
+    }
+    std::vector<void*> held;
+    MEMORY_BASIC_INFORMATION info{};
+    for (uintptr_t address = 64_KB; address < CudaLowestAddress;
+         address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize) {
+        VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info));
+        const auto base = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        const uintptr_t start = Common::AlignUp(base, 64_KB);
+        const uintptr_t end = std::min(base + info.RegionSize, CudaLowestAddress);
+        if (info.State != MEM_FREE || start >= end) {
+            continue;
+        }
+        if (void* reserved = VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_RESERVE,
+                                          PAGE_NOACCESS)) {
+            held.push_back(reserved);
+        }
+    }
+    const int result = cu_init(0);
+    for (void* reserved : held) {
+        VirtualFree(reserved, 0, MEM_RELEASE);
+    }
+    if (result == 0) {
+        LOG_INFO(Render_Vulkan, "GR2 DLSS: CUDA started");
+    } else {
+        LOG_WARNING(Render_Vulkan, "GR2 DLSS: CUDA did not start: error {}", result);
+    }
+}
+
 void ExtendInstance(std::vector<const char*>& extensions) {
-    const bool gr2 = Common::IsGravityRush2();
-    if (!gr2 && !Common::IsGravityRushRemastered()) {
+    if (!DlssRequested()) {
         return;
     }
     const Settings::Values settings = Settings::Snapshot();
-    if (!(gr2 ? settings.dlss_enable : settings.grr_dlss_enable)) {
-        return;
-    }
     const std::filesystem::path folder = Settings::DlssDir();
     const std::string folder_text = Common::FS::PathToUTF8String(folder);
     std::string missing;

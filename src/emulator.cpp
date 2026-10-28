@@ -48,6 +48,7 @@
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "video_core/cache_storage.h"
+#include "video_core/gr2_fsr3/dlss_streamline.h"
 #include "video_core/renderdoc.h"
 
 #ifdef _WIN32
@@ -634,6 +635,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Create stdin/stdout/stderr
     Common::Singleton<FileSys::HandleTable>::Instance()->CreateStdHandles();
+
+    // The guest address space takes the space below 1 TiB that CUDA needs.
+    Gr2Fsr3::StartCudaForDlss();
 
     // Initialize components
     memory = Core::Memory::Instance();
