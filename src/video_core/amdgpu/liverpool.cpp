@@ -1615,7 +1615,7 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
     FIBER_ENTER(dcb_task_name);
 
-    const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (true) {
         dcb = RunGraphicsPackets(dcb, base_addr);
         if (dcb.empty()) {
@@ -1688,6 +1688,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if (indirect_buffer->chain) {
+                // A chained buffer replaces the current one: the CP never comes back to the
+                // rest of this buffer, which in reused segments still holds old commands.
+                dcb = {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size};
+                base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+                continue;
+            }
             auto task =
                 ProcessGraphics({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
             SCOPE_EXIT {
@@ -1785,6 +1792,15 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if constexpr (is_indirect) {
+                if (indirect_buffer->chain) {
+                    // As for graphics, a chained buffer replaces the current one.
+                    acb = {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size};
+                    base_addr = reinterpret_cast<VAddr>(acb.data());
+                    acb_size = acb.size_bytes();
+                    continue;
+                }
+            }
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
             SCOPE_EXIT {
