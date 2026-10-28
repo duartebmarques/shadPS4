@@ -922,7 +922,8 @@ struct GPUSettings {
     clean_sync_peek, readback_offload, fast_shader_math, \
     one_core_gpu_thread_pin, inplace_guest_memory, guest_sync_barriers, inplace_image_downloads, \
     draw_pipe, async_submit, tick_query_interval_us, guest_gpu_time_percent, barrier_tracker, \
-    present_pacing, frame_cap, vk_record_thread, async_shader_recompiling, pipeline_sync_budget_ms
+    present_pacing, frame_cap, vk_record_thread, async_shader_recompiling, \
+    pipeline_sync_budget_ms
 // clang-format on
 template <
     typename BasicJsonType,
