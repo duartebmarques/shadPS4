@@ -89,6 +89,7 @@ public:
     void dispatch(u32 group_count_x, u32 group_count_y, u32 group_count_z) const;
     void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const;
 
+    void resetQueryPool(vk::QueryPool query_pool, u32 first_query, u32 query_count) const;
     void writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool query_pool, u32 query) const;
 
     void copyBuffer(vk::Buffer src_buffer, vk::Buffer dst_buffer,

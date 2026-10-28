@@ -688,6 +688,7 @@ private:
     u32 span_next{};
     double timestamp_period{};
     u64 session_seq{};
+    u32 chunk_span_slot{UINT32_MAX};
     std::mutex busy_mutex;
     std::deque<BusySpan> busy_spans;
     u64 busy_ticks{};

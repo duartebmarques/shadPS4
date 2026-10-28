@@ -599,6 +599,13 @@ void CommandRecorder::dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset)
         [buffer, offset](vk::CommandBuffer cmdbuf) { cmdbuf.dispatchIndirect(buffer, offset); });
 }
 
+void CommandRecorder::resetQueryPool(vk::QueryPool query_pool, u32 first_query,
+                                     u32 query_count) const {
+    scheduler->Record([query_pool, first_query, query_count](vk::CommandBuffer cmdbuf) {
+        cmdbuf.resetQueryPool(query_pool, first_query, query_count);
+    });
+}
+
 void CommandRecorder::writeTimestamp2(vk::PipelineStageFlags2 stage, vk::QueryPool query_pool,
                                       u32 query) const {
     scheduler->Record([stage, query_pool, query](vk::CommandBuffer cmdbuf) {

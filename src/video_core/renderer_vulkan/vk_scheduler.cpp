@@ -305,6 +305,14 @@ void Scheduler::BeginSession() {
     if (threaded_recording) {
         // The record thread begins the next command buffer itself; only the dynamic state
         // needs re-emitting into it.
+        ++session_seq;
+        if (span_pool) {
+            chunk_span_slot = span_next;
+            span_next = (span_next + 1) % TimestampSlots;
+            CommandBuffer().resetQueryPool(span_pool, chunk_span_slot * 2, 2);
+            CommandBuffer().writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, span_pool,
+                                            chunk_span_slot * 2);
+        }
         dynamic_state.Invalidate();
         return;
     }
@@ -391,7 +399,7 @@ Scheduler::GpuTimestamp Scheduler::WriteGpuTimestamp() {
     timestamp_next = (timestamp_next + 1) % TimestampSlots;
     CommandBuffer().writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, timestamp_pool,
                                     slot);
-    return {slot, sessions.back().seq};
+    return {slot, session_seq};
 }
 
 void Scheduler::AccumulateBusy(u64 session_limit, u64 tick_limit) {
@@ -468,6 +476,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     if (threaded_recording) {
         EndRendering();
+        if (chunk_span_slot != UINT32_MAX) {
+            CommandBuffer().writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, span_pool,
+                                            chunk_span_slot * 2 + 1);
+            std::scoped_lock busy_lk{busy_mutex};
+            if (busy_spans.size() >= TimestampSlots / 2) {
+                work_semaphore.Refresh();
+                AccumulateBusy(UINT64_MAX, work_semaphore.KnownGpuTick());
+            }
+            busy_spans.push_back({session_seq, signal_value, chunk_span_slot});
+            chunk_span_slot = UINT32_MAX;
+        }
         info.AddSignal(work_semaphore.Handle(), signal_value);
         const SubmitRequest request{
             .info = info,
