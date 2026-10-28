@@ -343,6 +343,15 @@ void ExtendDeviceForDlss(vk::PhysicalDevice physical_device, vk::DeviceCreateInf
                                create_info.ppEnabledExtensionNames +
                                    create_info.enabledExtensionCount);
     AppendMissing(g_device_extensions, names);
+    // NGX can ask for both buffer device address extensions, which a device must not enable
+    // together; Streamline's own device proxy drops the EXT one.
+    const auto named = [](std::string_view wanted) {
+        return [wanted](const char* name) { return wanted == name; };
+    };
+    if (std::ranges::any_of(g_device_extensions,
+                            named(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME))) {
+        std::erase_if(g_device_extensions, named(VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME));
+    }
     create_info.enabledExtensionCount = static_cast<u32>(g_device_extensions.size());
     create_info.ppEnabledExtensionNames = g_device_extensions.data();
 
