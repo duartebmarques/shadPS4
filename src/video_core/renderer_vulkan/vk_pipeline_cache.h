@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -241,6 +242,7 @@ public:
     void DumpKeyReuseStats();
     void DumpProgramIdentityStats();
     void DumpColorMaskStats(u64 emit_skips);
+    void DumpAsyncSkipStats();
     void DumpRuntimeInfoMemoStats();
     void DumpLayoutStats();
     /// Pipelines whose set 0 takes the descriptor heap leg, against the pipeline count.
@@ -333,6 +335,15 @@ private:
     bool key_reuse_hash_diff{};
     u64 key_reuse_diff_decisions{};
     u64 nonfull_mask_pipelines{};
+    u64 async_skips{};
+    std::atomic<u64> heap_pipelines{};
+    std::atomic<u64> array_pipelines{};
+    std::atomic<u64> total_pipelines{};
+    void CountPipeline(const Pipeline& pipeline, s64 delta) {
+        heap_pipelines += static_cast<u64>(!pipeline.UsesPushDescriptors() ? delta : 0);
+        array_pipelines += static_cast<u64>(pipeline.HasDescriptorArrays() ? delta : 0);
+        total_pipelines += static_cast<u64>(delta);
+    }
     u64 graphics_lookups{};
     // Cleared by every graphics lookup; the first compile wait of the draw sets compile_deadline.
     bool compile_deadline_armed{};
@@ -446,6 +457,7 @@ private:
                    ((reinterpret_cast<uintptr_t>(code) >> 8) * 0x9E3779B97F4A7C15ull) >> 40) &
                identity_table_mask;
     }
+    u64 PublishNotReady(u32 out_slot, Shader::SwStage l_stage);
     u64 pgmid_map_hits{};
     u64 pgmid_map_probes{};
     u64 params_hits{};

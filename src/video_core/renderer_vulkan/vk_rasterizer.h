@@ -353,6 +353,8 @@ private:
 
     /// The once-per-300-frames [SkipCache] telemetry block, out of OnSubmit's lines.
     void EmitSkipcacheTelemetry(VideoCore::Skipcache::Framework& skipcache);
+    void EmitPipelineCacheTelemetry(u64 mask_skips);
+    void PollPipelineCacheTelemetry();
 
 private:
     // BeginRendering skip cache (verify contract in skipcache.h). The snapshot
@@ -627,6 +629,8 @@ private:
     std::unique_ptr<RecordView> record_view;
     /// Draw pipe: pipelines are selected on the command thread and handed over.
     bool pipe_select{};
+    std::atomic_bool pipeline_telemetry_due{};
+    std::atomic<u64> pending_mask_skips{};
     /// Stage B: the pipeline the packet being recorded was selected with, or null.
     const Pipeline* selected_pipeline{};
     const AmdGpu::Regs* record_regs;

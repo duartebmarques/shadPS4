@@ -661,8 +661,28 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+void Rasterizer::EmitPipelineCacheTelemetry(u64 mask_skips) {
+    pipeline_cache.DumpColorMaskStats(mask_skips);
+    pipeline_cache.DumpKeyReuseStats();
+    pipeline_cache.DumpProgramIdentityStats();
+    pipeline_cache.DumpSpecFpStats();
+    pipeline_cache.DumpSharpReadStats();
+    pipeline_cache.DumpRuntimeInfoMemoStats();
+    pipeline_cache.DumpLayoutStats();
+    pipeline_cache.DumpHeapPipelineStats();
+    pipeline_cache.DumpAsyncSkipStats();
+}
+
+void Rasterizer::PollPipelineCacheTelemetry() {
+    if (pipeline_telemetry_due.load(std::memory_order_relaxed) &&
+        pipeline_telemetry_due.exchange(false, std::memory_order_acquire)) {
+        EmitPipelineCacheTelemetry(pending_mask_skips.exchange(0, std::memory_order_relaxed));
+    }
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (draw_pipe) {
+        PollPipelineCacheTelemetry();
         const PipeDraw args{is_indexed, index_offset};
         const Pipeline* pipeline = nullptr;
         if (pipe_select && ClassifyDraw(liverpool->regs).kind == DrawFilter::Kind::Draw) {
@@ -1046,6 +1066,7 @@ void Rasterizer::RecordDrawIndirect(bool is_indexed, VAddr arg_address, u32 offs
 
 void Rasterizer::DispatchDirect() {
     if (draw_pipe) {
+        PollPipelineCacheTelemetry();
         const PipeDispatch args{.cs = liverpool->GetCsRegs()};
         const Pipeline* pipeline = pipe_select ? pipeline_cache.GetComputePipeline() : nullptr;
         if (pipe_select && !pipeline) {
@@ -1333,14 +1354,14 @@ void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
                  "per300f",
                  bw.calls, bw.hits, bw.hit_bytes >> 10, bw.miss_bytes >> 10, bw.multi);
     }
-    pipeline_cache.DumpColorMaskStats(scheduler.GetDynamicState().DrainColorWriteMaskSkips());
-    pipeline_cache.DumpKeyReuseStats();
-    pipeline_cache.DumpProgramIdentityStats();
-    pipeline_cache.DumpSpecFpStats();
-    pipeline_cache.DumpSharpReadStats();
-    pipeline_cache.DumpRuntimeInfoMemoStats();
-    pipeline_cache.DumpLayoutStats();
-    pipeline_cache.DumpHeapPipelineStats();
+    const u64 mask_skips = scheduler.GetDynamicState().DrainColorWriteMaskSkips();
+    if (pipe_select) {
+        // The command thread owns the pipeline cache then: it emits these at its next draw.
+        pending_mask_skips.fetch_add(mask_skips, std::memory_order_relaxed);
+        pipeline_telemetry_due.store(true, std::memory_order_release);
+    } else {
+        EmitPipelineCacheTelemetry(mask_skips);
+    }
     pipeline_cache.DumpDescHeapStats();
     if (const auto vm = texture_cache.DrainViewMemoStats(); vm.hits || vm.slow) {
         LOG_INFO(Render_Skipcache, "[SkipCache] VIEWMEMO hits={} slow={} writebacks={} per300f",

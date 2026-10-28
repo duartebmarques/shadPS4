@@ -1285,6 +1285,7 @@ const GraphicsPipeline* PipelineCache::CreateGraphicsPipeline() {
             if (pending_it->second.wait_for(std::chrono::seconds::zero()) !=
                 std::future_status::ready) {
                 if (!photo) {
+                    ++async_skips;
                     return nullptr;
                 }
                 if (pre_compile_hook_) {
@@ -1412,6 +1413,7 @@ const GraphicsPipeline* PipelineCache::InstallGraphicsPipeline(
         }
     }
     ++num_new_pipelines;
+    CountPipeline(*pipeline, 1);
     return graphics_pipelines.emplace(graphics_key, std::move(pipeline)).first->second.get();
 }
 
@@ -1558,18 +1560,26 @@ void PipelineCache::DumpLayoutStats() {
 }
 
 void PipelineCache::DumpHeapPipelineStats() {
-    u64 heap = 0;
-    u64 arrays = 0;
-    for (const auto& [key, pipeline] : graphics_pipelines) {
-        heap += !pipeline->UsesPushDescriptors();
-        arrays += pipeline->HasDescriptorArrays();
+    // Counted at install and erase: with pipe_select the maps change on the command thread
+    // while this runs on the recording thread.
+    LOG_INFO(Render_Skipcache, "[SkipCache] HEAPPIPES heap={} arrays={} of {}",
+             heap_pipelines.load(std::memory_order_relaxed),
+             array_pipelines.load(std::memory_order_relaxed),
+             total_pipelines.load(std::memory_order_relaxed));
+}
+
+// A draw or stage skipped because its shader or pipeline still compiles: the frame may miss it.
+u64 PipelineCache::PublishNotReady(u32 out_slot, SwStage l_stage) {
+    ++async_skips;
+    return Publish(out_slot, l_stage, nullptr, {}, nullptr, 0u, 0);
+}
+
+void PipelineCache::DumpAsyncSkipStats() {
+    if (async_skips == 0) {
+        return;
     }
-    for (const auto& [key, pipeline] : compute_pipelines) {
-        heap += !pipeline->UsesPushDescriptors();
-        arrays += pipeline->HasDescriptorArrays();
-    }
-    LOG_INFO(Render_Skipcache, "[SkipCache] HEAPPIPES heap={} arrays={} of {}", heap, arrays,
-             graphics_pipelines.size() + compute_pipelines.size());
+    LOG_WARNING(Render_Skipcache, "[SkipCache] ASYNCSKIP skips={} per300f", async_skips);
+    async_skips = 0;
 }
 
 void PipelineCache::DumpDescHeapStats() {
@@ -1675,6 +1685,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             *pipeline_cache, compute_key, *infos[0], modules[0], sdata, false);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
+        CountPipeline(*it->second, 1);
 
         if (EmulatorSettings.IsShaderCollect()) {
             auto& m = modules[0];
@@ -2222,7 +2233,7 @@ u64 PipelineCache::CreateProgramSlow(HwStage stage, SwStage l_stage,
         const auto perm_hash = HashCombine(params.hash, perm_idx);
         if (!CompileProgramOnWorker(*created_slot, stage, l_stage, params, binding, nullptr,
                                     perm_idx, perm_hash)) {
-            return Publish(out_slot, l_stage, nullptr, {}, nullptr, 0u, 0);
+            return PublishNotReady(out_slot, l_stage);
         }
         // Points the info the compile published at the live user data registers.
         auto& info = created_slot->info;
@@ -2300,7 +2311,7 @@ u64 PipelineCache::GetProgram(HwStage stage, SwStage l_stage, const Shader::Shad
     }
     if (program->pending_compilation && !PublishPendingCompilation(*program) &&
         program->modules.empty()) [[unlikely]] {
-        return Publish(out_slot, l_stage, nullptr, {}, nullptr, 0u, 0);
+        return PublishNotReady(out_slot, l_stage);
     }
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
@@ -2646,7 +2657,7 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
     if (hit_idx == std::numeric_limits<size_t>::max()) {
         // One permutation of a program compiles at a time.
         if (program->pending_compilation) {
-            return Publish(out_slot, l_stage, nullptr, {}, nullptr, 0u, 0);
+            return PublishNotReady(out_slot, l_stage);
         }
         if (async_shader_recompiling && stage != HwStage::Compute && !DrawsPhoto()) {
             perm_idx = FreePermutationIndex(params.hash, perm_idx);
@@ -2654,7 +2665,7 @@ u64 PipelineCache::ResolvePermutationSlow(HwStage stage, SwStage l_stage,
             RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
             if (!CompileProgramOnWorker(*program, stage, l_stage, params, binding, &spec, perm_idx,
                                         perm_hash)) {
-                return Publish(out_slot, l_stage, nullptr, {}, nullptr, 0u, 0);
+                return PublishNotReady(out_slot, l_stage);
             }
             module = program->modules[perm_idx].module;
         } else {
@@ -2746,6 +2757,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                 auto& graphics_key = std::get<GraphicsPipelineKey>(key);
                 if (auto it = graphics_pipelines.find(graphics_key);
                     it != graphics_pipelines.end()) {
+                    CountPipeline(*it->second, -1);
                     {
                         std::scoped_lock lk{retired_pipelines_mutex};
                         retired_pipelines.push_back(std::move(it.value()));
@@ -2759,6 +2771,7 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
             } else if (std::holds_alternative<ComputePipelineKey>(key)) {
                 auto& compute_key = std::get<ComputePipelineKey>(key);
                 if (auto it = compute_pipelines.find(compute_key); it != compute_pipelines.end()) {
+                    CountPipeline(*it->second, -1);
                     {
                         std::scoped_lock lk{retired_pipelines_mutex};
                         retired_pipelines.push_back(std::move(it.value()));
