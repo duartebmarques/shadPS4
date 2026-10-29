@@ -12,7 +12,7 @@ with the Deck's controls.
 | Game | Title id | Version | State on the Deck OLED |
 |---|---|---|---|
 | inFAMOUS Second Son | CUSA00004 (+ other regions) | update 1.07 | about 30 fps (the game's cap), graffiti shake and trackpads work |
-| inFAMOUS First Light | CUSA00897 (+ other regions) | 1.00 (1.04 works too) | **work in progress**: playable, about 26-30 fps outside fights, heavy fights drop to about 20 fps |
+| inFAMOUS First Light | CUSA00897 (+ other regions) | update 1.04 (1.00 works too) | **work in progress**: playable, about 30 fps most of the time, heavy fights can still dip to the low 20s |
 
 More games are added through `games.json` (see [Adding a game](#adding-a-game)).
 
@@ -71,6 +71,9 @@ machine allows (uneven on the Deck, about 34 fps).
 - **Everything stays in the app folder:** saves in `user/home/1000/savedata/`, settings in
   `user/`. Saves from an earlier shadPS4 setup are copied there on the first start (the originals
   are left alone). Move or back up the folder as a whole.
+- **Trophies** only unlock with your own PS4 trophy key (it cannot be shipped). Put it in
+  `user/keys.json` as `{"TrophyKeySet": {"ReleaseTrophyKey": "<32 hex digits>"}}`. Without it the
+  games play normally and trophies stay locked.
 - **Patches:** in the game picker choose a game > **Patches**. The Deck defaults are the 1280x720
   render patch and skip intro; on a stronger PC turn the resolution patch off (or pick a higher
   one) for a sharper image.
@@ -101,12 +104,17 @@ All options: `./shadPS4.sh --help`.
 3. Measure it with the bench tools (`agent/TOOLS.md`: `title-ab`, `game-run`, `pad-session`).
 
 ## What's different from shadPS4
-- **Two-stage draw pipeline** (`draw_pipe`): PM4 decoding and Vulkan command recording run on separate threads.
+- **Three-stage draw pipeline**: PM4 decoding, draw preparation (`draw_pipe`) and the Vulkan
+  driver calls (`vk_record_thread`, from EXODUS) run on separate threads; new shaders compile in
+  the background.
 - **In-place guest memory** (`inplace_guest_memory` 1–3): honest fences, plus guest memory in dma-buf chunks that the GPU uses directly.
 - **GPU-time timestamps**: guest GPU timestamps count GPU execution time, which fixes the "refocus" flicker.
 - **Present thread and low-lag pacing**: the game's own 30 fps limit (or a `frame_cap`) is paced so
   each frame is done just before it is shown: steady 30 fps with less than half the input lag.
-- **Background pipeline compiles** for every-frame passes, and a log-based barrier tracker.
+- **Flip lead** (`flip_lead_us`): a game that runs ahead of the emulated GPU is held after each
+  frame just long enough, so the input it reads is not queued behind a frame of commands
+  (pad-to-screen lag about 33 ms in First Light, 36 ms in Second Son, and a few % more fps).
+- A log-based barrier tracker, and builds optimized with profiles from real play (PGO).
 - **Steam Deck input**: the Deck's own motion sensor (shake past the sensor's limit) and trackpads
   feed the emulated controller.
 - Texture-cache GC, stream copy lanes, and more. See [`docs/infamous-deck-handoff.md`](docs/infamous-deck-handoff.md).

@@ -10,7 +10,8 @@ the SD card: **Second Son** (CUSA00004, update **1.07**) and/or **First Light** 
 3. **Steam:** on the game's page choose **Add to Steam**, then in Gaming Mode open
    Library > Non-Steam > your game.
 
-First Light is a **work in progress**: playable, but heavy fights drop to about 20 fps.
+First Light is a **work in progress**: playable at about 30 fps, but heavy fights can still dip to
+the low 20s.
 
 Or the one line in Konsole (installs into `~/Applications/shadPS4-infamous`):
 ```
