@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <ranges>
@@ -90,7 +91,8 @@ static std::deque<BackupRequest> g_result_queue;
 static std::atomic_int g_backup_progress = 0;
 static std::atomic g_backup_status = WorkerStatus::NotStarted;
 static std::atomic_bool g_backup_stopping = false;
-static std::atomic_bool g_backup_copying = false;
+static std::mutex g_backup_stop_mutex;
+static std::condition_variable g_backup_stop_cv;
 
 static void backup(const std::filesystem::path& dir_name) {
     std::unique_lock lk{g_backup_running_mutex};
@@ -163,7 +165,6 @@ static void BackupThreadBody() {
             break;
         }
         g_backup_status = WorkerStatus::Running;
-        g_backup_copying = true;
 
         LOG_INFO(Lib_SaveData, "Backing up the following directory: {}",
                  fmt::UTF(req.save_path.u8string()));
@@ -190,11 +191,15 @@ static void BackupThreadBody() {
                 }
             }
         }
-        g_backup_copying = false;
         if (req.origin != OrbisSaveDataEventType::__DO_NOT_SAVE) {
             DispatchBackupEvent(req);
         }
-        std::this_thread::sleep_for(std::chrono::seconds(5)); // Don't backup too often
+        {
+            // Don't backup too often, but wake immediately on StopThread().
+            std::unique_lock lk{g_backup_stop_mutex};
+            g_backup_stop_cv.wait_for(lk, std::chrono::seconds(5),
+                                      [] { return g_backup_stopping.load(); });
+        }
     }
     g_backup_status = WorkerStatus::NotStarted;
 }
@@ -217,22 +222,26 @@ void StopThread() {
         return;
     }
     LOG_DEBUG(Lib_SaveData, "Stopping backup thread");
-    g_backup_stopping = true;
+    {
+        std::scoped_lock lk{g_backup_stop_mutex};
+        g_backup_stopping = true;
+    }
+    g_backup_stop_cv.notify_all();
     g_backup_status = WorkerStatus::Stopping;
     {
         std::scoped_lock lk{g_backup_queue_mutex};
         g_backup_queue.emplace_back(BackupRequest{});
     }
     g_backup_thread_semaphore.release();
-    if (!Kernel::g_curthread) {
-        // Emulator shutdown runs on a host thread, which cannot join a guest thread: let a
-        // running backup finish and leave the thread to the process exit.
-        while (g_backup_copying) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (Kernel::g_curthread != nullptr) {
+        // Called from a guest thread (sceSaveDataTerminate): a guest join is valid here.
+        g_backup_thread.Join();
+    } else {
+        // Called from a host thread (Emulator::Shutdown via at_quick_exit).
+        for (int i = 0; i < 100 && g_backup_status != WorkerStatus::NotStarted; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        return;
     }
-    g_backup_thread.Join();
     std::scoped_lock lk{g_backup_queue_mutex};
     g_backup_queue.clear();
 }
