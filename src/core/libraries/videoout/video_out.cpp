@@ -156,6 +156,20 @@ void PaceGuestFrame() {
     driver->PaceGuestFlip();
 }
 
+void NoteQueuedFlip() {
+    driver->NoteQueuedFlip();
+}
+
+void WaitQueuedFlips() {
+    driver->WaitQueuedFlips();
+}
+
+void NoteGpuIdle() {
+    if (driver) {
+        driver->NoteGpuIdle();
+    }
+}
+
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {
     auto* port = driver->GetPort(handle);
     if (!port) {

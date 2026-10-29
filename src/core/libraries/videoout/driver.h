@@ -27,6 +27,13 @@ void LatNoteGuestFlip();
 /// Holds the calling guest thread after a flip for the frame cap.
 void PaceGuestFrame();
 
+/// Notes a submit-and-flip before it is submitted, and holds the guest after it so that its flips
+/// reach the GPU command thread flip_lead_us after they are submitted.
+void NoteQueuedFlip();
+void WaitQueuedFlips();
+/// The GPU command thread ran out of work: a guest held for the flip lead is let go.
+void NoteGpuIdle();
+
 struct VideoOutPort {
     SceVideoOutResolutionStatus resolution;
     std::array<VideoOutBuffer, MaxDisplayBuffers> buffer_slots;
@@ -101,6 +108,9 @@ public:
                               const BufferAttribute* attribute);
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    void NoteQueuedFlip();
+    void WaitQueuedFlips();
+    void NoteGpuIdle();
 
     /// Called by the guest thread after it queued a flip: holds it until its next frame should
     /// start for the frame cap.
@@ -145,6 +155,7 @@ private:
     void SwapThread(std::stop_token token);
     void TrackDisplay(s64 vblank_ns, s64 display_ns);
     s64 NoteFrameReady();
+    void NoteFlipReached();
 
     std::mutex mutex;
     std::condition_variable request_cv;
@@ -172,6 +183,17 @@ private:
     s64 cap_slot_ns{};
     s64 cap_lead_ns{};
     u64 cap_submitted{};
+    // Flip lead: submit times of the guest flips the command thread has not reached yet, and how
+    // long the guest is held after each flip.
+    s64 flip_lead_ns{};
+    std::mutex flip_lead_mutex;
+    std::deque<s64> flip_lead_submits;
+    s64 flip_lead_hold_ns{};
+    std::condition_variable flip_lead_cv;
+    bool flip_lead_holding{};
+    u64 flip_lead_starved{};
+    s64 flip_lead_lag_sum_ns{};
+    u64 flip_lead_samples{};
     u64 cap_ready{};
     std::jthread present_thread;
     std::jthread swap_thread;

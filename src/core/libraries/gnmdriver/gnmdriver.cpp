@@ -2424,9 +2424,11 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
             return patch_result;
         }
 
+        Libraries::VideoOut::NoteQueuedFlip();
         result = PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                                const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
     }
+    Libraries::VideoOut::WaitQueuedFlips();
     Libraries::VideoOut::PaceGuestFrame();
     return result;
 }
