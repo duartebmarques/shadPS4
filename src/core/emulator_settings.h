@@ -532,6 +532,11 @@ struct GPUSettings {
     // game asks for with its flip rate (e.g. a 30 fps lock), and leaves games without one uncapped.
     // Read once at boot.
     Setting<u32> frame_cap{0};
+    // Target in microseconds for how long a guest submit-and-flip waits before the GPU command
+    // thread reaches it, 0 for off. A guest that runs ahead of the command thread is held after
+    // its flips by a learned amount, so the input it reads for its next frame is not queued
+    // behind the commands of the last one. Read once at boot.
+    Setting<u32> flip_lead_us{3000};
     // With inplace_guest_memory 2+, copy GPU-written images back into guest memory on the GPU,
     // straight into the GPU-visible chunk holding it, instead of through a staging buffer and a
     // CPU copy on the completion thread, which end-of-pipe labels queue behind.
@@ -880,6 +885,7 @@ struct GPUSettings {
             GPU_OVERRIDE(guest_copy_lock_batch),
             GPU_OVERRIDE(spec_mru_perm_probe),
             GPU_OVERRIDE(guest_gpu_time_percent),
+            GPU_OVERRIDE(flip_lead_us),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
@@ -923,7 +929,7 @@ struct GPUSettings {
     one_core_gpu_thread_pin, inplace_guest_memory, guest_sync_barriers, inplace_image_downloads, \
     draw_pipe, async_submit, tick_query_interval_us, guest_gpu_time_percent, barrier_tracker, \
     present_pacing, frame_cap, vk_record_thread, async_shader_recompiling, \
-    pipeline_sync_budget_ms
+    pipeline_sync_budget_ms, flip_lead_us
 // clang-format on
 template <
     typename BasicJsonType,
@@ -1289,6 +1295,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, AsyncSubmit, async_submit)
     SETTING_FORWARD(m_gpu, TickQueryIntervalUs, tick_query_interval_us)
     SETTING_FORWARD(m_gpu, GuestGpuTimePercent, guest_gpu_time_percent)
+    SETTING_FORWARD(m_gpu, FlipLeadUs, flip_lead_us)
     SETTING_FORWARD(m_gpu, RingDrainFlushDraws, ring_drain_flush_draws)
     SETTING_FORWARD(m_gpu, PendingPopThrottle, pending_pop_throttle)
     SETTING_FORWARD(m_gpu, StreamCopyWorkers, stream_copy_workers)

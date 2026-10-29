@@ -58,6 +58,7 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
     present_pacing = EmulatorSettings.GetPresentPacing();
+    flip_lead_ns = s64{EmulatorSettings.GetFlipLeadUs()} * 1000;
     if (const u32 cap = EmulatorSettings.GetFrameCap(); cap != 0) {
         cap_period_ns = 1'000'000'000 / cap;
     }
@@ -542,6 +543,9 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         if (is_eop) {
             ++port->flip_status.gc_queue_num;
         }
+        if (is_eop && flip_lead_ns != 0) {
+            NoteFlipReached();
+        }
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
@@ -554,6 +558,65 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     }
 
     return true;
+}
+
+void VideoOutDriver::NoteQueuedFlip() {
+    if (flip_lead_ns != 0) {
+        std::scoped_lock lock{flip_lead_mutex};
+        if (flip_lead_submits.size() < 8) {
+            flip_lead_submits.push_back(SteadyNs());
+        }
+    }
+}
+
+void VideoOutDriver::NoteFlipReached() {
+    constexpr s64 MaxHold = 33'000'000;
+    const s64 now = SteadyNs();
+    std::scoped_lock lock{flip_lead_mutex};
+    if (flip_lead_submits.empty()) {
+        return;
+    }
+    const s64 lag = now - flip_lead_submits.front();
+    flip_lead_submits.pop_front();
+    // Lags over the target mean the guest ran ahead: hold it longer, under it shorten the hold.
+    flip_lead_hold_ns = std::clamp<s64>(flip_lead_hold_ns + (lag - flip_lead_ns) / 8, 0, MaxHold);
+    flip_lead_lag_sum_ns += lag;
+    if (++flip_lead_samples % 300 == 0) {
+        LOG_INFO(Lib_VideoOut, "FLIPLEAD lag={:.1f} hold={:.1f} ms starved={}",
+                 flip_lead_lag_sum_ns / 300 / 1e6, flip_lead_hold_ns / 1e6, flip_lead_starved);
+        flip_lead_lag_sum_ns = 0;
+    }
+}
+
+void VideoOutDriver::WaitQueuedFlips() {
+    if (flip_lead_ns == 0) {
+        return;
+    }
+    std::unique_lock lock{flip_lead_mutex};
+    if (flip_lead_hold_ns <= 0) {
+        return;
+    }
+    flip_lead_holding = true;
+    flip_lead_cv.wait_for(lock, std::chrono::nanoseconds(flip_lead_hold_ns),
+                          [this] { return !flip_lead_holding; });
+    flip_lead_holding = false;
+}
+
+void VideoOutDriver::NoteGpuIdle() {
+    if (flip_lead_ns == 0) {
+        return;
+    }
+    {
+        std::scoped_lock lock{flip_lead_mutex};
+        if (!flip_lead_holding) {
+            return;
+        }
+        // Holding the guest left the command thread without work: the hold was too long.
+        flip_lead_holding = false;
+        flip_lead_hold_ns -= flip_lead_hold_ns / 4;
+        ++flip_lead_starved;
+    }
+    flip_lead_cv.notify_one();
 }
 
 void VideoOutDriver::SetFlipRate(VideoOutPort* port, s32 rate) {

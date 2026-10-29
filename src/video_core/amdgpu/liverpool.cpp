@@ -684,6 +684,9 @@ void Liverpool::Process(std::stop_token stoken) {
     VideoCore::RegionLock::gpu_spin_rounds = EmulatorSettings.GetTrackerLockSpinRounds();
 
     while (!stoken.stop_requested()) {
+        if (!num_submits && !num_commands) {
+            Libraries::VideoOut::NoteGpuIdle();
+        }
         {
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
