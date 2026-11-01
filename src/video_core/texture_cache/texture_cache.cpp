@@ -141,6 +141,9 @@ TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    if (download_images.empty()) {
+        return;
+    }
     if (readback_linear_images_async) {
         bool recorded = false;
         for (const ImageId image_id : download_images) {
@@ -163,9 +166,15 @@ void TextureCache::ProcessDownloadImages() {
         return;
     }
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, DownloadMemoryFlags::Sync);
+        DownloadImageMemory(image_id);
     }
     download_images.clear();
+    const u64 t0 = Common::FencedRDTSC();
+    scheduler.Finish();
+    scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage, Common::FencedRDTSC() - t0);
+    scheduler.PopPendingOperations();
+    // In-place downloads defer their bump to the priority thread; the memory is final here.
+    Skipcache::Framework::Instance().BumpMemGen();
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags flags) {
