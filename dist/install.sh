@@ -58,14 +58,19 @@ else
     rel="$work/shadPS4-infamous"
 fi
 
+[ -x "$rel/app/usr/bin/shadps4" ] && [ -d "$rel/dist-user" ] && [ -d "$rel/tools" ] ||
+    die "${TAG:-the latest release} is not a folder app release; nothing was changed"
 mkdir -p "$DIR"
 DIR="$(cd "$DIR" && pwd)"
 if [ "$rel" != "$DIR" ]; then
     info "Installing into $DIR"
+    rm -rf "$DIR/app.new"
+    cp -a "$rel/app" "$DIR/app.new"
     rm -rf "$DIR/app.prev"
     [ -d "$DIR/app" ] && mv "$DIR/app" "$DIR/app.prev"
+    mv "$DIR/app.new" "$DIR/app"
     rm -rf "$DIR/dist-user" "$DIR/tools"
-    cp -a "$rel/app" "$rel/dist-user" "$rel/tools" "$DIR/"
+    cp -a "$rel/dist-user" "$rel/tools" "$DIR/"
     for f in shadPS4.sh install.sh games.json README.md LICENSE VERSION; do
         [ -f "$rel/$f" ] && cp -a "$rel/$f" "$DIR/$f"
     done

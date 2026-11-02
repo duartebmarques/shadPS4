@@ -280,7 +280,7 @@ add_to_steam() {
 }
 
 update() {
-    local rel tag url work
+    local rel tag url work f
     command -v curl >/dev/null || die "curl is required"
     command -v unzip >/dev/null || die "unzip is required"
     running && die "a game is running; close it first"
@@ -291,25 +291,32 @@ update() {
         return
     fi
     work="$(mktemp -d)"
-    trap 'rm -rf "$work"' RETURN
+    # exec and exit skip RETURN traps: the download (in RAM on SteamOS) goes on any exit.
+    trap 'rm -rf "$work"' EXIT
     info "Downloading $tag..."
     curl -fL --progress-bar -o "$work/release.zip" "$url"
     unzip -q "$work/release.zip" -d "$work/r"
-    local src
-    src="$(dirname "$(find "$work/r" -maxdepth 3 -name shadPS4.sh | head -1)")"
-    [ -f "$src/shadPS4.sh" ] && [ -x "$src/app/usr/bin/shadps4" ] ||
+    local src=""
+    f="$(find "$work/r" -maxdepth 3 -name shadPS4.sh -print -quit)"
+    [ -n "$f" ] && src="$(dirname "$f")"
+    [ -n "$src" ] && [ -x "$src/app/usr/bin/shadps4" ] && [ -d "$src/dist-user" ] ||
         die "$tag is not a folder app release (older than v1.1); nothing was changed"
+    # Copied next to the old build first: a failed copy leaves app/ and app.prev as they were.
+    rm -rf "$ROOT/app.new" "$ROOT/dist-user.new"
+    cp -a "$src/app" "$ROOT/app.new"
+    cp -a "$src/dist-user" "$ROOT/dist-user.new"
     rm -rf "$ROOT/app.prev"
     [ -d "$ROOT/app" ] && mv "$ROOT/app" "$ROOT/app.prev"
-    cp -a "$src/app" "$ROOT/app"
+    mv "$ROOT/app.new" "$ROOT/app"
     rm -rf "$ROOT/dist-user" "$ROOT/tools.new"
-    cp -a "$src/dist-user" "$ROOT/dist-user"
+    mv "$ROOT/dist-user.new" "$ROOT/dist-user"
     for f in shadPS4.sh games.json README.md LICENSE VERSION; do
         [ -f "$src/$f" ] && put "$src/$f" "$ROOT/$f"
     done
     cp -a "$src/tools/." "$ROOT/tools/"
     chmod +x "$ROOT/shadPS4.sh" "$ROOT/app/usr/bin/shadps4"
     info "Updated to $tag (the previous build is in app.prev)"
+    rm -rf "$work"
     if [ "$YES" = 1 ]; then exec "$ROOT/shadPS4.sh" --setup -y; fi
     exec "$ROOT/shadPS4.sh" --setup
 }
@@ -356,7 +363,10 @@ run_emu() {
 }
 
 cd "$ROOT"
-[ -x "$EMU" ] || die "app/usr/bin/shadps4 is missing: extract the whole release folder"
+case "${1:-}" in
+-h | --help | --update) ;; # --update also repairs a folder whose app/ is missing
+*) [ -x "$EMU" ] || die "app/usr/bin/shadps4 is missing: extract the whole release folder" ;;
+esac
 case "${1:-}" in
 -h | --help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
 --setup) shift; [ "${1:-}" = -y ] && YES=1; setup ;;
