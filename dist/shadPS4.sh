@@ -78,6 +78,7 @@ install_defaults() {
             if [ ! -f "$U/$rel" ]; then put "$f" "$U/$rel"; elif ! cmp -s "$f" "$U/$rel"; then
                 put "$f" "$U/$rel.release"; fi ;;
         art/*) ;; # read in place by steam_shortcut
+        patches/shadPS4/files.json) ;; # merged by index_patches: other games' entries stay
         patches/*/*.xml)
             if [ -f "$U/$rel" ]; then
                 cp "$f" "$U/$rel.new" && py patches "$U/$rel.new" "$U/$rel" >/dev/null &&
@@ -90,7 +91,8 @@ install_defaults() {
 
 # Patch files ship in dist-user/patches (install_defaults); the emulator finds them by serial here.
 index_patches() {
-    py patch-index "$U/patches/shadPS4/files.json" "$ROOT/games.json"
+    py patch-index "$U/patches/shadPS4/files.json" "$ROOT/games.json" \
+        "$ROOT/dist-user/patches/shadPS4/files.json"
 }
 
 find_extractor() {
