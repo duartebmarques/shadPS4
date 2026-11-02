@@ -237,13 +237,19 @@ def patch_index(index, manifest, release=None):
     os.replace(index + ".tmp", index)
 
 def config_for(manifest, cfg_dir, title):
-    # Gives a region's title id the tuned settings of its game (custom_configs/<main id>.json).
-    import json, shutil
+    # Gives a region's title id the tuned settings of its game (custom_configs/<main id>.json),
+    # again when a release changes them (a changed copy is kept as .bak, as for the main id).
+    import filecmp, json, shutil
     dst = os.path.join(cfg_dir, title + ".json")
     for gid, g in json.load(open(manifest)).items():
         src = os.path.join(cfg_dir, gid + ".json")
-        if title in g["serials"] and not os.path.exists(dst) and os.path.isfile(src):
-            shutil.copy(src, dst)
+        if title in g["serials"] and title != gid and os.path.isfile(src):
+            if os.path.isfile(dst):
+                if filecmp.cmp(src, dst, shallow=False):
+                    return
+                shutil.copy(dst, dst + ".bak")
+            shutil.copy(src, dst + ".tmp")
+            os.replace(dst + ".tmp", dst)
 
 cmd, *args = sys.argv[1:]
 {"scan": scan, "patches": patches, "shortcut": shortcut, "latest": latest, "games": games,
