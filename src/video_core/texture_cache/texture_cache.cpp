@@ -263,7 +263,7 @@ bool TextureCache::DownloadImageInPlace(Image& image, std::span<vk::BufferImageC
     if (!phys || (*phys & 15) != 0) {
         return false;
     }
-    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    const auto chunk = Vulkan::GuestMemory::Find(*phys);
     if (!chunk || *phys + copy_size > chunk->phys + chunk->size) {
         return false;
     }
@@ -283,7 +283,7 @@ bool TextureCache::DownloadImageInPlace(Image& image, u32 download_size) {
     if (!phys || (*phys & 15) != 0) {
         return false;
     }
-    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    const auto chunk = Vulkan::GuestMemory::Find(*phys);
     if (!chunk || *phys + download_size > chunk->phys + chunk->size) {
         return false;
     }

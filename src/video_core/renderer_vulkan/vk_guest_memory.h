@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
@@ -36,8 +38,9 @@ bool Install(const Instance& instance, u32 arena_type_bits);
 /// Whether chunks were installed.
 bool Installed();
 
-/// The chunk holding direct memory offset `phys`, or null.
-const Chunk* Find(u64 phys);
+/// The chunk holding direct memory offset `phys`, if any. A copy: a chunk mapped later may
+/// move the list.
+std::optional<Chunk> Find(u64 phys);
 
 /// Bytes of direct memory held in chunks so far.
 u64 ChunkBytes();
