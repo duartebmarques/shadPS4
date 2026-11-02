@@ -391,7 +391,8 @@ public:
         DataSelect timestamp{};
         u32 timestamp_slot{};
         u64 timestamp_session{};
-        u64 seq{}; ///< Identifies its pending_labels_ entry.
+        u64 seq{};       ///< Identifies its pending_labels_ entry.
+        bool recorded{}; ///< Its tick is taken: later stream work is recorded after it.
     };
     /// Draw pipe recording thread: a WRITE_DATA or DMA_DATA packet handed over in order.
     void RunPipePm4(const u32* packet);
@@ -418,6 +419,8 @@ private:
     bool PendingLabelSatisfies(const PM4CmdWaitRegMem* wait);
     /// Adds a label to pending_labels_ and gives it its sequence number.
     void PushPendingLabel(FenceWrite& write);
+    /// Whether a recorded label that the CPU stores once its batch finished overlaps the range.
+    bool PendingCpuLabelOverlaps(VAddr address, u32 size);
 
     // Labels queued and not yet written, in stream order per thread; each write removes its own
     // entry. With the draw pipe, fences are queued at decode and WRITE_DATA at record time.
