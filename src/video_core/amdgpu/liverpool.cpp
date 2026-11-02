@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <optional>
@@ -256,8 +257,7 @@ void Liverpool::QueueHonestSignal(std::optional<FenceWrite> write,
         }
     }
     if (write && !label_queued) {
-        std::scoped_lock lk{pending_labels_mutex_};
-        pending_labels_.push_back(*write);
+        PushPendingLabel(*write);
     }
     honest_signal_tick_.store(tick, std::memory_order_release);
     rasterizer->DeferAfterTick(tick, [this, write, irq] mutable {
@@ -274,9 +274,11 @@ void Liverpool::QueueHonestSignal(std::optional<FenceWrite> write,
         }
         WriteFenceLabel(write);
         if (write) {
-            // Completion callbacks run in queue order, so this label is the oldest one.
             std::scoped_lock lk{pending_labels_mutex_};
-            pending_labels_.pop_front();
+            const auto it = std::ranges::find(pending_labels_, write->seq, &FenceWrite::seq);
+            if (it != pending_labels_.end()) {
+                pending_labels_.erase(it);
+            }
         }
         if (irq) {
             Platform::IrqC::Instance()->Signal(*irq);
@@ -331,8 +333,7 @@ void Liverpool::HonestFence(std::optional<FenceWrite> write,
     if (draw_pipe && pipe_fences_) {
         // The label is pending from here, so a wait on it is met in stream order.
         if (write) {
-            std::scoped_lock lk{pending_labels_mutex_};
-            pending_labels_.push_back(*write);
+            PushPendingLabel(*write);
         }
         rasterizer->QueueFence(write, irq);
         return;
@@ -344,6 +345,12 @@ void Liverpool::HonestFence(std::optional<FenceWrite> write,
 void Liverpool::RunPipeFence(std::optional<FenceWrite> write,
                              std::optional<Platform::InterruptId> irq) {
     QueueHonestSignal(write, irq, true);
+}
+
+void Liverpool::PushPendingLabel(FenceWrite& write) {
+    std::scoped_lock lk{pending_labels_mutex_};
+    write.seq = ++next_label_seq_;
+    pending_labels_.push_back(write);
 }
 
 bool Liverpool::PendingLabelSatisfies(const PM4CmdWaitRegMem* wait) {
