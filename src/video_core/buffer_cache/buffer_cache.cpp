@@ -941,7 +941,7 @@ u64 BufferCache::InPlaceRun(u64 block, u64 end, vk::DeviceMemory* out_memory,
     if (!phys || (*phys & (block_size - 1)) != 0) {
         return 0;
     }
-    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    const auto chunk = Vulkan::GuestMemory::Find(*phys);
     if (!chunk || *phys + block_size > chunk->phys + chunk->size) {
         return 0;
     }
