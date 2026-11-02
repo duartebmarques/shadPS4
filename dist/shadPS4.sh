@@ -342,13 +342,15 @@ play() {
 # Copies the saves to user/save-backups/<date> before each run (unchanged saves are not copied
 # again) and keeps the last 20, so an overwritten save can be put back.
 backup_saves() {
-    local src="$U/home/1000/savedata" dir="$U/save-backups" last
+    local src="$U/home/1000/savedata" dir="$U/save-backups" last all
     [ -d "$src" ] || return 0
     mkdir -p "$dir"
     last="$(ls -1d "$dir"/*/ 2>/dev/null | tail -1 || true)"
     [ -n "$last" ] && diff -rq "$src" "$last" >/dev/null 2>&1 && return 0
     cp -a "$src" "$dir/$(date +%Y-%m-%d_%H%M%S)" || { warn "save backup failed"; return 0; }
-    ls -1d "$dir"/*/ | head -n -20 | xargs -r rm -rf
+    # A glob, not ls | xargs: the app folder can have spaces or quotes (~/My Games).
+    all=("$dir"/*/)
+    [ "${#all[@]}" -le 20 ] || rm -rf -- "${all[@]:0:${#all[@]}-20}"
 }
 
 # An executable user/session-hook (optional, e.g. a play recorder) is started detached for each run,
