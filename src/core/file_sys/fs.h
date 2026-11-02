@@ -100,9 +100,11 @@ public:
     void InvalidateCache(std::string_view guest_path = "");
     // Mounts are returned by value: another thread can mount or unmount while the caller uses it.
     std::optional<MntPair> GetMountFromHostPath(const std::string& host_path) {
+        const auto host_norm = std::filesystem::path(host_path).generic_string();
         std::scoped_lock lock{m_mutex};
         const auto it = std::ranges::find_if(m_mnt_pairs, [&](const MntPair& mount) {
-            return host_path.starts_with(std::string{fmt::UTF(mount.host_path.u8string()).data});
+            const auto mnt_host = mount.host_path.generic_string();
+            return host_norm == mnt_host || host_norm.starts_with(mnt_host + "/");
         });
         return it == m_mnt_pairs.end() ? std::nullopt : std::optional<MntPair>{*it};
     }
