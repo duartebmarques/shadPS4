@@ -212,14 +212,28 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     ASSERT(copy_size <= image.info.guest_size);
     if (!image.info.props.is_tiled && DownloadImageInPlace(image, buffer_copies, copy_size)) {
         const auto bump = [] { Skipcache::Framework::Instance().BumpMemGen(); };
+        const auto unmark = [this, image_addr, copy_size] {
+            buffer_cache.UnmarkRegionAsGpuModified(image_addr, copy_size, true);
+        };
         if (is_sync) {
             const u64 t0 = Common::FencedRDTSC();
             scheduler.Finish();
             scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage,
                                  Common::FencedRDTSC() - t0);
             bump();
+            if (discard_buffer_cache) {
+                unmark();
+            }
         } else {
             scheduler.DeferPriorityOperation(bump);
+            if (discard_buffer_cache) {
+                // As in the staging path: on the queue the GC drains before it deletes the image.
+                if (is_priority) {
+                    scheduler.DeferPriorityOperation(unmark);
+                } else {
+                    scheduler.DeferOperation(unmark);
+                }
+            }
         }
         return;
     }
