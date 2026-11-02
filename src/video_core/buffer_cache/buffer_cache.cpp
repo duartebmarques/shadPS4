@@ -992,7 +992,10 @@ void BufferCache::ProcessPendingUnmaps() {
                 ++run_end;
             }
             // The blocks get rebound to whatever is mapped there at their next use.
-            resident_ranges.Subtract(block, run_end);
+            {
+                std::scoped_lock lk{arena_mutex};
+                resident_ranges.Subtract(block, run_end);
+            }
             released = true;
             block = run_end;
         }
