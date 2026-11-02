@@ -160,9 +160,12 @@ void ReadbackLanes::Process(Lane& lane, Job& job) {
     {
         // Without a transfer family the lanes share the scheduler's graphics queue, whose submits
         // take the scheduler's submit lock.
+        // The submit thread (async_submit) holds only queue_mutex for its graphics submits.
         std::unique_lock lk{Vulkan::Scheduler::submit_mutex, std::defer_lock};
+        std::unique_lock queue_lk{Vulkan::Scheduler::queue_mutex, std::defer_lock};
         if (instance.GetCopyQueues().empty()) {
             lk.lock();
+            queue_lk.lock();
         }
         Vulkan::Check(lane.queue.submit(submit_info));
     }
