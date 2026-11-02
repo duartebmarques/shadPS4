@@ -888,6 +888,10 @@ bool BufferCache::NoteCpWrite(VAddr device_addr, u64 size) {
 
 std::optional<std::pair<const Buffer*, u64>> BufferCache::TryInPlaceRead(VAddr device_addr,
                                                                          u32 size) {
+    // A block unmapped since its bind still has its bit and its old chunk binding.
+    if (has_pending_unmaps.load(std::memory_order_acquire)) {
+        ProcessPendingUnmaps();
+    }
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     if (IsCpWritten(first_block, last_block)) {
