@@ -391,6 +391,7 @@ public:
         DataSelect timestamp{};
         u32 timestamp_slot{};
         u64 timestamp_session{};
+        u64 seq{}; ///< Identifies its pending_labels_ entry.
     };
     /// Draw pipe recording thread: a WRITE_DATA or DMA_DATA packet handed over in order.
     void RunPipePm4(const u32* packet);
@@ -415,10 +416,14 @@ private:
     /// Whether a queued, not yet written label will make the wait pass (the GPU runs the queues
     /// in recording order, so the wait is met by stream order).
     bool PendingLabelSatisfies(const PM4CmdWaitRegMem* wait);
+    /// Adds a label to pending_labels_ and gives it its sequence number.
+    void PushPendingLabel(FenceWrite& write);
 
-    // Labels queued and not yet written, oldest first; their writes pop them in order.
+    // Labels queued and not yet written, in stream order per thread; each write removes its own
+    // entry. With the draw pipe, fences are queued at decode and WRITE_DATA at record time.
     std::mutex pending_labels_mutex_;
     std::deque<FenceWrite> pending_labels_;
+    u64 next_label_seq_{};
     // Tick of the newest queued honest signal.
     std::atomic<u64> honest_signal_tick_{};
     // SHADPS4_PIPE_FENCES: fences, WRITE_DATA and DMA_DATA run in order on the draw pipe.
