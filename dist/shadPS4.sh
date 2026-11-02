@@ -53,6 +53,8 @@ put() {
     mv -f "$2.new.$$" "$2"
 }
 
+steam_deck() { [ "$(cat /sys/devices/virtual/dmi/id/board_vendor 2>/dev/null)" = Valve ]; }
+
 running() {
     local exe
     for exe in /proc/[0-9]*/exe; do
@@ -75,8 +77,14 @@ install_defaults() {
             if [ -f "$U/$rel" ] && ! cmp -s "$f" "$U/$rel"; then cp "$U/$rel" "$U/$rel.bak"; fi
             put "$f" "$U/$rel" ;;
         input_config/*)
+            if [ "$rel" = input_config/default.ini ] && ! steam_deck; then
+                # A pad on a PC presses the touchpad with back/share; a Deck has its trackpads.
+                cat "$f" - >"$U/.default.ini.pc" <<<'touchpad_center = back'
+                f="$U/.default.ini.pc"
+            fi
             if [ ! -f "$U/$rel" ]; then put "$f" "$U/$rel"; elif ! cmp -s "$f" "$U/$rel"; then
-                put "$f" "$U/$rel.release"; fi ;;
+                put "$f" "$U/$rel.release"; fi
+            rm -f "$U/.default.ini.pc" ;;
         art/*) ;; # read in place by steam_shortcut
         patches/shadPS4/files.json) ;; # merged by index_patches: other games' entries stay
         patches/*/*.xml)
