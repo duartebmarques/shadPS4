@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -197,12 +198,9 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
 
-    backing = &backing_images.emplace_back();
-    backing->num_samples = info.num_samples;
+    backing = &AddBacking(image_ci, info.num_samples);
     backing_num_samples = info.num_samples;
     backing_epoch = backing->state_epoch;
-    backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-    backing->image.Create(image_ci);
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
@@ -213,17 +211,37 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
 Image::~Image() = default;
 
+Image::BackingImage& Image::AddBacking(const vk::ImageCreateInfo& create_info, u32 num_samples) {
+    const auto previous_size = memory_usage_counter ? Common::AlignUp(SizeBytes(), 1024) : 0;
+    const size_t backing_index = backing ? backing - backing_images.data() : 0;
+    auto& added_backing = backing_images.emplace_back();
+    backing = &backing_images[backing_index];
+
+    const auto& instance = runtime->GetInstance();
+    added_backing.num_samples = num_samples;
+    added_backing.image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+    added_backing.image.Create(create_info);
+    if (memory_usage_counter) {
+        *memory_usage_counter += Common::AlignUp(SizeBytes(), 1024) - previous_size;
+    }
+    return added_backing;
+}
+
 ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_samples) {
     if (ensure_guest_samples && backing_num_samples > 1 != info.num_samples > 1) {
         runtime->SetBackingSamples(this, info.num_samples);
     }
-    const auto& records = backing->view_records;
+    return FindView(view_info, *backing);
+}
+
+ImageView& Image::FindView(const ImageViewInfo& view_info, BackingImage& view_backing) {
+    const auto& records = view_backing.view_records;
     for (size_t i = 0; i < records.size(); ++i) {
         if (records[i].info == view_info) {
-            return (*slot_image_views)[backing->image_view_ids[i]];
+            return (*slot_image_views)[view_backing.image_view_ids[i]];
         }
     }
-    return (*slot_image_views)[InsertView(view_info)];
+    return (*slot_image_views)[InsertView(view_info, view_backing)];
 }
 
 vk::ImageView Image::FindViewHandle(const ImageViewInfo& view_info, bool ensure_guest_samples) {
@@ -236,38 +254,41 @@ vk::ImageView Image::FindViewHandle(const ImageViewInfo& view_info, bool ensure_
             return records[i].handle;
         }
     }
-    InsertView(view_info);
+    InsertView(view_info, *backing);
     return backing->view_records.back().handle;
 }
 
-SHAD_NO_INLINE ImageViewId Image::InsertView(const ImageViewInfo& view_info) {
-    const auto view_id = slot_image_views->Insert(runtime->GetInstance(), view_info, *this);
+SHAD_NO_INLINE ImageViewId Image::InsertView(const ImageViewInfo& view_info,
+                                             BackingImage& view_backing) {
+    const auto view_id = slot_image_views->Insert(runtime->GetInstance(), view_info, *this,
+                                                  view_backing.image.image);
     // Handle read through the slot AFTER the insert: a reserve inside it can
     // move every ImageView. The two pushes stay adjacent (lockstep contract).
     const vk::ImageView handle = *(*slot_image_views)[view_id].image_view;
-    backing->view_records.push_back(BackingImage::ViewRecord{view_info, handle});
-    backing->image_view_ids.emplace_back(view_id);
+    view_backing.view_records.push_back(BackingImage::ViewRecord{view_info, handle});
+    view_backing.image_view_ids.emplace_back(view_id);
     return view_id;
 }
 
-void Image::RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                              vk::PipelineStageFlags2 dst_stage,
+void Image::RecordNoopBarrier(BackingImage& image_backing, vk::ImageLayout dst_layout,
+                              vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
                               const std::optional<SubresourceRange>& subres_range) {
-    backing->noop_epoch = backing->state_epoch;
-    backing->noop_layout = dst_layout;
-    backing->noop_access = dst_mask;
-    backing->noop_stage = dst_stage;
-    backing->noop_range = RangeKey(subres_range);
+    image_backing.noop_epoch = image_backing.state_epoch;
+    image_backing.noop_layout = dst_layout;
+    image_backing.noop_access = dst_mask;
+    image_backing.noop_stage = dst_stage;
+    image_backing.noop_range = RangeKey(subres_range);
 }
 
-void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
-                            vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
+void Image::GetBarriersSlow(Barriers& barriers, BackingImage& image_backing,
+                            vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                            vk::PipelineStageFlags2 dst_stage,
                             std::optional<SubresourceRange> subres_range) {
     // The runtime accumulates barriers across images, so this call's own
     // output is what it appends past the entry size.
     const size_t num_barriers_in = barriers.size();
-    auto& last_state = backing->state;
-    auto& subresource_states = backing->subresource_states;
+    auto& last_state = image_backing.state;
+    auto& subresource_states = image_backing.subresource_states;
 
     const bool needs_partial_transition =
         subres_range &&
@@ -278,11 +299,11 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
     // instead of scanning every mip x layer on each call. Entries may still
     // differ in pipeline stage; the union keeps the next full-resource
     // barrier's source stage a superset of every entry's.
-    if (partially_transited && backing->subres_divergent == 0) {
-        last_state.pl_stage |= backing->subres_stage_union;
+    if (partially_transited && image_backing.subres_divergent == 0) {
+        last_state.pl_stage |= image_backing.subres_stage_union;
         subresource_states.clear();
-        backing->subres_stage_union = {};
-        BumpStateEpoch();
+        image_backing.subres_stage_union = {};
+        BumpStateEpoch(image_backing);
         partially_transited = false;
     }
     // A partial transition into the state the whole image is already in would
@@ -293,7 +314,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
                                  vk::AccessFlagBits2::eMemoryWrite;
     if (needs_partial_transition && !partially_transited && last_state.layout == dst_layout &&
         last_state.access_mask == dst_mask && !(last_state.access_mask & write_flags)) {
-        RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
+        RecordNoopBarrier(image_backing, dst_layout, dst_mask, dst_stage, subres_range);
         return;
     }
     // The inline GetBarriers has already probed BarriersNoop; the collapse
@@ -304,8 +325,8 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
         if (!partially_transited) {
             subresource_states.resize(info.resources.levels * info.resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
-            backing->subres_divergent = 0;
-            backing->subres_stage_union = last_state.pl_stage;
+            image_backing.subres_divergent = 0;
+            image_backing.subres_stage_union = last_state.pl_stage;
         }
         const State base_state = last_state;
         const bool dst_divergent =
@@ -341,7 +362,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
                         .newLayout = dst_layout,
                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .image = GetImage(),
+                        .image = image_backing.image.image,
                         .subresourceRange{
                             .aspectMask = aspect_mask,
                             .baseMipLevel = mip,
@@ -352,7 +373,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
                     });
                     const bool was_divergent = state.layout != base_state.layout ||
                                                state.access_mask != base_state.access_mask;
-                    backing->subres_divergent +=
+                    image_backing.subres_divergent +=
                         static_cast<u32>(dst_divergent) - static_cast<u32>(was_divergent);
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
@@ -362,22 +383,22 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
         }
 
         if (barriers.size() != num_barriers_in) {
-            backing->subres_stage_union |= dst_stage;
-            BumpStateEpoch();
+            image_backing.subres_stage_union |= dst_stage;
+            BumpStateEpoch(image_backing);
             Skipcache::Framework::Instance().BumpLayoutGen();
         }
 
         if (!needs_partial_transition) {
             // The loop unified every entry; the tail writes last_state to that state.
             subresource_states.clear();
-            backing->subres_divergent = 0;
-            backing->subres_stage_union = {};
-            BumpStateEpoch();
+            image_backing.subres_divergent = 0;
+            image_backing.subres_stage_union = {};
+            BumpStateEpoch(image_backing);
         }
     } else { // Full resource transition
         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
         if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
-            RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
+            RecordNoopBarrier(image_backing, dst_layout, dst_mask, dst_stage, subres_range);
             return;
         }
         barriers.emplace_back(vk::ImageMemoryBarrier2{
@@ -389,7 +410,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
             .newLayout = dst_layout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = GetImage(),
+            .image = image_backing.image.image,
             .subresourceRange{
                 .aspectMask = aspect_mask,
                 .baseMipLevel = 0,
@@ -403,12 +424,12 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
     if (barriers.size() == num_barriers_in && had_subres == !subresource_states.empty()) {
         // No work was needed and the structure is as it was: the answer is
         // reproducible until the state epoch moves.
-        RecordNoopBarrier(dst_layout, dst_mask, dst_stage, subres_range);
+        RecordNoopBarrier(image_backing, dst_layout, dst_mask, dst_stage, subres_range);
         return;
     }
     if (last_state.layout != dst_layout || last_state.access_mask != dst_mask ||
         last_state.pl_stage != dst_stage) {
-        BumpStateEpoch();
+        BumpStateEpoch(image_backing);
     }
     // subres_divergent is counted against last_state; a partial transition
     // moves it while the vector stays alive, so recount against the new base.
@@ -418,7 +439,7 @@ void Image::GetBarriersSlow(Barriers& barriers, vk::ImageLayout dst_layout,
         for (const State& s : subresource_states) {
             divergent += static_cast<u32>(s.layout != dst_layout || s.access_mask != dst_mask);
         }
-        backing->subres_divergent = divergent;
+        image_backing.subres_divergent = divergent;
     }
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
