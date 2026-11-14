@@ -512,10 +512,11 @@ constexpr std::array kDynRegBlocks = {
 // compare the bits they read themselves, so a change elsewhere in the two
 // words moves neither cache.
 constexpr std::array kRtRegBlocks = {
-    DYN_REG_BLOCK(color_buffers),         DYN_REG_BLOCK(color_target_mask),
-    DYN_REG_BLOCK(depth_buffer),          DYN_REG_BLOCK(depth_view),
-    DYN_REG_BLOCK(depth_htile_data_base), DYN_REG_BLOCK(depth_render_control),
-    DYN_REG_BLOCK(depth_clear),           DYN_REG_BLOCK(stencil_clear),
+    DYN_REG_BLOCK(color_buffers),        DYN_REG_BLOCK(color_target_mask),
+    DYN_REG_BLOCK(color_shader_mask),    DYN_REG_BLOCK(depth_buffer),
+    DYN_REG_BLOCK(depth_view),           DYN_REG_BLOCK(depth_htile_data_base),
+    DYN_REG_BLOCK(depth_render_control), DYN_REG_BLOCK(depth_clear),
+    DYN_REG_BLOCK(stencil_clear),
 };
 #undef DYN_REG_BLOCK
 consteval bool RegBlocksInRange(const auto& blocks) {
