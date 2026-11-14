@@ -77,9 +77,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        # ubuntu-latest (26.04, 11-14): CMake cannot find libc++'s std.compat.cppm there (upstream CI fails too).
+        os: [ubuntu-24.04]
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             compiler_cxx: clang++
             compiler_c: clang
 
