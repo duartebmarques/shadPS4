@@ -866,7 +866,7 @@ SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __re
                                                         u64* diff) const {
     const auto& regs = rasterizer.SelectRegs();
     u32 n = 0;
-    // Two accumulators: a single OR chain over up to 61 words is a latency
+    // Two accumulators: a single OR chain over up to 67 words is a latency
     // chain the core cannot overlap. Words are read from the source through
     // memcpy, never through an aliasing pointer, so padding reaches the entry
     // exactly as the block copy wrote it.
@@ -929,6 +929,11 @@ SHAD_NO_INLINE u32 PipelineCache::SnapshotRuntimeInputs(HwStage stage, u32* __re
         put(regs.clipper_control);
         put(regs.stage_enable);
         put(regs.vs_output_control);
+        put(regs.aa_mask);
+        put(regs.alpha_to_mask);
+        put(regs.depth_eqaa);
+        put(regs.color_export_format);
+        put(regs.color_shader_mask);
         put(graphics_key.color_buffers);
         const u32 count = std::min<u32>(num_interp, static_cast<u32>(regs.ps_inputs.size()));
         put_words(regs.ps_inputs.data(), count);
