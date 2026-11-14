@@ -13,7 +13,7 @@ chmod a+x "$appimage"
 (cd "$stage" && "$appimage" --appimage-extract >/dev/null)
 mv "$stage/squashfs-root" "$dir/app"
 cp -r "$repo/dist/user" "$dir/dist-user"
-cp -r "$repo/dist/tools" "$dir/tools"
+mkdir -p "$dir/tools" && cp "$repo/dist/tools/sp4.py" "$dir/tools/"
 cp "$repo/dist/shadPS4.sh" "$repo/dist/games.json" "$repo/dist/install.sh" "$repo/LICENSE" \
     "$repo/README.md" "$dir/"
 echo "$tag" > "$dir/VERSION"
