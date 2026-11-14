@@ -17,6 +17,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
                                  Rasterizer& rasterizer) {
     auto& runtime = rasterizer.GetRuntime();
     auto& buffer_cache = rasterizer.GetBufferCache();
+    auto& scheduler = rasterizer.GetScheduler();
 
     // Copy shader defines three formatted buffers as inputs: control, source, and destination.
     const auto ctl_buf_sharp = info.buffers[0].GetSharp(info);
@@ -39,12 +40,23 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     static std::vector<vk::BufferCopy> copies;
     copies.clear();
     copies.reserve(cs_program.dim_x);
+    static std::vector<std::pair<VAddr, u32>> written;
+    written.clear();
+    u64 batch_tick = 0;
 
+    // The destinations are stamped when obtained; a flush before their copies are recorded
+    // leaves those stamps one batch early.
     const auto do_copies = [&]() {
         if (!copies.empty()) {
             runtime.CopyBuffer(last_src_buf, last_dst_buf, copies);
             copies.clear();
         }
+        if (scheduler.CurrentTick() != batch_tick) {
+            for (const auto& [addr, size] : written) {
+                buffer_cache.RestampWrite(addr, size);
+            }
+        }
+        written.clear();
     };
 
     for (u32 i = 0; i < cs_program.dim_x; i++) {
@@ -52,6 +64,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         const u32 local_dst_offset = dst_idx * buf_stride;
         const u32 local_src_offset = src_idx * buf_stride;
         const u32 local_size = (end + 1) * buf_stride;
+        const u64 obtain_tick = scheduler.CurrentTick();
 
         const auto [src_buf, src_buf_offset] =
             buffer_cache.ObtainBuffer(src_buf_sharp.base_address + local_src_offset, local_size);
@@ -65,7 +78,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             last_dst_buf = dst_buf;
         }
 
+        if (written.empty()) {
+            batch_tick = obtain_tick;
+        }
         copies.emplace_back(src_buf_offset, dst_buf_offset, local_size);
+        written.emplace_back(dst_buf_sharp.base_address + local_dst_offset, local_size);
     }
     do_copies();
 

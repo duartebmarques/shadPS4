@@ -158,6 +158,10 @@ public:
     /// readback consumed between its binds and its record.
     void RestampGpuWrite(VAddr device_addr, u64 size);
 
+    /// Moves a write obtained with IsWritten into the open batch after a flush came between the
+    /// obtain and the record. In-place blocks only renew their write ticks.
+    void RestampWrite(VAddr device_addr, u64 size);
+
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
 

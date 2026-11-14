@@ -676,6 +676,16 @@ void BufferCache::RestampGpuWrite(VAddr device_addr, u64 size) {
     memory_tracker->MarkRegionAsGpuModified(device_addr, size);
 }
 
+void BufferCache::RestampWrite(VAddr device_addr, u64 size) {
+    if (!in_place) {
+        RestampGpuWrite(device_addr, size);
+        return;
+    }
+    NoteInPlaceWrite(device_addr, size);
+    ForEachNotInPlace(device_addr, size,
+                      [&](VAddr addr, u64 part) { RestampGpuWrite(addr, part); });
+}
+
 void BufferCache::ReadEdgeImagePages(const Image& image) {
     // May happen that after downloading the image and invalidating region,
     // that there were GPU modified ranges that are lost due to CPU reuploading.
