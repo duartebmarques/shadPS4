@@ -294,6 +294,8 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
 }
 
 bool MustKeepDrawing() {
+    // Called on the vblank thread: the presenting thread changes `layers` under this lock.
+    std::scoped_lock lock{change_layers_mutex};
     return std::ranges::any_of(layers, [](Layer* layer) { return layer->ShouldKeepDrawing(); }) ||
            change_layers.size() > 1;
 }

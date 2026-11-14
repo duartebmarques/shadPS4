@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <optional>
@@ -256,8 +257,14 @@ void Liverpool::QueueHonestSignal(std::optional<FenceWrite> write,
         }
     }
     if (write && !label_queued) {
+        write->recorded = true;
+        PushPendingLabel(*write);
+    } else if (write) {
         std::scoped_lock lk{pending_labels_mutex_};
-        pending_labels_.push_back(*write);
+        const auto it = std::ranges::find(pending_labels_, write->seq, &FenceWrite::seq);
+        if (it != pending_labels_.end()) {
+            it->recorded = true;
+        }
     }
     honest_signal_tick_.store(tick, std::memory_order_release);
     rasterizer->DeferAfterTick(tick, [this, write, irq] mutable {
@@ -274,9 +281,11 @@ void Liverpool::QueueHonestSignal(std::optional<FenceWrite> write,
         }
         WriteFenceLabel(write);
         if (write) {
-            // Completion callbacks run in queue order, so this label is the oldest one.
             std::scoped_lock lk{pending_labels_mutex_};
-            pending_labels_.pop_front();
+            const auto it = std::ranges::find(pending_labels_, write->seq, &FenceWrite::seq);
+            if (it != pending_labels_.end()) {
+                pending_labels_.erase(it);
+            }
         }
         if (irq) {
             Platform::IrqC::Instance()->Signal(*irq);
@@ -331,8 +340,7 @@ void Liverpool::HonestFence(std::optional<FenceWrite> write,
     if (draw_pipe && pipe_fences_) {
         // The label is pending from here, so a wait on it is met in stream order.
         if (write) {
-            std::scoped_lock lk{pending_labels_mutex_};
-            pending_labels_.push_back(*write);
+            PushPendingLabel(*write);
         }
         rasterizer->QueueFence(write, irq);
         return;
@@ -344,6 +352,20 @@ void Liverpool::HonestFence(std::optional<FenceWrite> write,
 void Liverpool::RunPipeFence(std::optional<FenceWrite> write,
                              std::optional<Platform::InterruptId> irq) {
     QueueHonestSignal(write, irq, true);
+}
+
+void Liverpool::PushPendingLabel(FenceWrite& write) {
+    std::scoped_lock lk{pending_labels_mutex_};
+    write.seq = ++next_label_seq_;
+    pending_labels_.push_back(write);
+}
+
+bool Liverpool::PendingCpuLabelOverlaps(VAddr address, u32 size) {
+    std::scoped_lock lk{pending_labels_mutex_};
+    return std::ranges::any_of(pending_labels_, [&](const FenceWrite& label) {
+        return label.cpu_write && label.recorded && label.address < address + size &&
+               address < label.address + label.num_bytes;
+    });
 }
 
 bool Liverpool::PendingLabelSatisfies(const PM4CmdWaitRegMem* wait) {
@@ -525,17 +547,34 @@ SHAD_FORCE_INLINE static void CpWriteOrCopy(Vulkan::Rasterizer* rasterizer, void
 
 void Liverpool::WriteData(const PM4CmdWriteData* write_data, u32 data_size) {
     const VAddr address = write_data->Address<u64>();
+    // An earlier label is stored on the CPU once its batch finished, after this write: the value
+    // is stored again behind it so the newer one stays.
+    const bool behind_label = honest_fences_ && rasterizer && data_size <= sizeof(u64) &&
+                              PendingCpuLabelOverlaps(address, data_size);
+    u64 value = 0;
+    if (data_size <= sizeof(u64)) {
+        std::memcpy(&value, write_data->data, data_size);
+    }
+    if (behind_label) {
+        static std::atomic<u64> rewrites{};
+        const u64 n = ++rewrites;
+        if ((n & (n - 1)) == 0) {
+            LOG_INFO(Render, "WRITE_DATA {:#x} stored again behind a pending label ({} so far)",
+                     address, n);
+        }
+    }
     if (honest_fences_ && rasterizer &&
         rasterizer->WriteDataOnGpu(address, write_data->data, data_size)) {
         if (data_size <= sizeof(u64)) {
             // The CP may poll it next: met in stream order, like a queued label.
-            u64 value = 0;
-            std::memcpy(&value, write_data->data, data_size);
-            QueueHonestSignal(FenceWrite{address, value, data_size, false}, std::nullopt);
+            QueueHonestSignal(FenceWrite{address, value, data_size, behind_label}, std::nullopt);
         }
         return;
     }
     CpWriteOrCopy(rasterizer, write_data->Address<void*>(), write_data->data, data_size);
+    if (behind_label) {
+        QueueHonestSignal(FenceWrite{address, value, data_size}, std::nullopt);
+    }
 }
 
 void Liverpool::RunDmaData(const PM4DmaData* dma_data) {

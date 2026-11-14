@@ -219,23 +219,37 @@ def config_add_dir(cfg, path):
         json.dump(c, open(tmp, "w"), indent=4)
         os.replace(tmp, cfg)
 
-def patch_index(index, manifest):
-    # Lists each game's patch file under all its serials in the patch folder's files.json.
+def patch_index(index, manifest, release=None):
+    # Lists each game's patch file under all its serials in the patch folder's files.json, and
+    # the entries of the release's index; entries of other games stay.
     import json
-    idx = json.load(open(index)) if os.path.isfile(index) else {}
+    try:
+        idx = json.load(open(index)) if os.path.isfile(index) else {}
+    except ValueError:
+        idx = {}
+    add = json.load(open(release)) if release and os.path.isfile(release) else {}
     for g in json.load(open(manifest)).values():
         if g.get("patch_file"):
-            idx[g["patch_file"]] = sorted(set(idx.get(g["patch_file"], [])) | set(g["serials"]))
-    json.dump(idx, open(index, "w"), indent=2)
+            add[g["patch_file"]] = add.get(g["patch_file"], []) + g["serials"]
+    for name, serials in add.items():
+        idx[name] = sorted(set(idx.get(name, [])) | set(serials))
+    json.dump(idx, open(index + ".tmp", "w"), indent=2)
+    os.replace(index + ".tmp", index)
 
 def config_for(manifest, cfg_dir, title):
-    # Gives a region's title id the tuned settings of its game (custom_configs/<main id>.json).
-    import json, shutil
+    # Gives a region's title id the tuned settings of its game (custom_configs/<main id>.json),
+    # again when a release changes them (a changed copy is kept as .bak, as for the main id).
+    import filecmp, json, shutil
     dst = os.path.join(cfg_dir, title + ".json")
     for gid, g in json.load(open(manifest)).items():
         src = os.path.join(cfg_dir, gid + ".json")
-        if title in g["serials"] and not os.path.exists(dst) and os.path.isfile(src):
-            shutil.copy(src, dst)
+        if title in g["serials"] and title != gid and os.path.isfile(src):
+            if os.path.isfile(dst):
+                if filecmp.cmp(src, dst, shallow=False):
+                    return
+                shutil.copy(dst, dst + ".bak")
+            shutil.copy(src, dst + ".tmp")
+            os.replace(dst + ".tmp", dst)
 
 cmd, *args = sys.argv[1:]
 {"scan": scan, "patches": patches, "shortcut": shortcut, "latest": latest, "games": games,

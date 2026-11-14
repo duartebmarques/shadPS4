@@ -220,15 +220,17 @@ bool Installed() {
     return installed;
 }
 
-const Chunk* Find(u64 phys) {
+std::optional<Chunk> Find(u64 phys) {
     std::shared_lock lk{mutex};
     const auto it = std::ranges::upper_bound(chunks, phys, {}, &Chunk::phys);
     if (it == chunks.begin()) {
-        return nullptr;
+        return std::nullopt;
     }
     const Chunk& chunk = *std::prev(it);
-    // Chunks are never destroyed once mapped, so the pointer stays valid.
-    return phys < chunk.phys + chunk.size ? &chunk : nullptr;
+    if (phys >= chunk.phys + chunk.size) {
+        return std::nullopt;
+    }
+    return chunk;
 }
 
 u64 ChunkBytes() {

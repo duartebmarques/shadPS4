@@ -141,6 +141,9 @@ TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
     std::unique_lock lk{download_images_mutex};
+    if (download_images.empty()) {
+        return;
+    }
     if (readback_linear_images_async) {
         bool recorded = false;
         for (const ImageId image_id : download_images) {
@@ -163,9 +166,15 @@ void TextureCache::ProcessDownloadImages() {
         return;
     }
     for (const ImageId image_id : download_images) {
-        DownloadImageMemory(image_id, DownloadMemoryFlags::Sync);
+        DownloadImageMemory(image_id);
     }
     download_images.clear();
+    const u64 t0 = Common::FencedRDTSC();
+    scheduler.Finish();
+    scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage, Common::FencedRDTSC() - t0);
+    scheduler.PopPendingOperations();
+    // In-place downloads defer their bump to the priority thread; the memory is final here.
+    Skipcache::Framework::Instance().BumpMemGen();
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags flags) {
@@ -212,14 +221,28 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
     ASSERT(copy_size <= image.info.guest_size);
     if (!image.info.props.is_tiled && DownloadImageInPlace(image, buffer_copies, copy_size)) {
         const auto bump = [] { Skipcache::Framework::Instance().BumpMemGen(); };
+        const auto unmark = [this, image_addr, copy_size] {
+            buffer_cache.UnmarkRegionAsGpuModified(image_addr, copy_size, true);
+        };
         if (is_sync) {
             const u64 t0 = Common::FencedRDTSC();
             scheduler.Finish();
             scheduler.RecordWait(Vulkan::Scheduler::WaitSite::DownloadImage,
                                  Common::FencedRDTSC() - t0);
             bump();
+            if (discard_buffer_cache) {
+                unmark();
+            }
         } else {
             scheduler.DeferPriorityOperation(bump);
+            if (discard_buffer_cache) {
+                // As in the staging path: on the queue the GC drains before it deletes the image.
+                if (is_priority) {
+                    scheduler.DeferPriorityOperation(unmark);
+                } else {
+                    scheduler.DeferOperation(unmark);
+                }
+            }
         }
         return;
     }
@@ -263,7 +286,7 @@ bool TextureCache::DownloadImageInPlace(Image& image, std::span<vk::BufferImageC
     if (!phys || (*phys & 15) != 0) {
         return false;
     }
-    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    const auto chunk = Vulkan::GuestMemory::Find(*phys);
     if (!chunk || *phys + copy_size > chunk->phys + chunk->size) {
         return false;
     }
@@ -283,7 +306,7 @@ bool TextureCache::DownloadImageInPlace(Image& image, u32 download_size) {
     if (!phys || (*phys & 15) != 0) {
         return false;
     }
-    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    const auto chunk = Vulkan::GuestMemory::Find(*phys);
     if (!chunk || *phys + download_size > chunk->phys + chunk->size) {
         return false;
     }
@@ -441,18 +464,25 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+    // Mark the image at the written address, then follow images stored right after it
+    // (e.g. the chroma planes after a luma plane).
     bool marked = false;
-    ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
-        // Only consider images that match base address.
-        // TODO: Maybe also consider subresources
-        if (image.info.guest_address != address) {
-            return;
-        }
-        // Ensure image is reuploaded when accessed again.
-        image.flags |= ImageFlagBits::GpuDirty;
-        image.MarkFastStateDirty();
-        marked = true;
-    });
+    const VAddr end = address + max_size;
+    VAddr next = address;
+    while (next < end) {
+        VAddr next_end = 0;
+        ForEachImageWithAddress(next, [&](ImageId image_id, Image& image) {
+            if (image.info.guest_address != next) {
+                return;
+            }
+            // Ensure image is reuploaded when accessed again.
+            image.flags |= ImageFlagBits::GpuDirty;
+            image.MarkFastStateDirty();
+            marked = true;
+            next_end = std::max<VAddr>(next_end, next + image.info.guest_size);
+        });
+        next = next_end > next ? next_end : end;
+    }
     // Every written storage buffer binding lands here; with no image marked
     // nothing the dirty generation guards has changed.
     if (marked) {
@@ -547,7 +577,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
 
     if (recreate) {
         auto new_info = requested_info;
-        new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
+        new_info.resources = {
+            .levels = std::max(requested_info.resources.levels, cache_image.info.resources.levels),
+            .layers = std::max(requested_info.resources.layers, cache_image.info.resources.layers),
+        };
         new_info.UpdateSize();
         const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, new_info);
         RegisterImage(new_image_id);

@@ -888,6 +888,10 @@ bool BufferCache::NoteCpWrite(VAddr device_addr, u64 size) {
 
 std::optional<std::pair<const Buffer*, u64>> BufferCache::TryInPlaceRead(VAddr device_addr,
                                                                          u32 size) {
+    // A block unmapped since its bind still has its bit and its old chunk binding.
+    if (has_pending_unmaps.load(std::memory_order_acquire)) {
+        ProcessPendingUnmaps();
+    }
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     if (IsCpWritten(first_block, last_block)) {
@@ -937,7 +941,7 @@ u64 BufferCache::InPlaceRun(u64 block, u64 end, vk::DeviceMemory* out_memory,
     if (!phys || (*phys & (block_size - 1)) != 0) {
         return 0;
     }
-    const auto* chunk = Vulkan::GuestMemory::Find(*phys);
+    const auto chunk = Vulkan::GuestMemory::Find(*phys);
     if (!chunk || *phys + block_size > chunk->phys + chunk->size) {
         return 0;
     }
@@ -992,7 +996,10 @@ void BufferCache::ProcessPendingUnmaps() {
                 ++run_end;
             }
             // The blocks get rebound to whatever is mapped there at their next use.
-            resident_ranges.Subtract(block, run_end);
+            {
+                std::scoped_lock lk{arena_mutex};
+                resident_ranges.Subtract(block, run_end);
+            }
             released = true;
             block = run_end;
         }

@@ -53,6 +53,8 @@ put() {
     mv -f "$2.new.$$" "$2"
 }
 
+steam_deck() { [ "$(cat /sys/devices/virtual/dmi/id/board_vendor 2>/dev/null)" = Valve ]; }
+
 running() {
     local exe
     for exe in /proc/[0-9]*/exe; do
@@ -75,9 +77,16 @@ install_defaults() {
             if [ -f "$U/$rel" ] && ! cmp -s "$f" "$U/$rel"; then cp "$U/$rel" "$U/$rel.bak"; fi
             put "$f" "$U/$rel" ;;
         input_config/*)
+            if [ "$rel" = input_config/default.ini ] && ! steam_deck; then
+                # A pad on a PC presses the touchpad with back/share; a Deck has its trackpads.
+                cat "$f" - >"$U/.default.ini.pc" <<<'touchpad_center = back'
+                f="$U/.default.ini.pc"
+            fi
             if [ ! -f "$U/$rel" ]; then put "$f" "$U/$rel"; elif ! cmp -s "$f" "$U/$rel"; then
-                put "$f" "$U/$rel.release"; fi ;;
+                put "$f" "$U/$rel.release"; fi
+            rm -f "$U/.default.ini.pc" ;;
         art/*) ;; # read in place by steam_shortcut
+        patches/shadPS4/files.json) ;; # merged by index_patches: other games' entries stay
         patches/*/*.xml)
             if [ -f "$U/$rel" ]; then
                 cp "$f" "$U/$rel.new" && py patches "$U/$rel.new" "$U/$rel" >/dev/null &&
@@ -90,7 +99,8 @@ install_defaults() {
 
 # Patch files ship in dist-user/patches (install_defaults); the emulator finds them by serial here.
 index_patches() {
-    py patch-index "$U/patches/shadPS4/files.json" "$ROOT/games.json"
+    py patch-index "$U/patches/shadPS4/files.json" "$ROOT/games.json" \
+        "$ROOT/dist-user/patches/shadPS4/files.json"
 }
 
 find_extractor() {
@@ -127,7 +137,7 @@ extract_pkgs() {
 # Finds the games of games.json (the folder around this app first, then home and SD cards) and
 # writes user/games.list ("title id<TAB>game folder").
 setup() {
-    local serials scan game title path ver upd other d link n=0 roots=("$(dirname "$ROOT")" "$HOME" /run/media)
+    local serials scan game title upd other d link s pkgs n=0 roots=("$(dirname "$ROOT")" "$HOME" /run/media)
     command -v python3 >/dev/null || die "python3 is required"
     install_defaults
     index_patches
@@ -166,7 +176,7 @@ setup() {
         py config-add-dir "$U/config.json" "$(dirname "$game")"
         info "Also found $title: $game"
     done < <(awk -F'\t' '$1 == "other" && $3 !~ /-(UPDATE|patch)$/ && !seen[$2]++' "$scan")
-    while IFS=$'\t' read -r _ title game ver; do
+    while IFS=$'\t' read -r _ title game _; do
         grep -q "^$title"$'\t' "$GAMES_LIST.new" && continue
         printf '%s\t%s\n' "$title" "$game" >>"$GAMES_LIST.new"
         py config-add-dir "$U/config.json" "$(dirname "$game")"
@@ -280,7 +290,7 @@ add_to_steam() {
 }
 
 update() {
-    local rel tag url work
+    local rel tag url work f
     command -v curl >/dev/null || die "curl is required"
     command -v unzip >/dev/null || die "unzip is required"
     running && die "a game is running; close it first"
@@ -291,25 +301,32 @@ update() {
         return
     fi
     work="$(mktemp -d)"
-    trap 'rm -rf "$work"' RETURN
+    # exec and exit skip RETURN traps: the download (in RAM on SteamOS) goes on any exit.
+    trap 'rm -rf "$work"' EXIT
     info "Downloading $tag..."
     curl -fL --progress-bar -o "$work/release.zip" "$url"
     unzip -q "$work/release.zip" -d "$work/r"
-    local src
-    src="$(dirname "$(find "$work/r" -maxdepth 3 -name shadPS4.sh | head -1)")"
-    [ -f "$src/shadPS4.sh" ] && [ -x "$src/app/usr/bin/shadps4" ] ||
+    local src=""
+    f="$(find "$work/r" -maxdepth 3 -name shadPS4.sh -print -quit)"
+    [ -n "$f" ] && src="$(dirname "$f")"
+    [ -n "$src" ] && [ -x "$src/app/usr/bin/shadps4" ] && [ -d "$src/dist-user" ] ||
         die "$tag is not a folder app release (older than v1.1); nothing was changed"
+    # Copied next to the old build first: a failed copy leaves app/ and app.prev as they were.
+    rm -rf "$ROOT/app.new" "$ROOT/dist-user.new"
+    cp -a "$src/app" "$ROOT/app.new"
+    cp -a "$src/dist-user" "$ROOT/dist-user.new"
     rm -rf "$ROOT/app.prev"
     [ -d "$ROOT/app" ] && mv "$ROOT/app" "$ROOT/app.prev"
-    cp -a "$src/app" "$ROOT/app"
-    rm -rf "$ROOT/dist-user" "$ROOT/tools.new"
-    cp -a "$src/dist-user" "$ROOT/dist-user"
+    mv "$ROOT/app.new" "$ROOT/app"
+    rm -rf "$ROOT/dist-user"
+    mv "$ROOT/dist-user.new" "$ROOT/dist-user"
     for f in shadPS4.sh games.json README.md LICENSE VERSION; do
         [ -f "$src/$f" ] && put "$src/$f" "$ROOT/$f"
     done
     cp -a "$src/tools/." "$ROOT/tools/"
     chmod +x "$ROOT/shadPS4.sh" "$ROOT/app/usr/bin/shadps4"
     info "Updated to $tag (the previous build is in app.prev)"
+    rm -rf "$work"
     if [ "$YES" = 1 ]; then exec "$ROOT/shadPS4.sh" --setup -y; fi
     exec "$ROOT/shadPS4.sh" --setup
 }
@@ -335,13 +352,15 @@ play() {
 # Copies the saves to user/save-backups/<date> before each run (unchanged saves are not copied
 # again) and keeps the last 20, so an overwritten save can be put back.
 backup_saves() {
-    local src="$U/home/1000/savedata" dir="$U/save-backups" last
+    local src="$U/home/1000/savedata" dir="$U/save-backups" last all
     [ -d "$src" ] || return 0
     mkdir -p "$dir"
     last="$(ls -1d "$dir"/*/ 2>/dev/null | tail -1 || true)"
     [ -n "$last" ] && diff -rq "$src" "$last" >/dev/null 2>&1 && return 0
     cp -a "$src" "$dir/$(date +%Y-%m-%d_%H%M%S)" || { warn "save backup failed"; return 0; }
-    ls -1d "$dir"/*/ | head -n -20 | xargs -r rm -rf
+    # A glob, not ls | xargs: the app folder can have spaces or quotes (~/My Games).
+    all=("$dir"/*/)
+    [ "${#all[@]}" -le 20 ] || rm -rf -- "${all[@]:0:${#all[@]}-20}"
 }
 
 # An executable user/session-hook (optional, e.g. a play recorder) is started detached for each run,
@@ -356,7 +375,10 @@ run_emu() {
 }
 
 cd "$ROOT"
-[ -x "$EMU" ] || die "app/usr/bin/shadps4 is missing: extract the whole release folder"
+case "${1:-}" in
+-h | --help | --update) ;; # --update also repairs a folder whose app/ is missing
+*) [ -x "$EMU" ] || die "app/usr/bin/shadps4 is missing: extract the whole release folder" ;;
+esac
 case "${1:-}" in
 -h | --help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
 --setup) shift; [ "${1:-}" = -y ] && YES=1; setup ;;

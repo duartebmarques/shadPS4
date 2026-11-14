@@ -47,10 +47,12 @@ if [ -n "$SRC" ] && [ -x "$SRC/shadPS4.sh" ] && [ -d "$SRC/app" ]; then
 else
     command -v curl >/dev/null || die "curl is required"
     command -v unzip >/dev/null || die "unzip is required"
+    command -v python3 >/dev/null || die "python3 is required"
     api="https://api.github.com/repos/$REPO/releases/latest"
     [ -z "$TAG" ] || api="https://api.github.com/repos/$REPO/releases/tags/$TAG"
-    url="$(curl -fsSL "$api" |
-        grep -o '"browser_download_url": *"[^"]*-linux\.zip"' | head -1 | cut -d'"' -f4)"
+    url="$(curl -fsSL "$api" | python3 -I -c 'import json, sys
+print(next((a["browser_download_url"] for a in json.load(sys.stdin)["assets"]
+            if a["name"].endswith("-linux.zip")), ""))')"
     [ -n "$url" ] || die "could not find the release ${TAG:-latest}"
     info "Downloading $(basename "$url")..."
     curl -fL --progress-bar -o "$work/release.zip" "$url"
@@ -58,14 +60,19 @@ else
     rel="$work/shadPS4-infamous"
 fi
 
+[ -x "$rel/app/usr/bin/shadps4" ] && [ -d "$rel/dist-user" ] && [ -d "$rel/tools" ] ||
+    die "${TAG:-the latest release} is not a folder app release; nothing was changed"
 mkdir -p "$DIR"
 DIR="$(cd "$DIR" && pwd)"
 if [ "$rel" != "$DIR" ]; then
     info "Installing into $DIR"
+    rm -rf "$DIR/app.new"
+    cp -a "$rel/app" "$DIR/app.new"
     rm -rf "$DIR/app.prev"
     [ -d "$DIR/app" ] && mv "$DIR/app" "$DIR/app.prev"
+    mv "$DIR/app.new" "$DIR/app"
     rm -rf "$DIR/dist-user" "$DIR/tools"
-    cp -a "$rel/app" "$rel/dist-user" "$rel/tools" "$DIR/"
+    cp -a "$rel/dist-user" "$rel/tools" "$DIR/"
     for f in shadPS4.sh install.sh games.json README.md LICENSE VERSION; do
         [ -f "$rel/$f" ] && cp -a "$rel/$f" "$DIR/$f"
     done
