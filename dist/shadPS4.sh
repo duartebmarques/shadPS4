@@ -137,7 +137,7 @@ extract_pkgs() {
 # Finds the games of games.json (the folder around this app first, then home and SD cards) and
 # writes user/games.list ("title id<TAB>game folder").
 setup() {
-    local serials scan game title path ver upd other d link n=0 roots=("$(dirname "$ROOT")" "$HOME" /run/media)
+    local serials scan game title upd other d link s pkgs n=0 roots=("$(dirname "$ROOT")" "$HOME" /run/media)
     command -v python3 >/dev/null || die "python3 is required"
     install_defaults
     index_patches
@@ -176,7 +176,7 @@ setup() {
         py config-add-dir "$U/config.json" "$(dirname "$game")"
         info "Also found $title: $game"
     done < <(awk -F'\t' '$1 == "other" && $3 !~ /-(UPDATE|patch)$/ && !seen[$2]++' "$scan")
-    while IFS=$'\t' read -r _ title game ver; do
+    while IFS=$'\t' read -r _ title game _; do
         grep -q "^$title"$'\t' "$GAMES_LIST.new" && continue
         printf '%s\t%s\n' "$title" "$game" >>"$GAMES_LIST.new"
         py config-add-dir "$U/config.json" "$(dirname "$game")"
@@ -318,7 +318,7 @@ update() {
     rm -rf "$ROOT/app.prev"
     [ -d "$ROOT/app" ] && mv "$ROOT/app" "$ROOT/app.prev"
     mv "$ROOT/app.new" "$ROOT/app"
-    rm -rf "$ROOT/dist-user" "$ROOT/tools.new"
+    rm -rf "$ROOT/dist-user"
     mv "$ROOT/dist-user.new" "$ROOT/dist-user"
     for f in shadPS4.sh games.json README.md LICENSE VERSION; do
         [ -f "$src/$f" ] && put "$src/$f" "$ROOT/$f"
