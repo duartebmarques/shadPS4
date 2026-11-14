@@ -284,6 +284,10 @@ public:
     BackingImage& AddBacking(const vk::ImageCreateInfo& create_info, u32 num_samples);
     ImageView& FindView(const ImageViewInfo& view_info, BackingImage& view_backing);
     void InvalidateSubrects() {
+        // Runs for every bound target of every draw; only a crop adds a second backing.
+        if (backing_images.size() < 2) [[likely]] {
+            return;
+        }
         for (auto& image_backing : backing_images) {
             image_backing.subrect_valid = false;
         }
