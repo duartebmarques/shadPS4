@@ -132,15 +132,17 @@ struct Image : public Common::LRUNode<> {
             [](vk::DeviceSize sum, const BackingImage& bi) { return sum + bi.image.size_bytes; });
     }
 
+    struct BackingImage;
+
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
     vk::ImageView FindViewHandle(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
-    ImageViewId InsertView(const ImageViewInfo& view_info);
+    ImageViewId InsertView(const ImageViewInfo& view_info, BackingImage& view_backing);
 
     using Barriers = SmallVector<vk::ImageMemoryBarrier2, 32>;
     /// Records that the given query needed no barriers, valid until the
     /// backing's state epoch changes.
-    void RecordNoopBarrier(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                           vk::PipelineStageFlags2 dst_stage,
+    void RecordNoopBarrier(BackingImage& image_backing, vk::ImageLayout dst_layout,
+                           vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
                            const std::optional<SubresourceRange>& subres_range);
 
     /// Header fast path for GetBarriers' repeat no-op answer: the memo the
@@ -155,28 +157,31 @@ struct Image : public Common::LRUNode<> {
                     (u64{r->extent.levels} << 32) | (u64{r->extent.layers} << 48))
                  : ~u64{0};
     }
-    void BumpStateEpoch() {
-        backing_epoch = ++backing->state_epoch;
+    void BumpStateEpoch(BackingImage& image_backing) {
+        ++image_backing.state_epoch;
+        backing_epoch = backing->state_epoch;
     }
-    bool BarriersNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                      vk::PipelineStageFlags2 dst_stage,
+    bool BarriersNoop(const BackingImage& image_backing, vk::ImageLayout dst_layout,
+                      vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
                       const std::optional<SubresourceRange>& subres_range) const {
         const u64 range_key = RangeKey(subres_range);
-        return backing->noop_epoch == backing->state_epoch && backing->noop_layout == dst_layout &&
-               backing->noop_access == dst_mask && backing->noop_stage == dst_stage &&
-               backing->noop_range == range_key;
+        return image_backing.noop_epoch == image_backing.state_epoch &&
+               image_backing.noop_layout == dst_layout && image_backing.noop_access == dst_mask &&
+               image_backing.noop_stage == dst_stage && image_backing.noop_range == range_key;
     }
 
-    void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+    void GetBarriers(Barriers& out_barriers, BackingImage& image_backing,
+                     vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
                      std::optional<SubresourceRange> subres_range = {}) {
-        if (BarriersNoop(dst_layout, dst_mask, dst_stage, subres_range)) {
+        if (BarriersNoop(image_backing, dst_layout, dst_mask, dst_stage, subres_range)) {
             return;
         }
-        GetBarriersSlow(out_barriers, dst_layout, dst_mask, dst_stage, subres_range);
+        GetBarriersSlow(out_barriers, image_backing, dst_layout, dst_mask, dst_stage, subres_range);
     }
-    void GetBarriersSlow(Barriers& out_barriers, vk::ImageLayout dst_layout,
-                         vk::AccessFlags2 dst_mask, vk::PipelineStageFlags2 dst_stage,
+    void GetBarriersSlow(Barriers& out_barriers, BackingImage& image_backing,
+                         vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                         vk::PipelineStageFlags2 dst_stage,
                          std::optional<SubresourceRange> subres_range);
 
 public:
@@ -224,6 +229,7 @@ public:
     struct {
         u32 is_bound : 1;
         u32 is_target : 1;
+        u32 is_storage : 1;
         u32 needs_rebind : 1;
         u32 force_general : 1;
     } binding{};
@@ -273,7 +279,20 @@ public:
         SmallVector<ViewRecord, 2> view_records;
         SmallVector<ImageViewId, 2> image_view_ids;
         u32 num_samples;
+        bool subrect_valid{};
     };
+    BackingImage& AddBacking(const vk::ImageCreateInfo& create_info, u32 num_samples);
+    ImageView& FindView(const ImageViewInfo& view_info, BackingImage& view_backing);
+    void InvalidateSubrects() {
+        // Runs for every bound target of every draw; only a crop adds a second backing.
+        if (backing_images.size() < 2) [[likely]] {
+            return;
+        }
+        for (auto& image_backing : backing_images) {
+            image_backing.subrect_valid = false;
+        }
+    }
+
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};
     // Mirror of backing->state_epoch: every bump and backing switch writes it,

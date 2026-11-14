@@ -120,6 +120,11 @@ public:
         u64 memo_bind_epoch{};
         vk::ImageLayout memo_bind_layout{};
 
+        // A disengaged info means a consumed memo hit, and the memo never holds a crop source.
+        bool IsSubrectTexture(const ImageInfo& source) const {
+            return type == BindingType::Texture && info && info->IsSubrectOf(source);
+        }
+
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc,
                   bool defer_view = false)
